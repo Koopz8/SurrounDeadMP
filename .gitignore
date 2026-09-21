@@ -1,0 +1,5 @@
+research/extract/
+research/pak_filelist.txt
+tools/*.zip
+*.pak
+*.pdb
