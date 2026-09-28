@@ -1,10 +1,4 @@
 @echo off
-REM Second SurrounDead instance, for loopback co-op testing on one machine.
-REM Launches the shipping exe directly - Steam's library blocks a second
-REM launch, the exe itself doesn't. Windowed and small so both fit on screen.
-REM
-REM Needs the SDMP LOOPBACK TEST block in
-REM   %%LOCALAPPDATA%%\SurrounDead\Saved\Config\Windows\Engine.ini
-REM or this instance will try Steam P2P and fail against its own SteamID.
-
-start "" "C:\Program Files (x86)\Steam\steamapps\common\SurrounDead\SurrounDead\Binaries\Win64\SurrounDead-Win64-Shipping.exe" -windowed -ResX=1280 -ResY=720
+REM Instance 2 - the client. Launches the exe directly, past Steam's
+REM single-instance block. -log so we can see why a connect fails.
+start "" "C:\Program Files (x86)\Steam\steamapps\common\SurrounDead\SurrounDead\Binaries\Win64\SurrounDead-Win64-Shipping.exe" -log -windowed -ResX=1280 -ResY=720 -AbsLog=Client.log

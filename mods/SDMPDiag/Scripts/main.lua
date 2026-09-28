@@ -178,3 +178,39 @@ RegisterConsoleCommandHandler("sdmp_diag", function()
 end)
 
 log("SDMPDiag loaded. F7 or `sdmp_diag` to dump.")
+
+-- One line of net state. F8, or `sdmp_net`. For checking whether a listen
+-- server actually came up, or whether a connect landed, without the full dump.
+local function netStatus()
+    local world = UEHelpers.GetWorld()
+    if not world or not world:IsValid() then log("NET: no world"); return end
+
+    local nd   = safe(function() return world.NetDriver end, nil)
+    local gm   = safe(function() return world.AuthorityGameMode end, nil)
+    local pc   = UEHelpers.GetPlayerController()
+    local pawn = pc and safe(function() return pc.Pawn end, nil) or nil
+
+    local conns = 0
+    if nd and nd:IsValid() then
+        conns = safe(function() return #nd.ClientConnections end, 0)
+    end
+
+    log(("NET: driver=%s  connections=%d  authority=%s  pawn=%s  role=%s"):format(
+        (nd and nd:IsValid()) and className(nd) or "NONE (standalone)",
+        conns,
+        (gm and gm:IsValid()) and "yes" or "no (we are a client)",
+        (pawn and pawn:IsValid()) and className(pawn) or "NONE",
+        pawn and (ROLE[safe(function() return pawn.Role end, -1)] or "?") or "-"))
+
+    local map = safe(function() return world:GetFName():ToString() end, "?")
+    log("NET: map=" .. map .. "  actors=" .. tostring(safe(function()
+        local a = FindAllOf("Actor"); return a and #a or 0 end, 0)))
+end
+
+RegisterKeyBind(Key.F8, function() ExecuteInGameThread(netStatus) end)
+RegisterConsoleCommandHandler("sdmp_net", function()
+    ExecuteInGameThread(netStatus)
+    return true
+end)
+
+log("SDMPDiag: F8 / sdmp_net for quick net status.")

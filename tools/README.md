@@ -1,47 +1,64 @@
 # Testing co-op with one copy of the game
 
-You don't need a second machine or a second license. Two processes on one PC,
-talking over 127.0.0.1.
+Two processes on one PC over 127.0.0.1. No second machine, no second license.
 
 ## One-time setup
 
 The `SDMP LOOPBACK TEST` block in
 `%LOCALAPPDATA%\SurrounDead\Saved\Config\Windows\Engine.ini` swaps the net
-driver from SteamSockets to IP. This is required: Steam P2P routes by SteamID,
-and two instances run by the same account share one, so a P2P connection to
-yourself goes nowhere. IP over loopback has no such problem.
+driver from SteamSockets to IP. Required: Steam P2P routes by SteamID, both
+instances run as the same account, and a P2P connection to yourself goes
+nowhere. Single player is unaffected — standalone never creates a net driver.
 
-It does nothing to single player — standalone never creates a net driver.
-Delete the block to restore stock behaviour.
+Original backed up at `research/Engine.ini.orig-backup`.
 
-A backup of the original file is at `research/Engine.ini.orig-backup`.
+## Order matters
 
-## Running a test
+`open <map>?listen` reloads the map. The world in SurrounDead isn't in the
+map — it's spawned by the new-game / load-save flow — so hosting *after*
+you've started playing throws the world away and drops you back to the menu.
 
-1. Launch the game normally through Steam. Start or load a save so the world
-   is fully up.
-2. Open the UE console with `~` and run:
+So listen first, then start the game.
+
+1. `tools\host.bat` — instance 1. Steam must be running. `-log` gives a
+   console window and writes `Saved\Logs\SurrounDead.log`; Shipping builds
+   write nothing without it.
+2. At the **main menu**, press `~` and run:
 
    ```
-   open PersistentLevel?listen
+   open /Game/Levels/PersistentLevel?listen
    ```
-
-   The map reloads as a listen server. `PersistentLevel` is the real game
-   world — the community enabler says `LongdownValley`, but the diagnostics
-   show `PersistentLevel` is what actually loads.
-3. Run `tools\second-instance.bat`. When it's at the menu, `~` and:
+3. Press **F8**. Want `driver=IpNetDriver`. If it says `NONE (standalone)`
+   the listen didn't take — check the console window for `LogNet`.
+4. Now start or load a game through the menu as normal.
+5. F8 again. Driver should still be there. If it's gone, loading a save
+   travels and takes the listen state with it — that's a different problem
+   and worth knowing.
+6. `tools\second-instance.bat` — instance 2. At its menu, `~` and:
 
    ```
    open 127.0.0.1:7777
    ```
-4. F7 in both windows. The host should report a `NetDriver` with
-   `ClientConnections: 1`; the client should report no `AuthorityGameMode`
-   and a `Role=AutonomousProxy` pawn.
+7. F8 on the client: `authority=no (we are a client)` and a pawn.
+   F8 on the host: `connections=1`.
 
-## What to watch for
+## If a step fails
 
-- Client has no pawn at all → spawning/possession, the known blocker.
-- Client sees an empty or frozen world → relevance or streaming.
-- Loot containers open on one side only → interaction authority.
-- Zombies stand still on the client → SmartAI is server-driven, expected;
-  the question is whether their *movement* replicates.
+The console windows are the point. Useful filters:
+
+```
+LogNet            connection, driver, travel
+LogNetTraffic     packet level
+LogOnline         Steam subsystem
+LogLoad           map loading
+```
+
+`Saved\Logs\SurrounDead.log` for the host, `Saved\Logs\Client.log` for the
+second instance.
+
+## Known symptom, first attempt
+
+`open PersistentLevel?listen` from in-game dropped instance 1 to the main
+menu, and the client's `open 127.0.0.1:7777` did nothing visible. The first
+half is expected — see "Order matters". The second half we have no data on,
+because there was no log. Hence `-log`.
