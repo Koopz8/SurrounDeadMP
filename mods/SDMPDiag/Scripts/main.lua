@@ -19,8 +19,6 @@ local function className(obj)
     return safe(function() return obj:GetClass():GetFName():ToString() end, "<?>")
 end
 
--- CDOs we care about. Static pak scanning can't see defaults that were
--- never overridden; the live CDO can.
 local CDOS = {
     "/Game/Blueprints/BP_PlayerCharacter.Default__BP_PlayerCharacter_C",
     "/Game/Blueprints/BP_PlayerController.Default__BP_PlayerController_C",
@@ -28,6 +26,16 @@ local CDOS = {
     "/Game/Blueprints/BP_SurroundeadGameState.Default__BP_SurroundeadGameState_C",
     "/Game/Blueprints/Vehicles/BP_VehicleMaster.Default__BP_VehicleMaster_C",
     "/Game/Blueprints/BuildingSystem/Actors/Buildable_MASTER.Default__Buildable_MASTER_C",
+}
+
+-- Engine defaults, so we can tell a deliberate Blueprint override from a
+-- stock value. BP_PlayerController reporting bReplicates=false only means
+-- something if the engine's own PlayerController reports true.
+local NATIVE_CDOS = {
+    "/Script/Engine.Default__PlayerController",
+    "/Script/Engine.Default__Character",
+    "/Script/Engine.Default__GameStateBase",
+    "/Script/Engine.Default__GameModeBase",
 }
 
 local FLAGS = {
@@ -49,6 +57,19 @@ local function dumpCDO(path)
     local freq = safe(function() return obj.NetUpdateFrequency end, nil)
     if freq then parts[#parts+1] = "NetUpdateFrequency=" .. tostring(freq) end
     log("  " .. path:match("([^%.]+)$") .. "  ->  " .. table.concat(parts, "  "))
+end
+
+-- Walk a Blueprint class up to its native parent.
+local function dumpChain(path)
+    local cls = StaticFindObject(path)
+    if not cls or not cls:IsValid() then log("  MISSING class " .. path); return end
+    local names, cur, guard = {}, cls, 0
+    while cur and cur:IsValid() and guard < 12 do
+        names[#names+1] = safe(function() return cur:GetFName():ToString() end, "?")
+        cur = safe(function() return cur:GetSuperStruct() end, nil)
+        guard = guard + 1
+    end
+    log("  " .. table.concat(names, "  <-  "))
 end
 
 local function dumpWorld()
@@ -94,33 +115,42 @@ local function dumpLocalPlayer()
     end
 end
 
--- Everything currently in the world that replicates, grouped by class.
-local function dumpReplicatedActors()
-    local counts, total, repl = {}, 0, 0
+-- Both halves matter. What replicates tells us what we get for free; what
+-- doesn't tells us the work list.
+local function dumpActorSweep()
+    local yes, no, total = {}, {}, 0
+    local nRep = 0
     local ok = pcall(function()
         local actors = FindAllOf("Actor")
         if not actors then return end
         for _, a in ipairs(actors) do
             total = total + 1
+            local c = className(a)
             if safe(function() return a.bReplicates end, false) == true then
-                repl = repl + 1
-                local c = className(a)
-                counts[c] = (counts[c] or 0) + 1
+                nRep = nRep + 1
+                yes[c] = (yes[c] or 0) + 1
+            else
+                no[c] = (no[c] or 0) + 1
             end
         end
     end)
     if not ok then log("actor sweep failed"); return end
 
-    local rows = {}
-    for c, n in pairs(counts) do rows[#rows+1] = { c = c, n = n } end
-    table.sort(rows, function(x, y) return x.n > y.n end)
+    local function top(t, n, label)
+        local rows = {}
+        for c, k in pairs(t) do rows[#rows+1] = { c = c, n = k } end
+        table.sort(rows, function(x, y) return x.n > y.n end)
+        log(label)
+        for i = 1, math.min(#rows, n) do
+            log(("  %5d  %s"):format(rows[i].n, rows[i].c))
+        end
+        if #rows > n then log("  ... and " .. (#rows - n) .. " more classes") end
+    end
 
     log(("Actors in world: %d   replicating: %d (%.1f%%)")
-        :format(total, repl, total > 0 and (repl / total * 100) or 0))
-    for i = 1, math.min(#rows, 30) do
-        log(("  %5d  %s"):format(rows[i].n, rows[i].c))
-    end
-    if #rows > 30 then log("  ... and " .. (#rows - 30) .. " more classes") end
+        :format(total, nRep, total > 0 and (nRep / total * 100) or 0))
+    top(yes, 15, "-- replicating --")
+    top(no, 25, "-- NOT replicating (the work list) --")
 end
 
 local function runDiag()
@@ -128,10 +158,15 @@ local function runDiag()
     dumpWorld()
     log("--- local player ---")
     dumpLocalPlayer()
-    log("--- CDO replication defaults ---")
+    log("--- game CDO replication defaults ---")
     for _, p in ipairs(CDOS) do dumpCDO(p) end
-    log("--- replicated actors in world ---")
-    dumpReplicatedActors()
+    log("--- engine defaults, for comparison ---")
+    for _, p in ipairs(NATIVE_CDOS) do dumpCDO(p) end
+    log("--- class chains ---")
+    dumpChain("/Game/Blueprints/BP_PlayerController.BP_PlayerController_C")
+    dumpChain("/Game/Blueprints/BP_SurroundeadGameMode.BP_SurroundeadGameMode_C")
+    log("--- actor sweep ---")
+    dumpActorSweep()
     log("===========================================================")
 end
 
