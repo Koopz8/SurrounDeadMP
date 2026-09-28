@@ -350,3 +350,42 @@ checked by `sdmp_input` on the client:
 Also unresolved: clicking Continue on the client's menu starts the client's
 *own* save-load flow, which is not something a joining player should ever do.
 Suppressing the menu for clients is on the list.
+
+## Two players, moving, looting
+
+The client moves and can loot containers. Input was the last blocker and it
+was two things:
+
+- `SetInputMode_GameOnly` needs `(Target, bFlushInput)` in UE5 — the one-arg
+  call silently failed, leaving the client in menu input mode with the cursor
+  up.
+- `IMC_General`, the Enhanced Input mapping context, was never added on the
+  client. It's applied in `BeginPlay` behind an `IsLocallyControlled` check,
+  and on a client the pawn's `BeginPlay` runs before the controller is
+  assigned, so the check fails and no bindings exist at all.
+
+Adding the context by hand to `EnhancedInputLocalPlayerSubsystem` fixed it.
+For the real mod this belongs on possession, not on a console command.
+
+So the full list of what was actually wrong with "multiplayer doesn't work":
+
+| Thing | Fix |
+|---|---|
+| Net driver was SteamSockets, useless for loopback | patch `NetDriverDefinitions` |
+| `GameMode.DefaultPawnClass` unset | set it, call `ServerRestartPlayer` |
+| Client in menu input mode | `SetInputMode_GameOnly(pc, false)` |
+| Enhanced Input context never added on clients | `AddMappingContext(IMC_General)` |
+
+None of it is replication work. The game replicates fine.
+
+## Open: no HUD on the client, and movement stutters
+
+The client has no UI at all — no health, nothing. Prime suspect is the same
+shape as `DefaultPawnClass`: `GameMode.HUDClass` unset, so no `AHUD` is
+spawned per controller and none of the game's UMG widgets are ever created.
+`sdmp_hud` checks and sets it.
+
+Movement is laggy and tears. Unclear whether that's network or just two
+copies of a 22k-actor UE5 world on one GPU. `sdmp_move` reports ping,
+`NetworkSmoothingMode` and the update frequencies so we can tell the
+difference instead of guessing.

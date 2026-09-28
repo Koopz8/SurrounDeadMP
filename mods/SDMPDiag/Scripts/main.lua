@@ -613,3 +613,140 @@ RegisterConsoleCommandHandler("sdmp_input", function()
 end)
 
 log("SDMPDiag: sdmp_input (on the client) reports and repairs input/possession state.")
+
+-- v2. Last run ruled out the interesting causes: role=AutonomousProxy and
+-- AcknowledgedPawn set, so possession is completely correct and the client is
+-- allowed to drive. What's left is input plumbing.
+--   * SetInputMode_GameOnly returned false - arity again, UE5 takes
+--     (Target, bFlushInput).
+--   * bShowMouseCursor=true, so we're in menu input mode.
+--   * The game is on Enhanced Input. IMC_General is almost certainly added in
+--     BeginPlay behind an IsLocallyControlled check, and on a client the pawn's
+--     BeginPlay can run before the controller is assigned - so it gets skipped
+--     and there are no bindings at all.
+local IMC_PATH = "/Game/Input/IMC_General.IMC_General"
+
+local function fixInput2()
+    local pc = UEHelpers.GetPlayerController()
+    if not pc or not pc:IsValid() then log("IN2: no PlayerController"); return end
+    local pawn = safe(function() return pc.Pawn end, nil)
+    log("IN2: pawn=" .. ((pawn and pawn:IsValid()) and className(pawn) or "NONE") ..
+        "  role=" .. (pawn and (ROLE[safe(function() return pawn.Role end, -1)] or "?") or "-"))
+
+    -- 1. input mode, with the argument it actually wants
+    local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    if wbl and wbl:IsValid() then
+        local ok = pcall(function() wbl:SetInputMode_GameOnly(pc, false) end)
+        log("IN2: SetInputMode_GameOnly(pc,false) -> " .. tostring(ok))
+        if not ok then
+            log("IN2: retrying with one arg -> " ..
+                tostring(pcall(function() wbl:SetInputMode_GameOnly(pc) end)))
+        end
+    end
+
+    local okc = pcall(function() pc.bShowMouseCursor = false end)
+    log("IN2: bShowMouseCursor=false -> " .. tostring(okc) ..
+        " (now " .. tostring(safe(function() return pc.bShowMouseCursor end, "?")) .. ")")
+
+    -- 2. enhanced input bindings
+    local sub = nil
+    pcall(function() sub = FindFirstOf("EnhancedInputLocalPlayerSubsystem") end)
+    if not (sub and sub:IsValid()) then
+        log("IN2: no EnhancedInputLocalPlayerSubsystem found")
+    else
+        local imc = StaticFindObject(IMC_PATH)
+        if not (imc and imc:IsValid()) then
+            log("IN2: IMC_General not loaded -- can't add mappings")
+        else
+            local ok3 = pcall(function()
+                sub:AddMappingContext(imc, 0, { bIgnoreAllPressedKeysUntilRelease = false })
+            end)
+            log("IN2: AddMappingContext(IMC_General, 0, opts) -> " .. tostring(ok3))
+            if not ok3 then
+                log("IN2: retrying with two args -> " ..
+                    tostring(pcall(function() sub:AddMappingContext(imc, 0) end)))
+            end
+        end
+    end
+
+    pcall(function() pc:EnableInput(pc) end)
+    log("IN2: done. Try moving.")
+end
+
+RegisterConsoleCommandHandler("sdmp_input2", function()
+    ExecuteInGameThread(fixInput2)
+    return true
+end)
+
+log("SDMPDiag: sdmp_input2 - input mode with correct arity, plus IMC_General.")
+
+-- Same shape of bug as DefaultPawnClass, most likely: GameMode.HUDClass never
+-- set, because single player builds its HUD through the load-save flow rather
+-- than letting the engine spawn one per controller. No AHUD means none of the
+-- game's UMG widgets ever get created on the client.
+local HUD_PATH = "/Game/Blueprints/HUD_Game.HUD_Game_C"
+local SMOOTH = { [0]="Disabled", [1]="Linear", [2]="Exponential", [3]="Replay" }
+
+local function fixHud()
+    local pc = UEHelpers.GetPlayerController()
+    if not pc or not pc:IsValid() then log("HUD: no PlayerController"); return end
+
+    local hud = safe(function() return pc.MyHUD end, nil)
+    log("HUD: MyHUD = " .. ((hud and hud:IsValid()) and className(hud) or "NONE"))
+
+    local hudCls = StaticFindObject(HUD_PATH)
+    if not (hudCls and hudCls:IsValid()) then log("HUD: HUD_Game_C not found"); return end
+
+    -- host: make sure anyone who joins later gets one
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    if gm and gm:IsValid() then
+        local hc = safe(function() return gm.HUDClass end, nil)
+        log("HUD: GameMode.HUDClass = " ..
+            ((hc and hc:IsValid()) and safe(function() return hc:GetFName():ToString() end, "?") or "NONE"))
+        if not (hc and hc:IsValid()) then
+            log("HUD: setting GameMode.HUDClass -> " .. tostring(pcall(function() gm.HUDClass = hudCls end)))
+        end
+    end
+
+    if not (hud and hud:IsValid()) then
+        local ok, err = pcall(function() pc:ClientSetHUD(hudCls) end)
+        log("HUD: ClientSetHUD -> " .. (ok and "called" or ("threw: " .. tostring(err))))
+        local h2 = safe(function() return pc.MyHUD end, nil)
+        log("HUD: MyHUD is now " .. ((h2 and h2:IsValid()) and className(h2) or "STILL NONE"))
+    end
+end
+
+-- Is the stutter the network, or just two copies of a 22k-actor UE5 world
+-- fighting over one GPU? Read the numbers instead of guessing.
+local function moveInfo()
+    local pc = UEHelpers.GetPlayerController()
+    if not pc or not pc:IsValid() then log("MV: no PlayerController"); return end
+
+    local ps = safe(function() return pc.PlayerState end, nil)
+    if ps and ps:IsValid() then
+        log("MV: ping=" .. tostring(safe(function() return ps.ExactPing end, "?")) ..
+            "ms  compressed=" .. tostring(safe(function() return ps.Ping end, "?")))
+    end
+
+    local pawn = safe(function() return pc.Pawn end, nil)
+    if not (pawn and pawn:IsValid()) then log("MV: no pawn"); return end
+    local cm = safe(function() return pawn.CharacterMovement end, nil)
+    if not (cm and cm:IsValid()) then log("MV: no CharacterMovement"); return end
+
+    local sm = safe(function() return cm.NetworkSmoothingMode end, nil)
+    log("MV: NetworkSmoothingMode=" .. tostring(SMOOTH[sm] or sm) ..
+        "  MaxSmoothUpdateDist=" .. tostring(safe(function() return cm.NetworkMaxSmoothUpdateDistance end, "?")) ..
+        "  NoSmoothUpdateDist=" .. tostring(safe(function() return cm.NetworkNoSmoothUpdateDistance end, "?")))
+    log("MV: NetworkSimulatedSmoothLocationTime=" ..
+        tostring(safe(function() return cm.NetworkSimulatedSmoothLocationTime end, "?")) ..
+        "  ServerAcceptClientAuthoritativePosition=" ..
+        tostring(safe(function() return cm.bServerAcceptClientAuthoritativePosition end, "?")))
+    log("MV: NetUpdateFrequency=" .. tostring(safe(function() return pawn.NetUpdateFrequency end, "?")) ..
+        "  MinNetUpdateFrequency=" .. tostring(safe(function() return pawn.MinNetUpdateFrequency end, "?")))
+end
+
+RegisterConsoleCommandHandler("sdmp_hud", function() ExecuteInGameThread(fixHud) return true end)
+RegisterConsoleCommandHandler("sdmp_move", function() ExecuteInGameThread(moveInfo) return true end)
+
+log("SDMPDiag: sdmp_hud creates the client HUD, sdmp_move reports movement/ping numbers.")
