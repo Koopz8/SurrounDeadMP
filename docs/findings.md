@@ -306,3 +306,47 @@ it just never fires for someone who arrives by connecting rather than dying.
 `sdmp_spawn` tries them in order on a pawnless controller. If the game's own
 respawn path works for a joiner, the spawning blocker is a few lines of glue
 rather than a new game mode.
+
+## Second player spawned
+
+```
+HS2: GameMode.DefaultPawnClass = NONE
+HS2: set DefaultPawnClass -> BP_PlayerCharacter_C : true
+HS2: 1 pawnless controller(s)
+HS2: ServerRestartPlayer -> called
+HS2: pawn is now BP_PlayerCharacter_C -- done, engine route works
+```
+
+**`DefaultPawnClass` was never set.** That's the whole spawning blocker. The
+GameMode has no login hooks and no default pawn, so a connecting player had
+nothing to be given. Single player never needed either, because the load-save
+flow builds the character directly.
+
+Set it, call the engine's own `ServerRestartPlayer`, and the engine does the
+rest — spawn, possess, everything. Two lines.
+
+Worth noting what this replaces. The community enabler ships `tphost`,
+`mprespawn` and `mpfix` console commands to paper over this. None of that is
+necessary; the engine path works once `DefaultPawnClass` exists.
+
+`ServerRestartPlayer` was found by enumerating UFunctions on the controller's
+class chain (`sdmp_funcs`) — worth remembering as a technique, since the other
+useful find, `Svr_RequestRespawn_Random`, turned out to be a dead end. It's
+callable and returns cleanly but does nothing for a player who was never
+alive, presumably an early-out in its body.
+
+## Current state: the client can't move
+
+The second player exists and renders, but is stuck. Three candidates, all
+checked by `sdmp_input` on the client:
+
+1. The controller is still in UI input mode, left over from the main menu
+   (the menu is still up on the client until you click Continue).
+2. The client-side half of possession never ran. `ClientRestart` is what
+   builds the input component locally; if `AcknowledgedPawn` is empty, the
+   handshake is incomplete.
+3. The pawn arrived as a `SimulatedProxy`, which the client can't drive.
+
+Also unresolved: clicking Continue on the client's menu starts the client's
+*own* save-load flow, which is not something a joining player should ever do.
+Suppressing the menu for clients is on the list.

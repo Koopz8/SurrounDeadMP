@@ -390,3 +390,226 @@ RegisterConsoleCommandHandler("sdmp_funcs", function()
 end)
 
 log("SDMPDiag: sdmp_spawn asks the server for a pawn. sdmp_funcs lists candidates.")
+
+-- Run on the HOST. Svr_RequestRespawn_Random from the client returned without
+-- doing anything - either it needs params we didn't pass or its body early-outs
+-- for a player who was never alive. So do it with authority instead: find the
+-- pawnless controller (that's the joiner), spawn a character next to the host,
+-- and possess it. Crude, but it's the shortest path to proving a second player
+-- can exist at all.
+local SPAWN_OFFSET = 250.0
+
+local function listControllers()
+    local out = {}
+    pcall(function()
+        local pcs = FindAllOf("PlayerController")
+        if not pcs then return end
+        for _, c in ipairs(pcs) do
+            if c:IsValid() then out[#out+1] = c end
+        end
+    end)
+    return out
+end
+
+local function hostSpawn()
+    local world = UEHelpers.GetWorld()
+    if not world or not world:IsValid() then log("HS: no world"); return end
+    if not safe(function() return world.AuthorityGameMode end, nil) then
+        log("HS: no AuthorityGameMode -- run this on the HOST, not the client")
+        return
+    end
+
+    local pcs = listControllers()
+    log("HS: " .. #pcs .. " PlayerController(s)")
+
+    local hostPawn, targets = nil, {}
+    for i, c in ipairs(pcs) do
+        local p = safe(function() return c.Pawn end, nil)
+        local has = p and p:IsValid()
+        log(("HS[%d]: %s  pawn=%s  remoteRole=%s"):format(
+            i, className(c), has and className(p) or "NONE",
+            ROLE[safe(function() return c.RemoteRole end, -1)] or "?"))
+        if has and not hostPawn then hostPawn = p else
+            if not has then targets[#targets+1] = c end
+        end
+    end
+
+    if #targets == 0 then log("HS: every controller already has a pawn"); return end
+    if not hostPawn then log("HS: no existing pawn to copy a location from"); return end
+
+    local loc = safe(function() return hostPawn:K2_GetActorLocation() end, nil)
+    if not loc then log("HS: couldn't read host pawn location"); return end
+    log(("HS: host at %.0f %.0f %.0f"):format(loc.X, loc.Y, loc.Z))
+
+    local cls = StaticFindObject("/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C")
+    if not cls or not cls:IsValid() then log("HS: BP_PlayerCharacter_C class not found"); return end
+
+    local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    if not gs or not gs:IsValid() then log("HS: no GameplayStatics"); return end
+
+    local xform = {
+        Rotation    = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+        Translation = { X = loc.X + SPAWN_OFFSET, Y = loc.Y + SPAWN_OFFSET, Z = loc.Z + 100.0 },
+        Scale3D     = { X = 1.0, Y = 1.0, Z = 1.0 },
+    }
+
+    for _, c in ipairs(targets) do
+        local ok, err = pcall(function()
+            -- 2 = AdjustIfPossibleButAlwaysSpawn
+            local pawn = gs:BeginDeferredActorSpawnFromClass(world, cls, xform, 2, c)
+            if not pawn or not pawn:IsValid() then error("deferred spawn returned nothing") end
+            gs:FinishSpawningActor(pawn, xform)
+            log("HS: spawned " .. className(pawn) .. ", possessing")
+            c:Possess(pawn)
+        end)
+        if ok then
+            local p = safe(function() return c.Pawn end, nil)
+            log("HS: controller pawn is now " .. ((p and p:IsValid()) and className(p) or "STILL NONE"))
+        else
+            log("HS: spawn/possess failed -- " .. tostring(err))
+        end
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_hostspawn", function()
+    ExecuteInGameThread(hostSpawn)
+    return true
+end)
+
+log("SDMPDiag: sdmp_hostspawn (on the host) spawns and possesses for pawnless controllers.")
+
+-- v2. Two fixes from the last run:
+--   * BeginDeferredActorSpawnFromClass wants 6 args in 5.3, not 5 - it gained
+--     TransformScaleMethod. FinishSpawningActor wants 3.
+--   * sdmp_funcs turned up ServerRestartPlayer on APlayerController, which is
+--     the engine's own "give me a pawn" RPC. That routes through the GameMode
+--     and possesses properly, so try it before hand-rolling a spawn.
+-- The GameMode's DefaultPawnClass is probably unset (single player never needs
+-- it), so point it at BP_PlayerCharacter first or RestartPlayer makes a
+-- DefaultPawn sphere.
+local PC_PATH = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
+
+local function hostSpawn2()
+    local world = UEHelpers.GetWorld()
+    if not world or not world:IsValid() then log("HS2: no world"); return end
+
+    local gm = safe(function() return world.AuthorityGameMode end, nil)
+    if not gm or not gm:IsValid() then
+        log("HS2: no AuthorityGameMode -- run this on the HOST")
+        return
+    end
+
+    local charCls = StaticFindObject(PC_PATH)
+    if not charCls or not charCls:IsValid() then log("HS2: BP_PlayerCharacter_C not found"); return end
+
+    local dp = safe(function() return gm.DefaultPawnClass end, nil)
+    log("HS2: GameMode.DefaultPawnClass = " ..
+        ((dp and dp:IsValid()) and safe(function() return dp:GetFName():ToString() end, "?") or "NONE"))
+    if not (dp and dp:IsValid()) or safe(function() return dp:GetFName():ToString() end, "") ~= "BP_PlayerCharacter_C" then
+        local ok = pcall(function() gm.DefaultPawnClass = charCls end)
+        log("HS2: set DefaultPawnClass -> BP_PlayerCharacter_C : " .. tostring(ok))
+    end
+
+    local hostPawn, targets = nil, {}
+    for _, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if p and p:IsValid() then
+            if not hostPawn then hostPawn = p end
+        else
+            targets[#targets+1] = c
+        end
+    end
+    if #targets == 0 then log("HS2: nobody is pawnless"); return end
+    log("HS2: " .. #targets .. " pawnless controller(s)")
+
+    for _, c in ipairs(targets) do
+        -- 1. the engine's own route
+        local ok, err = pcall(function() c:ServerRestartPlayer() end)
+        log("HS2: ServerRestartPlayer -> " .. (ok and "called" or ("threw: " .. tostring(err))))
+
+        local p = safe(function() return c.Pawn end, nil)
+        if p and p:IsValid() then
+            log("HS2: pawn is now " .. className(p) .. " -- done, engine route works")
+        else
+            log("HS2: still no pawn, falling back to manual spawn")
+            if not hostPawn then log("HS2: no host pawn to place next to"); return end
+            local loc = safe(function() return hostPawn:K2_GetActorLocation() end, nil)
+            if not loc then log("HS2: no host location"); return end
+
+            local xform = {
+                Rotation    = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+                Translation = { X = loc.X + 250.0, Y = loc.Y + 250.0, Z = loc.Z + 100.0 },
+                Scale3D     = { X = 1.0, Y = 1.0, Z = 1.0 },
+            }
+            local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+            local ok2, err2 = pcall(function()
+                -- 6th arg is ESpawnActorScaleMethod, new in 5.3. 0 = OverrideRootScale.
+                local pawn = gs:BeginDeferredActorSpawnFromClass(world, charCls, xform, 2, c, 0)
+                if not pawn or not pawn:IsValid() then error("deferred spawn returned nothing") end
+                gs:FinishSpawningActor(pawn, xform, 0)
+                log("HS2: spawned " .. className(pawn))
+                c:Possess(pawn)
+            end)
+            if not ok2 then log("HS2: manual spawn failed -- " .. tostring(err2)) end
+            local p2 = safe(function() return c.Pawn end, nil)
+            log("HS2: final pawn = " .. ((p2 and p2:IsValid()) and className(p2) or "STILL NONE"))
+        end
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_hostspawn2", function()
+    ExecuteInGameThread(hostSpawn2)
+    return true
+end)
+
+log("SDMPDiag: sdmp_hostspawn2 - engine RestartPlayer first, manual spawn as fallback.")
+
+-- Run on the CLIENT. The pawn exists but won't move. Three usual suspects:
+-- the controller is still in UI input mode from the menu, the client-side
+-- possession setup (ClientRestart, which builds the input component) never
+-- ran, or the pawn came through as a SimulatedProxy the client can't drive.
+-- Report all three, then try the fixes.
+local function fixInput()
+    local pc = UEHelpers.GetPlayerController()
+    if not pc or not pc:IsValid() then log("IN: no PlayerController"); return end
+
+    local pawn = safe(function() return pc.Pawn end, nil)
+    if not (pawn and pawn:IsValid()) then log("IN: no pawn to drive"); return end
+
+    log("IN: pawn=" .. className(pawn) ..
+        "  role=" .. (ROLE[safe(function() return pawn.Role end, -1)] or "?") ..
+        "  remoteRole=" .. (ROLE[safe(function() return pawn.RemoteRole end, -1)] or "?"))
+    log("IN: bShowMouseCursor=" .. tostring(safe(function() return pc.bShowMouseCursor end, "?")) ..
+        "  AcknowledgedPawn=" .. (function()
+            local a = safe(function() return pc.AcknowledgedPawn end, nil)
+            return (a and a:IsValid()) and className(a) or "NONE" end)())
+
+    -- If the client never acknowledged the pawn, the possession handshake is
+    -- incomplete and input was never wired up locally.
+    local ack = safe(function() return pc.AcknowledgedPawn end, nil)
+    if not (ack and ack:IsValid()) then
+        log("IN: no AcknowledgedPawn -- calling ClientRestart to finish possession")
+        local ok, err = pcall(function() pc:ClientRestart(pawn) end)
+        log("IN: ClientRestart -> " .. (ok and "called" or ("threw: " .. tostring(err))))
+    end
+
+    -- Menu left us in UI input mode.
+    local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    if wbl and wbl:IsValid() then
+        local ok = pcall(function() wbl:SetInputMode_GameOnly(pc) end)
+        log("IN: SetInputMode_GameOnly -> " .. tostring(ok))
+    else
+        log("IN: WidgetBlueprintLibrary not found")
+    end
+    pcall(function() pc.bShowMouseCursor = false end)
+    pcall(function() pc:EnableInput(pc) end)
+
+    log("IN: done. Try moving.")
+end
+
+RegisterConsoleCommandHandler("sdmp_input", function()
+    ExecuteInGameThread(fixInput)
+    return true
+end)
+
+log("SDMPDiag: sdmp_input (on the client) reports and repairs input/possession state.")
