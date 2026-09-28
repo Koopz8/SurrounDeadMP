@@ -214,3 +214,107 @@ RegisterConsoleCommandHandler("sdmp_net", function()
 end)
 
 log("SDMPDiag: F8 / sdmp_net for quick net status.")
+
+-- Shipping builds compile logging out, so -log gives us nothing and a failed
+-- ?listen is silent. Read the engine's own net driver table instead: if the
+-- Engine.ini override didn't merge, GameNetDriver is simply undefined and
+-- listen fails with no way to tell.
+local function dumpNetDriverDefs()
+    local engine = UEHelpers.GetEngine()
+    if not engine or not engine:IsValid() then log("DRV: no engine"); return end
+
+    local defs = safe(function() return engine.NetDriverDefinitions end, nil)
+    if not defs then log("DRV: NetDriverDefinitions unreadable"); return end
+
+    local n = safe(function() return #defs end, 0)
+    log("DRV: " .. tostring(n) .. " net driver definition(s)")
+    if n == 0 then
+        log("DRV: EMPTY -- the ini override cleared the array and didn't refill it.")
+        log("DRV: remove the SDMP LOOPBACK TEST block from Engine.ini.")
+        return
+    end
+
+    for i = 1, n do
+        local ok = pcall(function()
+            local d = defs[i]
+            local function nm(f)
+                local v = d[f]
+                if v == nil then return "?" end
+                local s = safe(function() return v:ToString() end, nil)
+                return s or tostring(v)
+            end
+            log(("DRV[%d]: def=%s  class=%s  fallback=%s")
+                :format(i, nm("DefName"), nm("DriverClassName"), nm("DriverClassNameFallback")))
+        end)
+        if not ok then log("DRV[" .. i .. "]: unreadable") end
+    end
+end
+
+-- Travel via GameplayStatics rather than the console. OpenLevel is a real
+-- UFunction that takes an options string, so if `open ?listen` is being
+-- swallowed somewhere this path sidesteps it.
+local function hostListen()
+    local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    if not gs or not gs:IsValid() then log("HOST: no GameplayStatics"); return end
+    local world = UEHelpers.GetWorld()
+    if not world or not world:IsValid() then log("HOST: no world"); return end
+
+    log("HOST: OpenLevel(PersistentLevel, absolute=true, options='listen')")
+    local ok, err = pcall(function()
+        gs:OpenLevel(world, FName("PersistentLevel"), true, "listen")
+    end)
+    if not ok then log("HOST: OpenLevel failed -- " .. tostring(err)) end
+end
+
+RegisterConsoleCommandHandler("sdmp_drivers", function()
+    ExecuteInGameThread(dumpNetDriverDefs)
+    return true
+end)
+RegisterConsoleCommandHandler("sdmp_host", function()
+    ExecuteInGameThread(hostListen)
+    return true
+end)
+RegisterKeyBind(Key.F9, function() ExecuteInGameThread(dumpNetDriverDefs) end)
+
+log("SDMPDiag: F9 / sdmp_drivers to dump net driver defs, sdmp_host to listen.")
+
+-- The Engine.ini route doesn't survive: the game re-serializes user config on
+-- exit and drops any section it doesn't track, so the override was gone by the
+-- time we looked. Patch the live array instead. Session-only, nothing on disk,
+-- nothing for the game to overwrite.
+local function setIpDriver()
+    local engine = UEHelpers.GetEngine()
+    if not engine or not engine:IsValid() then log("DRV: no engine"); return end
+
+    local defs = safe(function() return engine.NetDriverDefinitions end, nil)
+    if not defs then log("DRV: NetDriverDefinitions unreadable"); return end
+
+    local n = safe(function() return #defs end, 0)
+    local changed = 0
+    for i = 1, n do
+        pcall(function()
+            local d = defs[i]
+            local name = safe(function() return d.DefName:ToString() end, "?")
+            if name == "GameNetDriver" then
+                d.DriverClassName = FName("OnlineSubsystemUtils.IpNetDriver")
+                d.DriverClassNameFallback = FName("OnlineSubsystemUtils.IpNetDriver")
+                changed = changed + 1
+            end
+        end)
+    end
+
+    if changed == 0 then
+        log("DRV: no GameNetDriver entry found to patch")
+    else
+        log("DRV: patched " .. changed .. " entry -> IpNetDriver. Verifying:")
+    end
+    dumpNetDriverDefs()
+end
+
+RegisterConsoleCommandHandler("sdmp_ipdriver", function()
+    ExecuteInGameThread(setIpDriver)
+    return true
+end)
+RegisterKeyBind(Key.F10, function() ExecuteInGameThread(setIpDriver) end)
+
+log("SDMPDiag: F10 / sdmp_ipdriver forces the IP net driver for this session.")
