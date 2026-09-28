@@ -862,3 +862,51 @@ end
 RegisterConsoleCommandHandler("sdmp_netperf", function() ExecuteInGameThread(netPerf) return true end)
 
 log("SDMPDiag: sdmp_netperf (on the host) reports and raises the net driver throttles.")
+
+-- sdmp_pawnfuncs found it. BP_PlayerCharacter_C carries the whole client UI
+-- surface as client RPCs the server is meant to fire after possession:
+--   Client_AddUI            builds it
+--   Client_UpdateHealthUI / Stamina / Hunger / Thirst / Oxygen / Radiation
+--   ShowCompassWidget, SetUIVisibility, GetInGameUI, ClearUI
+-- None of it runs for a player the server restarted by hand, which is why the
+-- host's HUD is fine and the client has nothing. Run on the CLIENT.
+local UI_BUILD  = { "Client_AddUI", "ShowCompassWidget" }
+local UI_UPDATE = {
+    "Client_UpdateHealthUI", "Client_UpdateStaminaUI", "Client_UpdateHungerUI",
+    "Client_UpdateThirstUI", "Client_UpdateOxygenUI", "Client_UpdateRadiationUI",
+}
+
+local function buildUI()
+    local pc = UEHelpers.GetPlayerController()
+    local pawn = pc and safe(function() return pc.Pawn end, nil) or nil
+    if not (pawn and pawn:IsValid()) then log("UI: no pawn"); return end
+
+    local existing = safe(function() return pawn:GetInGameUI() end, nil)
+    log("UI: GetInGameUI before = " .. tostring(existing))
+
+    for _, name in ipairs(UI_BUILD) do
+        if safe(function() return pawn[name] end, nil) ~= nil then
+            local ok, err = pcall(function() pawn[name](pawn) end)
+            log("UI: " .. name .. " -> " .. (ok and "called" or ("threw: " .. tostring(err))))
+        else
+            log("UI: no such function " .. name)
+        end
+    end
+
+    -- visibility is a separate flag from existence
+    pcall(function() pawn:SetUIVisibility(true) end)
+
+    -- nudge each bar so they draw with real values rather than empty
+    for _, name in ipairs(UI_UPDATE) do
+        if safe(function() return pawn[name] end, nil) ~= nil then
+            local ok = pcall(function() pawn[name](pawn) end)
+            log("UI: " .. name .. " -> " .. tostring(ok))
+        end
+    end
+
+    log("UI: GetInGameUI after = " .. tostring(safe(function() return pawn:GetInGameUI() end, nil)))
+end
+
+RegisterConsoleCommandHandler("sdmp_ui", function() ExecuteInGameThread(buildUI) return true end)
+
+log("SDMPDiag: sdmp_ui (on the client) calls Client_AddUI and the update RPCs.")
