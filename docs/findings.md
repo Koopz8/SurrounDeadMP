@@ -258,3 +258,51 @@ instances run as the same SteamID and a P2P connection to yourself goes
 nowhere — so testing forces the IP net driver via a user config override.
 `tools/README.md` has the procedure. Single player is unaffected; standalone
 never creates a net driver.
+
+---
+
+# It connects. 2026-09-28
+
+Two instances, loopback, IP net driver patched in from Lua:
+
+```
+client   NET: driver=IpNetDriver  connections=0  authority=no (we are a client)  pawn=NONE
+client   NET: map=PersistentLevel  actors=22480
+host     NET: driver=IpNetDriver  connections=1  authority=yes  pawn=BP_PlayerCharacter_C  role=Authority
+host     NET: map=PersistentLevel  actors=22595
+```
+
+The client is connected and has **22,480 actors** of the host's world — within
+a hundred of the host's own count. The world replicates. That was the open
+question and the answer is yes.
+
+What's missing is one thing: `pawn=NONE`. The client is a connected observer
+with no body.
+
+## Why nothing spawns
+
+`BP_SurroundeadGameMode` has no login hooks whatsoever — its only event is
+`ReceiveBeginPlay`. No `PostLogin`, no `HandleStartingNewPlayer`, no
+`SpawnDefaultPawn`. It never spawns anyone, which is fine for single player
+because the load-save flow does it.
+
+But `BP_PlayerController` already has a server-side respawn path, written for
+the game's own death flow:
+
+```
+Svr_RequestRespawn_Random
+Svr_RequestRespawn_SpawnPoint
+Svr_RequestRespawnSuicide
+Survival_Respawn
+PlayerRespawned (delegate)
+ReceivePossess
+RespawnScreen widget
+```
+
+`Svr_` is the game's own server-RPC prefix. So the mechanism for putting a
+player into the world on demand exists and is already server-authoritative —
+it just never fires for someone who arrives by connecting rather than dying.
+
+`sdmp_spawn` tries them in order on a pawnless controller. If the game's own
+respawn path works for a joiner, the spawning blocker is a few lines of glue
+rather than a new game mode.

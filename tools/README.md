@@ -28,7 +28,7 @@ engine state in Lua and `ue4ss\UE4SS.log`.
 Host:
 
 1. `tools\host.bat`
-2. At the main menu: **F10** — want `DRV[1]: class=OnlineSubsystemUtils.IpNetDriver`
+2. At the main menu, console `~` → `sdmp_ipdriver` — want `DRV[1]: class=OnlineSubsystemUtils.IpNetDriver`
 3. Console `~` → `sdmp_host`   (or `open /Game/Levels/PersistentLevel?listen`)
 4. **F8** — want `driver=IpNetDriver`. If it still says `NONE (standalone)`
    the listen is failing for a different reason and we need another angle.
@@ -39,7 +39,7 @@ Host:
 Client:
 
 7. `tools\second-instance.bat`
-8. At its menu: **F10** (each process has its own copy of the array)
+8. At its menu, `~` → `sdmp_ipdriver` (each process has its own copy)
 9. `~` → `open 127.0.0.1:7777`
 10. **F8** — want `authority=no (we are a client)` and a pawn.
     F8 on the host should show `connections=1`.
@@ -51,4 +51,4 @@ Client:
 | F7 | `sdmp_diag` | Full dump — CDOs, class chains, actor sweep |
 | F8 | `sdmp_net` | One line: driver, connections, authority, pawn |
 | F9 | `sdmp_drivers` | Dump `GEngine.NetDriverDefinitions` |
-| F10 | `sdmp_ipdriver` | Force IP net driver for this session |
+| — | `sdmp_ipdriver` | Force IP net driver for this session (F10 is taken by the console) |

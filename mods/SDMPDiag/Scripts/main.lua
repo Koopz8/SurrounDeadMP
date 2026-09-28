@@ -315,6 +315,78 @@ RegisterConsoleCommandHandler("sdmp_ipdriver", function()
     ExecuteInGameThread(setIpDriver)
     return true
 end)
-RegisterKeyBind(Key.F10, function() ExecuteInGameThread(setIpDriver) end)
+-- No key bound: F10 is taken by the console. Type sdmp_ipdriver instead.
 
-log("SDMPDiag: F10 / sdmp_ipdriver forces the IP net driver for this session.")
+log("SDMPDiag: type sdmp_ipdriver in the console to force the IP net driver.")
+
+-- The GameMode has no login hooks at all - just ReceiveBeginPlay - so it never
+-- spawns anyone. BP_PlayerController does, via Svr_RequestRespawn_Random /
+-- _SpawnPoint. Those are server RPCs the game already wrote for its own death
+-- and respawn flow. A joining client has no pawn; ask for one.
+local RESPAWN_FNS = {
+    "Svr_RequestRespawn_Random",
+    "Svr_RequestRespawn_SpawnPoint",
+    "Survival_Respawn",
+}
+
+local function requestSpawn()
+    local pc = UEHelpers.GetPlayerController()
+    if not pc or not pc:IsValid() then log("SPAWN: no PlayerController"); return end
+
+    local pawn = safe(function() return pc.Pawn end, nil)
+    if pawn and pawn:IsValid() then
+        log("SPAWN: already have a pawn (" .. className(pawn) .. "), nothing to do")
+        return
+    end
+
+    for _, name in ipairs(RESPAWN_FNS) do
+        local fn = safe(function() return pc[name] end, nil)
+        if fn ~= nil then
+            log("SPAWN: calling " .. name)
+            local ok, err = pcall(function() pc[name](pc) end)
+            if ok then
+                log("SPAWN: " .. name .. " returned. Check F8 in a second.")
+                return
+            end
+            log("SPAWN: " .. name .. " threw -- " .. tostring(err))
+        else
+            log("SPAWN: no such function " .. name)
+        end
+    end
+    log("SPAWN: nothing worked. Run sdmp_funcs and send the list.")
+end
+
+-- Fallback: what can we actually call on this controller?
+local function dumpFuncs()
+    local pc = UEHelpers.GetPlayerController()
+    if not pc or not pc:IsValid() then log("FN: no PlayerController"); return end
+
+    local cls = safe(function() return pc:GetClass() end, nil)
+    local guard = 0
+    while cls and cls:IsValid() and guard < 6 do
+        local cname = safe(function() return cls:GetFName():ToString() end, "?")
+        log("FN: --- " .. cname .. " ---")
+        pcall(function()
+            cls:ForEachFunction(function(fn)
+                local n = safe(function() return fn:GetFName():ToString() end, "?")
+                if n:match("^Svr") or n:match("^Server") or n:match("Respawn")
+                   or n:match("Spawn") or n:match("Possess") then
+                    log("FN:   " .. n)
+                end
+            end)
+        end)
+        cls = safe(function() return cls:GetSuperStruct() end, nil)
+        guard = guard + 1
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_spawn", function()
+    ExecuteInGameThread(requestSpawn)
+    return true
+end)
+RegisterConsoleCommandHandler("sdmp_funcs", function()
+    ExecuteInGameThread(dumpFuncs)
+    return true
+end)
+
+log("SDMPDiag: sdmp_spawn asks the server for a pawn. sdmp_funcs lists candidates.")
