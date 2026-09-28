@@ -154,3 +154,62 @@ Revised order of work:
    find out what doesn't rather than assuming.
 3. Session layer — Steam lobbies and host/join UI.
 4. Saves for non-host players.
+
+## The PlayerController flag was a false alarm
+
+Second diag run dumped the engine CDOs alongside the game's:
+
+```
+Default__BP_PlayerController_C  ->  bReplicates=false  bOnlyRelevantToOwner=true
+Default__PlayerController       ->  bReplicates=false  bOnlyRelevantToOwner=true
+```
+
+The engine's own `APlayerController` CDO reads exactly the same. `bReplicates`
+isn't stored where this read looks for a PlayerController, so the value is
+meaningless for that class — and the Blueprint matches stock in every field.
+The dev did not disable controller replication. Nothing to fix.
+
+`Default__Character` reads `bReplicates=true` and `BP_PlayerCharacter` matches,
+which is the consistency check that makes the rest of the table trustworthy.
+
+Class chains:
+
+```
+BP_PlayerController_C  <-  BP_MasterPlayerController_C  <-  PlayerController  <-  Controller
+BP_SurroundeadGameMode_C  <-  GameModeBase
+```
+
+`BP_MasterPlayerController` (`Content/Blueprints/Other/More/`) has zero
+replication markers — it's a thin intermediate, not where Jigsaw's MP layer
+lives. That's all on `BP_PlayerCharacter`.
+
+## The actual work list
+
+Of the non-replicating actors, most are correctly non-replicating: 16,875
+`StaticMeshActor` (world geometry), plus spawn volumes, prefab spawners,
+`PlayerStart`, build-exclusion zones, splines and water boxes — all server-side
+or static by design.
+
+What's left is the real list — things a second player will interact with that
+currently have no authority model:
+
+| Class | Count | Why it matters |
+|---|---|---|
+| `BP_POIManager_C` | 187 | POI state, likely loot gating |
+| `BP_LaboratoryLight_C` (+`2`,`3`) | 195 | Lab area lighting state |
+| `BP_LaboratoryLightSwitch_C` | 55 | Switch → light, needs authority |
+| `BP_Ladder_C` | 48 | Traversal |
+| `BP_LaboratorySlidingDoor_C` | 39 | Traversal |
+| `BP_LockedDoor_C` | 20 | Traversal + key state |
+| `BP_ZombieDoor_C` | 16 | Traversal |
+| `BP_ToolRequired_Axe_C` | 16 | Gated interaction |
+| `BP_ToolRequired_GunLocker_C` | 15 | Gated interaction |
+| `BP_WaterWell_C` | 15 | Resource interaction |
+| `TrashObject_C` | 141 | Minor, cosmetic |
+
+Doors, switches, ladders and gated interactables. That's a bounded list, not a
+rewrite. The Laboratory is the worst-affected area — it's essentially a
+single-player set piece.
+
+Next: two clients on a listen server, and find out how much of the replicating
+18.8% actually holds up under a real connection.
