@@ -1090,3 +1090,120 @@ RegisterConsoleCommandHandler("sdmp_own",   function() ExecuteInGameThread(ownDu
 RegisterConsoleCommandHandler("sdmp_reown", function() ExecuteInGameThread(reOwn)   return true end)
 
 log("SDMPDiag: sdmp_own dumps ownership/movement state; sdmp_reown (host) re-asserts it.")
+
+-- Host trace shows the client hitting 750 speed while MaxWalkSpeed reads 400 on
+-- both sides. Sprint is almost certainly a client-local MaxWalkSpeed change the
+-- server never hears about, so the server simulates 400, sees 750, and corrects
+-- the client backwards every tick. That is exactly "freezes mid run but keeps
+-- going". Single player never notices because there's nobody to disagree with.
+--
+-- sdmp_speedwatch logs MaxWalkSpeed alongside speed so we can watch them
+-- diverge. sdmp_speedfix raises it on the server's copy so it stops arguing -
+-- a blunt test of the theory, not the real fix. The real fix is making the
+-- sprint state replicate.
+local function speedWatch(tag)
+    local n = 0
+    log("SPD: watching 4s [" .. tag .. "]")
+    LoopAsync(100, function()
+        n = n + 1
+        ExecuteInGameThread(function()
+            for i, c in ipairs(listControllers()) do
+                local p = safe(function() return c.Pawn end, nil)
+                local cm = p and p:IsValid() and safe(function() return p.CharacterMovement end, nil) or nil
+                if cm and cm:IsValid() then
+                    local vel = safe(function() return p:GetVelocity() end, nil)
+                    log(("SPD[%s] %02d pawn%d spd=%.0f MaxWalk=%s mode=%s"):format(
+                        tag, n, i,
+                        vel and math.sqrt(vel.X*vel.X + vel.Y*vel.Y) or -1,
+                        tostring(safe(function() return cm.MaxWalkSpeed end, "?")),
+                        tostring(MOVEMODE[safe(function() return cm.MovementMode end, -1)] or "?")))
+                end
+            end
+        end)
+        return n >= 40
+    end)
+end
+
+local function speedFix(v)
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    if not (gm and gm:IsValid()) then log("SF: run on the HOST"); return end
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        local cm = p and p:IsValid() and safe(function() return p.CharacterMovement end, nil) or nil
+        if cm and cm:IsValid() then
+            pcall(function() cm.MaxWalkSpeed = v end)
+            log(("SF[%d]: MaxWalkSpeed -> %s"):format(i,
+                tostring(safe(function() return cm.MaxWalkSpeed end, "?"))))
+        end
+    end
+    log("SF: server will stop correcting up to " .. v .. ". Move the client and see.")
+end
+
+RegisterConsoleCommandHandler("sdmp_speedwatch_host",   function() speedWatch("HOST")   return true end)
+RegisterConsoleCommandHandler("sdmp_speedwatch_client", function() speedWatch("CLIENT") return true end)
+RegisterConsoleCommandHandler("sdmp_speedfix", function() ExecuteInGameThread(function() speedFix(900.0) end) return true end)
+
+log("SDMPDiag: sdmp_speedwatch_host/_client logs MaxWalkSpeed vs actual; sdmp_speedfix on host.")
+
+-- It's the client's OWN pawn stuttering. That one should be locally predicted
+-- and completely immune to network rate, so either prediction isn't running on
+-- it or its updates are being starved. The video's character-region cadence
+-- works out around 15Hz, which is far slower than the 120Hz tick we set - that
+-- gap is the thing to explain.
+--
+-- sdmp_fine samples every 20ms for 2s. If the position advances in even little
+-- steps every sample, prediction is running and the stutter is elsewhere. If it
+-- moves in ~15 chunky jumps, it's being driven by replication like a remote
+-- actor and prediction is dead.
+local function fineTrace()
+    local n = 0
+    log("FINE: 2s at 20ms")
+    LoopAsync(20, function()
+        n = n + 1
+        ExecuteInGameThread(function()
+            local pc = UEHelpers.GetPlayerController()
+            local p = pc and safe(function() return pc.Pawn end, nil) or nil
+            if p and p:IsValid() then
+                local l = safe(function() return p:K2_GetActorLocation() end, nil)
+                if l then log(("FINE %03d %.1f %.1f %.1f"):format(n, l.X, l.Y, l.Z)) end
+            end
+        end)
+        return n >= 100
+    end)
+end
+
+-- With 4200 replicating actors competing, a pawn on default priority can get
+-- starved down to a few updates a second no matter what the tick rate is.
+-- Players should always win that contest. Run on the HOST.
+local function priorityFix()
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    if not (gm and gm:IsValid()) then log("PRI: run on the HOST"); return end
+
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if p and p:IsValid() then
+            log(("PRI[%d]: before  NetPriority=%s  bAlwaysRelevant=%s  NetUpdateFreq=%s  MinNetUpdateFreq=%s"):format(i,
+                tostring(safe(function() return p.NetPriority end, "?")),
+                tostring(safe(function() return p.bAlwaysRelevant end, "?")),
+                tostring(safe(function() return p.NetUpdateFrequency end, "?")),
+                tostring(safe(function() return p.MinNetUpdateFrequency end, "?"))))
+            pcall(function() p.NetPriority = 20.0 end)
+            pcall(function() p.bAlwaysRelevant = true end)
+            pcall(function() p.NetUpdateFrequency = 120.0 end)
+            pcall(function() p.MinNetUpdateFrequency = 60.0 end)
+            pcall(function() p:ForceNetUpdate() end)
+            log(("PRI[%d]: after   NetPriority=%s  bAlwaysRelevant=%s  NetUpdateFreq=%s  MinNetUpdateFreq=%s"):format(i,
+                tostring(safe(function() return p.NetPriority end, "?")),
+                tostring(safe(function() return p.bAlwaysRelevant end, "?")),
+                tostring(safe(function() return p.NetUpdateFrequency end, "?")),
+                tostring(safe(function() return p.MinNetUpdateFrequency end, "?"))))
+        end
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_fine",    function() fineTrace() return true end)
+RegisterConsoleCommandHandler("sdmp_priority",function() ExecuteInGameThread(priorityFix) return true end)
+
+log("SDMPDiag: sdmp_fine 20ms trace; sdmp_priority (host) stops player pawns being starved.")
