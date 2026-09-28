@@ -1207,3 +1207,109 @@ RegisterConsoleCommandHandler("sdmp_fine",    function() fineTrace() return true
 RegisterConsoleCommandHandler("sdmp_priority",function() ExecuteInGameThread(priorityFix) return true end)
 
 log("SDMPDiag: sdmp_fine 20ms trace; sdmp_priority (host) stops player pawns being starved.")
+
+-- sdmp_fine nailed the shape of it. At 750 units/sec a 20ms step should be a
+-- steady 15 units. Instead: 15 3 14 17 37 18 8 15 31 15 19 15 0 19 31 5 ...
+-- Stalls at 0-3, then jumps of 28-37, which is two or three steps arriving at
+-- once. Position is being written in server-sized chunks rather than predicted
+-- forward. Priority made no difference and it was already NetPriority 3 with
+-- NetUpdateFrequency 100, so starvation is out too.
+--
+-- One clean bisect left. Trace every pawn, not just the local one, and have the
+-- HOST run while the CLIENT records. The host's character on the client is a
+-- simulated proxy:
+--   host's char also stutters  -> general replication smoothing, tune
+--                                 NetworkSmoothingMode, ordinary problem
+--   only our own stutters      -> client prediction genuinely isn't running,
+--                                 which is a real engine-level fault
+local function fineAll(tag)
+    local n = 0
+    log("FINE2: 2s at 20ms [" .. tag .. "]")
+    LoopAsync(20, function()
+        n = n + 1
+        ExecuteInGameThread(function()
+            for i, c in ipairs(listControllers()) do
+                local p = safe(function() return c.Pawn end, nil)
+                if p and p:IsValid() then
+                    local l = safe(function() return p:K2_GetActorLocation() end, nil)
+                    if l then
+                        log(("FINE2[%s] %03d p%d %s %.1f %.1f"):format(
+                            tag, n, i,
+                            ROLE[safe(function() return p.Role end, -1)] or "?",
+                            l.X, l.Y))
+                    end
+                end
+            end
+        end)
+        return n >= 100
+    end)
+end
+
+RegisterConsoleCommandHandler("sdmp_fine2", function() fineAll("C") return true end)
+
+log("SDMPDiag: sdmp_fine2 traces every pawn - run on the client while the HOST moves.")
+
+-- Bisect result: the host's character is smooth on the client, our own is not.
+-- Backwards from normal - a simulated proxy is interpolated, an autonomous one
+-- is predicted and should be the smoother of the two. So prediction isn't
+-- running on our pawn and it's being driven by corrections instead.
+--
+-- Same shape as every other bug in this game: the client-side setup ran before
+-- possession completed, so it never took. reown skipped the re-possess because
+-- ownership already looked right; this forces it, which makes the engine redo
+-- the whole handshake - ClientRestart, input component, movement init - in the
+-- correct order this time. Run on the HOST.
+local function rePossess()
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    if not (gm and gm:IsValid()) then log("RP: run on the HOST"); return end
+
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if not (p and p:IsValid()) then goto continue end
+        -- leave the host's own alone, it's fine
+        if safe(function() return c:IsLocalController() end, false) == true then
+            log(("RP[%d]: skipping local (host) controller"):format(i))
+            goto continue
+        end
+
+        log(("RP[%d]: forcing unpossess/possess on %s"):format(i, className(p)))
+        pcall(function() c:UnPossess() end)
+        pcall(function() c:Possess(p) end)
+        local p2 = safe(function() return c.Pawn end, nil)
+        log(("RP[%d]: pawn now %s"):format(i, (p2 and p2:IsValid()) and className(p2) or "NONE"))
+        ::continue::
+    end
+    log("RP: done. On the client re-run sdmp_input2 and sdmp_ui, then move.")
+end
+
+-- Remote players have no PlayerController on a client, so controller-based
+-- tracing can never see them. Enumerate characters instead.
+local function fineChars()
+    local n = 0
+    log("FC: 2s at 20ms, all characters")
+    LoopAsync(20, function()
+        n = n + 1
+        ExecuteInGameThread(function()
+            pcall(function()
+                local cs = FindAllOf("Character")
+                if not cs then return end
+                for i, ch in ipairs(cs) do
+                    if ch:IsValid() and className(ch) == "BP_PlayerCharacter_C" then
+                        local l = safe(function() return ch:K2_GetActorLocation() end, nil)
+                        if l then
+                            log(("FC %03d c%d %s %.1f %.1f"):format(n, i,
+                                ROLE[safe(function() return ch.Role end, -1)] or "?", l.X, l.Y))
+                        end
+                    end
+                end
+            end)
+        end)
+        return n >= 100
+    end)
+end
+
+RegisterConsoleCommandHandler("sdmp_repossess", function() ExecuteInGameThread(rePossess) return true end)
+RegisterConsoleCommandHandler("sdmp_finechars", function() fineChars() return true end)
+
+log("SDMPDiag: sdmp_repossess (host) redoes the possession handshake; sdmp_finechars traces all characters.")
