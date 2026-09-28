@@ -213,3 +213,48 @@ single-player set piece.
 
 Next: two clients on a listen server, and find out how much of the replicating
 18.8% actually holds up under a real connection.
+
+---
+
+# SteamCore is already in the binary
+
+The user `Engine.ini` lists the marketplace plugins the build ships with, and
+one of them is `SteamCore_5.3`. It's linked into the shipping exe — 129 symbol
+hits, including the entire matchmaking surface:
+
+```
+CreateLobby            CreateLobbyAsync       JoinLobby        JoinLobbyAsync
+LeaveLobby             RequestLobbyList       GetLobbyByIndex  GetLobbyOwner
+GetLobbyData           SetLobbyData           GetNumLobbyMembers
+GetLobbyMemberByIndex  GetLobbyMemberData     GetLobbyMemberLimit
+InviteUserToLobby      GameLobbyJoinRequested
+AddRequestLobbyListStringFilter / NumericalFilter / DistanceFilter /
+  ResultCountFilter / SlotsAvailable / NearValue / CompatibleMembers
+```
+
+Plus the delegates: `OnCreateLobby`, `OnJoinLobby`, `OnLobbyChatMsg`,
+`OnGameLobbyJoinRequested`, `OnLobbyDataUpdate`, `OnLobbyKicked`.
+
+These are reflected UFunctions, so **UE4SS Lua can call them directly** — no
+pak override, no Blueprint editing. That covers the entire session layer we
+thought we'd have to build:
+
+- host creates a lobby, writes its address into lobby data
+- friends see it, or get invited through the Steam overlay
+- `GameLobbyJoinRequested` fires on the joiner, who reads the address and travels
+
+`RequestLobbyList` with filters gives a public server browser too, if we want
+one later.
+
+So the revised picture is that neither end of this was the hard part. The
+world already replicates, and Steam lobbies are already callable. What's
+genuinely missing is the middle: spawning and possessing a second player, and
+the ~11 interactable classes with no authority model.
+
+# Testing without a second machine or a second copy
+
+Two processes on one PC over 127.0.0.1. Steam P2P can't do this — both
+instances run as the same SteamID and a P2P connection to yourself goes
+nowhere — so testing forces the IP net driver via a user config override.
+`tools/README.md` has the procedure. Single player is unaffected; standalone
+never creates a net driver.
