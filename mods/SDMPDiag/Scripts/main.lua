@@ -806,3 +806,59 @@ RegisterConsoleCommandHandler("sdmp_pawnfuncs", function() ExecuteInGameThread(p
 RegisterConsoleCommandHandler("sdmp_ping", function() ExecuteInGameThread(pingInfo) return true end)
 
 log("SDMPDiag: sdmp_pawnfuncs lists pawn UI/setup functions, sdmp_ping reports real ping.")
+
+-- stat unit says host 7.55ms and client 5.77ms - both well over 130fps. So the
+-- stutter is not performance and the movement config is stock, which leaves the
+-- net driver's own throttles. UE ships them tuned for 2004 broadband:
+--   NetServerMaxTickRate  30   - the whole server replicates 30x/sec
+--   MaxClientRate         10000 bytes/sec
+--   MaxInternetClientRate 10000 bytes/sec
+-- 10 KB/s across a world with thousands of relevant replicating actors means
+-- updates queue and the client renders stale positions. That reads exactly like
+-- tearing. Run on the HOST.
+local function netPerf()
+    local world = UEHelpers.GetWorld()
+    if not world or not world:IsValid() then log("NP: no world"); return end
+    local nd = safe(function() return world.NetDriver end, nil)
+    if not (nd and nd:IsValid()) then log("NP: no NetDriver -- run on the HOST"); return end
+
+    local function show(tag)
+        log(("NP[%s]: ServerMaxTickRate=%s  MaxClientRate=%s  MaxInternetClientRate=%s  NetServerMaxTickRate=%s"):format(
+            tag,
+            tostring(safe(function() return nd.NetServerMaxTickRate end, "?")),
+            tostring(safe(function() return nd.MaxClientRate end, "?")),
+            tostring(safe(function() return nd.MaxInternetClientRate end, "?")),
+            tostring(safe(function() return nd.NetServerMaxTickRate end, "?"))))
+        local conns = safe(function() return nd.ClientConnections end, nil)
+        if conns then
+            for i = 1, safe(function() return #conns end, 0) do
+                pcall(function()
+                    local c = conns[i]
+                    log(("NP[%s]: conn %d CurrentNetSpeed=%s"):format(
+                        tag, i, tostring(safe(function() return c.CurrentNetSpeed end, "?"))))
+                end)
+            end
+        end
+    end
+
+    show("before")
+
+    pcall(function() nd.NetServerMaxTickRate = 60 end)
+    pcall(function() nd.MaxClientRate = 200000 end)
+    pcall(function() nd.MaxInternetClientRate = 200000 end)
+
+    -- the per-connection speed is negotiated at join, so bump the live ones too
+    local conns = safe(function() return nd.ClientConnections end, nil)
+    if conns then
+        for i = 1, safe(function() return #conns end, 0) do
+            pcall(function() conns[i].CurrentNetSpeed = 200000 end)
+        end
+    end
+
+    show("after")
+    log("NP: done. Move the client around and see if it's smoother.")
+end
+
+RegisterConsoleCommandHandler("sdmp_netperf", function() ExecuteInGameThread(netPerf) return true end)
+
+log("SDMPDiag: sdmp_netperf (on the host) reports and raises the net driver throttles.")
