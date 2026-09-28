@@ -750,3 +750,59 @@ RegisterConsoleCommandHandler("sdmp_hud", function() ExecuteInGameThread(fixHud)
 RegisterConsoleCommandHandler("sdmp_move", function() ExecuteInGameThread(moveInfo) return true end)
 
 log("SDMPDiag: sdmp_hud creates the client HUD, sdmp_move reports movement/ping numbers.")
+
+-- MyHUD exists (HUD_Game_C), so HUDClass isn't the problem. The game's UI is
+-- assembled from many separate widgets - Compass, TimeUI, medical bars - built
+-- during the normal start flow. A client whose character arrived via
+-- ServerRestartPlayer skips all of it. Almost certainly the same
+-- BeginPlay-before-controller race that ate the input context, which would
+-- mean one fix covers both. Enumerating first, since that's what found
+-- ServerRestartPlayer.
+local function pawnFuncs()
+    local pc = UEHelpers.GetPlayerController()
+    local pawn = pc and safe(function() return pc.Pawn end, nil) or nil
+    if not (pawn and pawn:IsValid()) then log("PF: no pawn"); return end
+
+    local cls = safe(function() return pawn:GetClass() end, nil)
+    local guard = 0
+    while cls and cls:IsValid() and guard < 4 do
+        log("PF: --- " .. safe(function() return cls:GetFName():ToString() end, "?") .. " ---")
+        pcall(function()
+            cls:ForEachFunction(function(fn)
+                local n = safe(function() return fn:GetFName():ToString() end, "?")
+                if n:match("UI") or n:match("Widget") or n:match("HUD")
+                   or n:match("Init") or n:match("Setup") or n:match("Create")
+                   or n:match("Possess") or n:match("BeginPlay") then
+                    log("PF:   " .. n)
+                end
+            end)
+        end)
+        cls = safe(function() return cls:GetSuperStruct() end, nil)
+        guard = guard + 1
+    end
+
+    -- components often own their own UI setup
+    pcall(function()
+        local comps = pawn:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.ActorComponent"))
+        if comps then
+            log("PF: " .. #comps .. " components")
+            for i = 1, math.min(#comps, 40) do
+                log("PF:   comp " .. className(comps[i]))
+            end
+        end
+    end)
+end
+
+-- The earlier ping read returned object wrappers. UE5 has a proper accessor.
+local function pingInfo()
+    local pc = UEHelpers.GetPlayerController()
+    local ps = pc and safe(function() return pc.PlayerState end, nil) or nil
+    if not (ps and ps:IsValid()) then log("PING: no PlayerState"); return end
+    local ok, v = pcall(function() return ps:GetPingInMilliseconds() end)
+    log("PING: " .. (ok and (tostring(v) .. " ms") or ("GetPingInMilliseconds threw: " .. tostring(v))))
+end
+
+RegisterConsoleCommandHandler("sdmp_pawnfuncs", function() ExecuteInGameThread(pawnFuncs) return true end)
+RegisterConsoleCommandHandler("sdmp_ping", function() ExecuteInGameThread(pingInfo) return true end)
+
+log("SDMPDiag: sdmp_pawnfuncs lists pawn UI/setup functions, sdmp_ping reports real ping.")
