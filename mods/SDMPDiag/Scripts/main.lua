@@ -951,3 +951,142 @@ RegisterConsoleCommandHandler("sdmp_tick60", function() ExecuteInGameThread(func
 RegisterConsoleCommandHandler("sdmp_tick120",function() ExecuteInGameThread(function() setTick(120) end) return true end)
 
 log("SDMPDiag: sdmp_pos on both sides to compare positions; sdmp_tick60/120 on the host.")
+
+-- Positions matched exactly, so the ghost theory is dead and both symptoms
+-- need explaining some other way. Two samples with vel=0 told us nothing about
+-- what happens while actually moving, so sample it properly: 40 readings at
+-- 100ms on each side, then diff the traces. A client whose own position is
+-- smooth locally but arrives at the server in 30hz steps looks exactly like
+-- this, and a trace shows it where two snapshots can't.
+local function track(tag)
+    local n = 0
+    log("TRK: starting 4s trace [" .. tag .. "]")
+    LoopAsync(100, function()
+        n = n + 1
+        ExecuteInGameThread(function()
+            for i, c in ipairs(listControllers()) do
+                local p = safe(function() return c.Pawn end, nil)
+                if p and p:IsValid() then
+                    local loc = safe(function() return p:K2_GetActorLocation() end, nil)
+                    local vel = safe(function() return p:GetVelocity() end, nil)
+                    if loc then
+                        log(("TRK[%s] %02d pawn%d role=%s %.0f %.0f %.0f spd=%.0f"):format(
+                            tag, n, i,
+                            ROLE[safe(function() return p.Role end, -1)] or "?",
+                            loc.X, loc.Y, loc.Z,
+                            vel and math.sqrt(vel.X*vel.X + vel.Y*vel.Y) or -1))
+                    end
+                end
+            end
+        end)
+        return n >= 40
+    end)
+end
+
+-- "No health lost" might mean no damage, or it might mean damage landing with
+-- a health bar that never updates - Client_UpdateHealthUI wanted a parameter we
+-- never passed, so the bar could be lying. Read the real numbers off the server.
+local function statDump()
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if not (p and p:IsValid()) then goto continue end
+        log("ST: --- pawn " .. i .. " " .. className(p) .. " ---")
+        local cls = safe(function() return p:GetClass() end, nil)
+        pcall(function()
+            cls:ForEachProperty(function(prop)
+                local pn = safe(function() return prop:GetFName():ToString() end, "")
+                if pn:match("[Hh]ealth") or pn:match("[Ss]tamina") or pn:match("[Hh]unger")
+                   or pn:match("[Tt]hirst") or pn:match("[Dd]amage") or pn:match("[Dd]ead")
+                   or pn:match("[Aa]live") or pn:match("Invuln") or pn:match("[Gg]odMode") then
+                    local v = safe(function() return p[pn] end, nil)
+                    log(("ST:   %s = %s"):format(pn, tostring(v)))
+                end
+            end)
+        end)
+        ::continue::
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_track_host",   function() track("HOST")   return true end)
+RegisterConsoleCommandHandler("sdmp_track_client", function() track("CLIENT") return true end)
+RegisterConsoleCommandHandler("sdmp_stats", function() ExecuteInGameThread(statDump) return true end)
+
+log("SDMPDiag: sdmp_track_host / sdmp_track_client trace positions; sdmp_stats reads real health.")
+
+-- The trace settled it. Client moves smoothly 0->400 speed over 4 seconds; the
+-- server's copy of that same pawn never moves at all, spd=0 the whole time,
+-- ~900 units from where the client actually is. The server is not receiving or
+-- not applying ServerMove. That single fact explains all three symptoms: the
+-- client predicts forward and gets yanked back (choppy), the AI walks to a
+-- position the player left long ago (zombies chase, never attack), and nothing
+-- ever hits you (health never drops).
+-- ServerMove is an RPC, and RPCs need ownership. Check the chain.
+local MOVEMODE = { [0]="None", [1]="Walking", [2]="NavWalking", [3]="Falling",
+                   [4]="Swimming", [5]="Flying", [6]="Custom" }
+
+local function ownDump()
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    local side = (gm and gm:IsValid()) and "HOST" or "CLIENT"
+    log("OWN: side=" .. side)
+
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if p and p:IsValid() then
+            local owner = safe(function() return p.Owner end, nil)
+            local ctrl  = safe(function() return p.Controller end, nil)
+            log(("OWN[%d]: pawn=%s role=%s/%s"):format(i, className(p),
+                ROLE[safe(function() return p.Role end, -1)] or "?",
+                ROLE[safe(function() return p.RemoteRole end, -1)] or "?"))
+            log(("OWN[%d]:   Owner=%s  Controller=%s  bReplicateMovement=%s"):format(i,
+                (owner and owner:IsValid()) and className(owner) or "NONE",
+                (ctrl and ctrl:IsValid()) and className(ctrl) or "NONE",
+                tostring(safe(function() return p.bReplicateMovement end, "?"))))
+
+            local cm = safe(function() return p.CharacterMovement end, nil)
+            if cm and cm:IsValid() then
+                log(("OWN[%d]:   MovementMode=%s  MaxWalkSpeed=%s  bIsActive=%s"):format(i,
+                    tostring(MOVEMODE[safe(function() return cm.MovementMode end, -1)] or "?"),
+                    tostring(safe(function() return cm.MaxWalkSpeed end, "?")),
+                    tostring(safe(function() return cm.bIsActive end, "?"))))
+            else
+                log(("OWN[%d]:   no CharacterMovement"):format(i))
+            end
+
+            local ok, locctl = pcall(function() return p:IsLocallyControlled() end)
+            log(("OWN[%d]:   IsLocallyControlled=%s"):format(i, ok and tostring(locctl) or "n/a"))
+        end
+    end
+end
+
+-- If Owner is wrong, ServerMove gets dropped server-side as unowned. Cheap to
+-- test: re-assert it and re-possess.
+local function reOwn()
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    if not (gm and gm:IsValid()) then log("RO: run on the HOST"); return end
+
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if p and p:IsValid() then
+            local owner = safe(function() return p.Owner end, nil)
+            local same = (owner and owner:IsValid()) and (className(owner) == className(c))
+            log(("RO[%d]: Owner=%s controller=%s"):format(i,
+                (owner and owner:IsValid()) and className(owner) or "NONE", className(c)))
+            if not same then
+                log(("RO[%d]: re-asserting ownership"):format(i))
+                pcall(function() p:SetOwner(c) end)
+                pcall(function() c:UnPossess() end)
+                pcall(function() c:Possess(p) end)
+                log(("RO[%d]: Owner now %s"):format(i, (function()
+                    local o = safe(function() return p.Owner end, nil)
+                    return (o and o:IsValid()) and className(o) or "NONE" end)()))
+            end
+        end
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_own",   function() ExecuteInGameThread(ownDump) return true end)
+RegisterConsoleCommandHandler("sdmp_reown", function() ExecuteInGameThread(reOwn)   return true end)
+
+log("SDMPDiag: sdmp_own dumps ownership/movement state; sdmp_reown (host) re-asserts it.")
