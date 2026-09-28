@@ -910,3 +910,44 @@ end
 RegisterConsoleCommandHandler("sdmp_ui", function() ExecuteInGameThread(buildUI) return true end)
 
 log("SDMPDiag: sdmp_ui (on the client) calls Client_AddUI and the update RPCs.")
+
+-- Hunch: the zombies and the choppiness are one bug. Zombies chase the client
+-- but never attack, which is what you'd see if the server's copy of the client
+-- pawn sits somewhere the client isn't - the AI walks to a ghost and never
+-- reaches attack range. That same divergence is what choppy movement looks
+-- like from the client side. Run sdmp_pos on BOTH within a second of each
+-- other while the client is running, and compare.
+local function posDump()
+    local world = UEHelpers.GetWorld()
+    local isHost = world and safe(function() return world.AuthorityGameMode end, nil) ~= nil
+    log("POS: side=" .. (isHost and "HOST" or "CLIENT"))
+
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if p and p:IsValid() then
+            local loc = safe(function() return p:K2_GetActorLocation() end, nil)
+            local vel = safe(function() return p:GetVelocity() end, nil)
+            log(("POS[%d]: role=%s  loc=%s  vel=%s"):format(
+                i,
+                ROLE[safe(function() return p.Role end, -1)] or "?",
+                loc and ("%.0f %.0f %.0f"):format(loc.X, loc.Y, loc.Z) or "?",
+                vel and ("%.0f"):format(math.sqrt(vel.X*vel.X + vel.Y*vel.Y)) or "?"))
+        end
+    end
+end
+
+-- 30 was the default and 60 may still not be enough for a survival game where
+-- you notice every hitch. Tunable so we can find the knee.
+local function setTick(n)
+    local world = UEHelpers.GetWorld()
+    local nd = world and safe(function() return world.NetDriver end, nil) or nil
+    if not (nd and nd:IsValid()) then log("TICK: no NetDriver -- run on the HOST"); return end
+    pcall(function() nd.NetServerMaxTickRate = n end)
+    log("TICK: NetServerMaxTickRate = " .. tostring(safe(function() return nd.NetServerMaxTickRate end, "?")))
+end
+
+RegisterConsoleCommandHandler("sdmp_pos",    function() ExecuteInGameThread(posDump) return true end)
+RegisterConsoleCommandHandler("sdmp_tick60", function() ExecuteInGameThread(function() setTick(60)  end) return true end)
+RegisterConsoleCommandHandler("sdmp_tick120",function() ExecuteInGameThread(function() setTick(120) end) return true end)
+
+log("SDMPDiag: sdmp_pos on both sides to compare positions; sdmp_tick60/120 on the host.")
