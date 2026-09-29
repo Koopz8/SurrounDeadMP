@@ -1588,3 +1588,151 @@ RegisterConsoleCommandHandler("sdmp_fine3",    function() fine3() return true en
 RegisterConsoleCommandHandler("sdmp_animfuncs",function() ExecuteInGameThread(animFuncs) return true end)
 
 log("SDMPDiag: sdmp_fine3 samples with world time; sdmp_animfuncs lists anim functions.")
+
+-- Nobody has checked whether the server is correcting the client. Position
+-- "agreeing" doesn't rule it out - after a correction they agree by definition.
+-- And a correction on your own pawn looks exactly like this: snap back, replay,
+-- catch up. SetReplicateMovement(false) wouldn't touch it either, corrections
+-- go through CharacterMovement's own RPCs.
+--
+-- There's a reason to suspect it. BP_PlayerCharacter has ReceiveTick, an
+-- FInterpTo, and sets MaxWalkSpeed through Svr_UpdateSpeed -> MC_UpdateSpeed
+-- (plus Svr_UpdateSprintSpeed / Svr_UpdateWalkSpeed / Svr_SetActorLocation /
+-- Svr_SetActorRotation / Svr_SetMovement). If speed is pushed over RPCs while
+-- the client predicts with whatever value it had, server and client simulate
+-- the same move at different speeds and the server snaps us back.
+--
+-- sdmp_rpcwatch counts all of that per second for 15s. Run it on BOTH
+-- instances and sprint on the client. It flips net.UsePackedMovementRPCs to 0
+-- locally so acks (ClientAckGoodMove) and corrections (ClientAdjustPosition)
+-- arrive as separate RPCs we can tell apart.
+local BPC = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:"
+local WATCH = {
+    -- client side, native
+    "/Script/Engine.Character:ClientAckGoodMove",
+    "/Script/Engine.Character:ClientAdjustPosition",
+    "/Script/Engine.Character:ClientVeryShortAdjustPosition",
+    "/Script/Engine.Character:ClientAdjustRootMotionPosition",
+    "/Script/Engine.Character:ClientMoveResponsePacked",
+    -- server side, native
+    "/Script/Engine.Character:ServerMovePacked",
+    "/Script/Engine.Character:ServerMove",
+    "/Script/Engine.Character:ServerMoveNoBase",
+    "/Script/Engine.Character:ServerMoveDual",
+    "/Script/Engine.Character:ServerMoveDualNoBase",
+    -- the game's own movement RPCs
+    BPC .. "Svr_UpdateSpeed",
+    BPC .. "MC_UpdateSpeed",
+    BPC .. "Svr_UpdateSprintSpeed",
+    BPC .. "Svr_UpdateWalkSpeed",
+    BPC .. "Svr_SetActorLocation",
+    BPC .. "Svr_SetActorRotation",
+    BPC .. "Svr_SetMovement",
+    BPC .. "Svr_SetJumpVelocity",
+    BPC .. "Svr_ReduceStamina",
+    BPC .. "MC_SetCapsuleSize",
+}
+
+local rw = { hooked = false, on = false, counts = {}, lastArg = {}, ok = 0, bad = {} }
+
+local function shortName(path) return path:match(":(.+)$") or path end
+
+local function rwHookAll()
+    if rw.hooked then return end
+    rw.hooked = true
+    for _, path in ipairs(WATCH) do
+        local name = shortName(path)
+        local ok, err = pcall(function()
+            RegisterHook(path, function(ctx, a1)
+                if not rw.on then return end
+                local who = "?"
+                pcall(function()
+                    local c = ctx:get()
+                    who = (c:IsLocallyControlled() == true) and "own" or "other"
+                end)
+                local key = name .. "@" .. who
+                rw.counts[key] = (rw.counts[key] or 0) + 1
+                if a1 then
+                    pcall(function()
+                        local v = a1:get()
+                        if type(v) == "number" then rw.lastArg[key] = v end
+                    end)
+                end
+            end)
+        end)
+        if ok then rw.ok = rw.ok + 1 else rw.bad[#rw.bad+1] = name end
+    end
+    log(("RW: hooked %d/%d"):format(rw.ok, #WATCH))
+    if #rw.bad > 0 then log("RW: not hookable: " .. table.concat(rw.bad, ", ")) end
+end
+
+local function rwCvar(cmd)
+    local ksl = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+    local world = UEHelpers.GetWorld()
+    local pc = UEHelpers.GetPlayerController()
+    local ok = pcall(function() ksl:ExecuteConsoleCommand(world, cmd, pc) end)
+    log("RW: " .. cmd .. " -> " .. tostring(ok))
+end
+
+local function rpcWatch()
+    local side = "?"
+    ExecuteInGameThread(function()
+        local pc = UEHelpers.GetPlayerController()
+        side = (pc and safe(function() return pc:HasAuthority() end, false)) and "HOST" or "CLIENT"
+        rwCvar("net.UsePackedMovementRPCs 0")
+        rwHookAll()
+        rw.counts, rw.lastArg, rw.on = {}, {}, true
+        log("RW[" .. side .. "]: watching 15s - sprint on the client now")
+    end)
+    local sec = 0
+    LoopAsync(1000, function()
+        sec = sec + 1
+        ExecuteInGameThread(function()
+            local keys = {}
+            for k in pairs(rw.counts) do keys[#keys+1] = k end
+            table.sort(keys)
+            local parts = {}
+            for _, k in ipairs(keys) do
+                local s = k .. "=" .. rw.counts[k]
+                if rw.lastArg[k] then s = s .. ("(%.0f)"):format(rw.lastArg[k]) end
+                parts[#parts+1] = s
+            end
+            log(("RW[%s] t=%02d  %s"):format(side, sec,
+                #parts > 0 and table.concat(parts, "  ") or "(nothing)"))
+            rw.counts, rw.lastArg = {}, {}
+            if sec >= 15 then
+                rw.on = false
+                log("RW[" .. side .. "]: done. ClientAdjustPosition@own on the CLIENT = server is correcting us.")
+            end
+        end)
+        return sec >= 15
+    end)
+end
+
+-- If rpcwatch shows corrections, this is the A/B: tell the server to trust the
+-- remote client's movement. Stutter gone = corrections were it. Run on HOST.
+local function trustClient(on)
+    local n = 0
+    local chars = FindAllOf("BP_PlayerCharacter_C") or {}
+    for _, c in ipairs(chars) do
+        if c:IsValid() and safe(function() return c:IsLocallyControlled() end, true) == false then
+            pcall(function()
+                local cmc = c.CharacterMovement
+                cmc.bIgnoreClientMovementErrorChecksAndCorrection = on
+                cmc.bServerAcceptClientAuthoritativePosition = on
+                n = n + 1
+                log(("TC: %s ignoreCorrections=%s acceptClientPos=%s"):format(
+                    className(c),
+                    tostring(cmc.bIgnoreClientMovementErrorChecksAndCorrection),
+                    tostring(cmc.bServerAcceptClientAuthoritativePosition)))
+            end)
+        end
+    end
+    log(("TC: applied to %d remote character(s)"):format(n))
+end
+
+RegisterConsoleCommandHandler("sdmp_rpcwatch",    function() rpcWatch() return true end)
+RegisterConsoleCommandHandler("sdmp_trustclient", function() ExecuteInGameThread(function() trustClient(true)  end) return true end)
+RegisterConsoleCommandHandler("sdmp_trustserver", function() ExecuteInGameThread(function() trustClient(false) end) return true end)
+
+log("SDMPDiag: sdmp_rpcwatch counts movement RPCs; sdmp_trustclient turns off server corrections.")
