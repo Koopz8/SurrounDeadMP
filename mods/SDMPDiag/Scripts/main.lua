@@ -1313,3 +1313,39 @@ RegisterConsoleCommandHandler("sdmp_repossess", function() ExecuteInGameThread(r
 RegisterConsoleCommandHandler("sdmp_finechars", function() fineChars() return true end)
 
 log("SDMPDiag: sdmp_repossess (host) redoes the possession handshake; sdmp_finechars traces all characters.")
+
+-- Last runtime theory before this needs a proper pak mod.
+-- Characters replicate movement THROUGH the movement component, which knows how
+-- to reconcile with a predicting client. The plain ReplicatedMovement path does
+-- not - it stamps the server transform straight onto the client. If both are
+-- running, every update stomps whatever prediction produced, which is exactly
+-- the stall-then-jump we measured.
+-- Turning it off on the server for the client's pawn is diagnostic, not a fix:
+-- if the stutter clears, we know what to change properly in the blueprint.
+local function repMove(on)
+    local world = UEHelpers.GetWorld()
+    local gm = world and safe(function() return world.AuthorityGameMode end, nil) or nil
+    if not (gm and gm:IsValid()) then log("RM: run on the HOST"); return end
+
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if not (p and p:IsValid()) then goto continue end
+        if safe(function() return c:IsLocalController() end, false) == true then
+            log(("RM[%d]: leaving host's own pawn alone"):format(i))
+            goto continue
+        end
+        log(("RM[%d]: bReplicateMovement %s -> %s"):format(i,
+            tostring(safe(function() return p.bReplicateMovement end, "?")), tostring(on)))
+        local ok = pcall(function() p:SetReplicateMovement(on) end)
+        if not ok then pcall(function() p.bReplicateMovement = on end) end
+        pcall(function() p:ForceNetUpdate() end)
+        log(("RM[%d]: now %s"):format(i, tostring(safe(function() return p.bReplicateMovement end, "?"))))
+        ::continue::
+    end
+    log("RM: move the client. If it's smooth now, generic transform replication was the culprit.")
+end
+
+RegisterConsoleCommandHandler("sdmp_repmove_off", function() ExecuteInGameThread(function() repMove(false) end) return true end)
+RegisterConsoleCommandHandler("sdmp_repmove_on",  function() ExecuteInGameThread(function() repMove(true)  end) return true end)
+
+log("SDMPDiag: sdmp_repmove_off (host) disables generic transform replication on the client's pawn.")
