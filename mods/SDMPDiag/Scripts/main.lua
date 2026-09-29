@@ -1452,3 +1452,70 @@ RegisterConsoleCommandHandler("sdmp_rootmotion2_fix", function()
     ExecuteInGameThread(function() rootMotion2(3) end) return true end)
 
 log("SDMPDiag: sdmp_rootmotion2 unwraps the enum properly; _fix sets montages-only.")
+
+-- Root motion is out: AnimInstance RootMotionMode = 3, montages-only, already
+-- the net-safe value, and IsPlayingRootMotion false.
+--
+-- More importantly the earlier 0/31 trace may have been my own instrument.
+-- LoopAsync sleeps on a worker thread and queues onto the game thread; if the
+-- game thread drains several queued callbacks in one frame, consecutive samples
+-- read the same position and the next batch jumps. That IS the 0-then-double
+-- pattern. So the thing four theories were built on might never have existed.
+--
+-- Sample from inside the frame instead. BlueprintUpdateAnimation is a real
+-- UFunction that runs once per frame on the anim instance, so a hook there is
+-- genuine per-frame data with no queueing in between.
+local ftActive, ftN, ftLast, ftRows = false, 0, nil, {}
+
+local function frameTrace()
+    ftActive, ftN, ftLast, ftRows = true, 0, nil, {}
+    log("FT: hooking BlueprintUpdateAnimation for 200 frames")
+end
+
+local okHook, errHook = pcall(function()
+    RegisterHook("/Game/Blueprints/Player_AnimBP.Player_AnimBP_C:BlueprintUpdateAnimation",
+    function(ctx)
+        if not ftActive then return end
+        local ok = pcall(function()
+            local ai = ctx:get()
+            local pawn = ai:GetOwningActor()
+            if not (pawn and pawn:IsValid()) then return end
+            -- only our own locally controlled character
+            if safe(function() return pawn:IsLocallyControlled() end, false) ~= true then return end
+
+            local l = pawn:K2_GetActorLocation()
+            ftN = ftN + 1
+            local step = 0.0
+            if ftLast then
+                step = math.sqrt((l.X-ftLast.x)^2 + (l.Y-ftLast.y)^2)
+            end
+            ftLast = { x = l.X, y = l.Y }
+            ftRows[#ftRows+1] = step
+
+            if ftN >= 200 then
+                ftActive = false
+                local parts = {}
+                for i = 2, #ftRows do parts[#parts+1] = ("%.1f"):format(ftRows[i]) end
+                log("FT: per-frame steps (units):")
+                for i = 1, #parts, 40 do
+                    log("FT:   " .. table.concat(parts, " ", i, math.min(i+39, #parts)))
+                end
+                local zero, big = 0, 0
+                for i = 2, #ftRows do
+                    if ftRows[i] < 0.05 then zero = zero + 1 end
+                    if ftRows[i] > 20 then big = big + 1 end
+                end
+                log(("FT: %d frames, %d with no movement, %d jumps over 20 units"):format(
+                    #ftRows, zero, big))
+                log("FT: even steps = prediction is fine and the stutter is visual.")
+                log("FT: zeros then jumps = the position really does stall.")
+            end
+        end)
+        if not ok then ftActive = false; log("FT: hook body failed") end
+    end)
+end)
+log("FT: hook registered = " .. tostring(okHook) .. (okHook and "" or (" err=" .. tostring(errHook))))
+
+RegisterConsoleCommandHandler("sdmp_frametrace", function() frameTrace() return true end)
+
+log("SDMPDiag: sdmp_frametrace samples inside the frame - no queueing artifact.")
