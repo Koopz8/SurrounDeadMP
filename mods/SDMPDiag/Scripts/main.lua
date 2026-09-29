@@ -1392,3 +1392,63 @@ RegisterConsoleCommandHandler("sdmp_rootmotion_fix", function()
     ExecuteInGameThread(function() rootMotion(3) end) return true end)
 
 log("SDMPDiag: sdmp_rootmotion reports RootMotionMode, sdmp_rootmotion_fix sets montages-only.")
+
+-- RootMotionMode came back as a TrivialObject wrapper rather than a number.
+-- UE4SS hands enum byte properties back that way, so unwrap it properly before
+-- concluding anything.
+local function enumVal(o)
+    if o == nil then return nil, "nil" end
+    if type(o) == "number" then return o, "number" end
+    local ok, v = pcall(function() return o:get() end)
+    if ok and type(v) == "number" then return v, "get()" end
+    ok, v = pcall(function() return o:GetValue() end)
+    if ok and type(v) == "number" then return v, "GetValue()" end
+    ok, v = pcall(function() return tonumber(tostring(o)) end)
+    if ok and type(v) == "number" then return v, "tostring" end
+    return nil, "type=" .. type(o) .. " str=" .. tostring(o)
+end
+
+local function rootMotion2(setTo)
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if not (p and p:IsValid()) then goto continue end
+        local mesh = safe(function() return p.Mesh end, nil)
+        if not (mesh and mesh:IsValid()) then
+            log(("RM2[%d]: no Mesh"):format(i)); goto continue
+        end
+
+        local raw = safe(function() return mesh.RootMotionMode end, nil)
+        local v, how = enumVal(raw)
+        log(("RM2[%d]: %s RootMotionMode raw=%s  value=%s (%s) via %s"):format(
+            i, className(p), tostring(raw), tostring(v), RMM[v] or "?", how))
+
+        -- the anim instance carries its own root motion setting too
+        local ai = safe(function() return mesh:GetAnimInstance() end, nil)
+        if ai and ai:IsValid() then
+            log(("RM2[%d]:   AnimInstance=%s  RootMotionMode=%s"):format(i, className(ai),
+                tostring((enumVal(safe(function() return ai.RootMotionMode end, nil))))))
+        end
+
+        local cm = safe(function() return p.CharacterMovement end, nil)
+        if cm and cm:IsValid() then
+            log(("RM2[%d]:   HasAnimRootMotion=%s  bServerAcceptClientAuthoritativePosition=%s"):format(i,
+                tostring(safe(function() return p:IsPlayingRootMotion() end, "?")),
+                tostring(safe(function() return cm.bServerAcceptClientAuthoritativePosition end, "?"))))
+        end
+
+        if setTo ~= nil then
+            local ok = pcall(function() mesh.RootMotionMode = setTo end)
+            local nv = enumVal(safe(function() return mesh.RootMotionMode end, nil))
+            log(("RM2[%d]: set %s -> ok=%s now=%s (%s)"):format(i, tostring(setTo),
+                tostring(ok), tostring(nv), RMM[nv] or "?"))
+        end
+        ::continue::
+    end
+end
+
+RegisterConsoleCommandHandler("sdmp_rootmotion2", function()
+    ExecuteInGameThread(function() rootMotion2(nil) end) return true end)
+RegisterConsoleCommandHandler("sdmp_rootmotion2_fix", function()
+    ExecuteInGameThread(function() rootMotion2(3) end) return true end)
+
+log("SDMPDiag: sdmp_rootmotion2 unwraps the enum properly; _fix sets montages-only.")
