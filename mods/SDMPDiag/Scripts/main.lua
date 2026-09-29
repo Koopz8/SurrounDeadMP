@@ -1519,3 +1519,72 @@ log("FT: hook registered = " .. tostring(okHook) .. (okHook and "" or (" err=" .
 RegisterConsoleCommandHandler("sdmp_frametrace", function() frameTrace() return true end)
 
 log("SDMPDiag: sdmp_frametrace samples inside the frame - no queueing artifact.")
+
+-- The hook target didn't exist - BlueprintUpdateAnimation isn't implemented on
+-- that anim blueprint - so nothing got sampled. But there's a simpler way to
+-- settle whether the old trace was real: record world time with each sample.
+--
+-- If the "no movement" samples also show no time passing, they were batched
+-- onto one frame and the stall was my instrument. If time advanced normally
+-- while position didn't, the stall is real. Same data either way, and it
+-- reports speed as step/dt so a steady 750 shows up as steady even if the
+-- sampling is uneven.
+local function fine3()
+    local n, rows = 0, {}
+    log("F3: sampling 120x with world time")
+    LoopAsync(16, function()
+        n = n + 1
+        ExecuteInGameThread(function()
+            local world = UEHelpers.GetWorld()
+            local pc = UEHelpers.GetPlayerController()
+            local p = pc and safe(function() return pc.Pawn end, nil) or nil
+            if not (world and p and p:IsValid()) then return end
+            local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+            local t = gs and safe(function() return gs:GetTimeSeconds(world) end, nil) or nil
+            local l = safe(function() return p:K2_GetActorLocation() end, nil)
+            if t and l then rows[#rows+1] = { t = t, x = l.X, y = l.Y } end
+
+            if n >= 120 and #rows > 2 then
+                local out = {}
+                for i = 2, #rows do
+                    local dt = rows[i].t - rows[i-1].t
+                    local d  = math.sqrt((rows[i].x-rows[i-1].x)^2 + (rows[i].y-rows[i-1].y)^2)
+                    out[#out+1] = ("dt=%.3f d=%.1f v=%.0f"):format(dt, d, dt > 0.0001 and d/dt or -1)
+                end
+                log("F3: dt / distance / implied speed")
+                for i = 1, #out, 6 do
+                    log("F3:   " .. table.concat(out, "  |  ", i, math.min(i+5, #out)))
+                end
+                local sameFrame = 0
+                for i = 2, #rows do
+                    if (rows[i].t - rows[i-1].t) < 0.0005 then sameFrame = sameFrame + 1 end
+                end
+                log(("F3: %d of %d samples landed on the same frame as the previous one"):format(
+                    sameFrame, #rows - 1))
+                log("F3: lots of those = the old 0/31 trace was my sampling, not the game.")
+            end
+        end)
+        return n >= 120
+    end)
+end
+
+-- So we can pick a real per-frame hook target next time instead of guessing.
+local function animFuncs()
+    local pc = UEHelpers.GetPlayerController()
+    local p = pc and safe(function() return pc.Pawn end, nil) or nil
+    local mesh = p and p:IsValid() and safe(function() return p.Mesh end, nil) or nil
+    local ai = mesh and mesh:IsValid() and safe(function() return mesh:GetAnimInstance() end, nil) or nil
+    if not (ai and ai:IsValid()) then log("AF: no anim instance"); return end
+    local cls = safe(function() return ai:GetClass() end, nil)
+    log("AF: " .. safe(function() return cls:GetFName():ToString() end, "?"))
+    pcall(function()
+        cls:ForEachFunction(function(fn)
+            log("AF:   " .. safe(function() return fn:GetFName():ToString() end, "?"))
+        end)
+    end)
+end
+
+RegisterConsoleCommandHandler("sdmp_fine3",    function() fine3() return true end)
+RegisterConsoleCommandHandler("sdmp_animfuncs",function() ExecuteInGameThread(animFuncs) return true end)
+
+log("SDMPDiag: sdmp_fine3 samples with world time; sdmp_animfuncs lists anim functions.")
