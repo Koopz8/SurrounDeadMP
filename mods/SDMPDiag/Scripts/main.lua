@@ -1349,3 +1349,46 @@ RegisterConsoleCommandHandler("sdmp_repmove_off", function() ExecuteInGameThread
 RegisterConsoleCommandHandler("sdmp_repmove_on",  function() ExecuteInGameThread(function() repMove(true)  end) return true end)
 
 log("SDMPDiag: sdmp_repmove_off (host) disables generic transform replication on the client's pawn.")
+
+-- Stopped guessing and read the assets. Player_AnimBP has RootMotionBasedOnRootBone
+-- and BP_PlayerCharacter has only two AddMovementInput calls - far too few for a
+-- full locomotion system. So movement is coming out of the animation, not the
+-- movement component.
+--
+-- ERootMotionMode::RootMotionFromEverything is documented as not supported in
+-- networked games. The client extracts motion from its own animation, the server
+-- runs its own animation state, and the two disagree every frame - which is the
+-- stall-then-catch-up we measured, and why it's invisible in single player.
+--   0 NoRootMotionExtraction   1 IgnoreRootMotion
+--   2 RootMotionFromEverything 3 RootMotionFromMontagesOnly  <- the net-safe one
+local RMM = { [0]="NoRootMotionExtraction", [1]="IgnoreRootMotion",
+              [2]="RootMotionFromEverything", [3]="RootMotionFromMontagesOnly" }
+
+local function rootMotion(setTo)
+    for i, c in ipairs(listControllers()) do
+        local p = safe(function() return c.Pawn end, nil)
+        if not (p and p:IsValid()) then goto continue end
+        local mesh = safe(function() return p.Mesh end, nil)
+        if not (mesh and mesh:IsValid()) then
+            log(("RMM[%d]: no Mesh"):format(i)); goto continue
+        end
+        local cur = safe(function() return mesh.RootMotionMode end, nil)
+        log(("RMM[%d]: %s  RootMotionMode = %s (%s)"):format(i, className(p),
+            tostring(cur), RMM[cur] or "?"))
+        if setTo ~= nil then
+            local ok = pcall(function() mesh.RootMotionMode = setTo end)
+            local now = safe(function() return mesh.RootMotionMode end, nil)
+            log(("RMM[%d]: set -> %s  now %s (%s)"):format(i, tostring(ok),
+                tostring(now), RMM[now] or "?"))
+        end
+        ::continue::
+    end
+    if setTo ~= nil then log("RMM: move the client now.") end
+end
+
+RegisterConsoleCommandHandler("sdmp_rootmotion", function()
+    ExecuteInGameThread(function() rootMotion(nil) end) return true end)
+RegisterConsoleCommandHandler("sdmp_rootmotion_fix", function()
+    ExecuteInGameThread(function() rootMotion(3) end) return true end)
+
+log("SDMPDiag: sdmp_rootmotion reports RootMotionMode, sdmp_rootmotion_fix sets montages-only.")
