@@ -1736,3 +1736,93 @@ RegisterConsoleCommandHandler("sdmp_trustclient", function() ExecuteInGameThread
 RegisterConsoleCommandHandler("sdmp_trustserver", function() ExecuteInGameThread(function() trustClient(false) end) return true end)
 
 log("SDMPDiag: sdmp_rpcwatch counts movement RPCs; sdmp_trustclient turns off server corrections.")
+
+-- sdmp_trustclient didn't change the stutter, and the host log shows a steady
+-- ~55 ServerMovePacked/s with no speed RPC spam. Corrections are out, and with
+-- them the network. Whatever it is happens on the client's own frame.
+--
+-- So sample inside that frame. BP_PlayerCharacter implements ReceiveTick (the
+-- anim BP didn't, which is why sdmp_frametrace never fired). Per frame we log
+-- the actor, the mesh, the camera and the yaws, so the layer that stalls names
+-- itself: actor stalls = movement, actor smooth but camera stalls = camera,
+-- both smooth = it's the animation / what you're looking at.
+local tk = { hooked = false, on = false, rows = {}, side = "?" }
+
+local function v2(a, b) return math.sqrt((a.X-b.X)^2 + (a.Y-b.Y)^2) end
+
+local function tkReport()
+    local r = tk.rows
+    log(("TK[%s]: %d frames. dt ms | actor d | mesh d | cam d | actor yaw | ctrl yaw | vel"):format(tk.side, #r))
+    local stallA, stallM, stallC, spikeDt = 0, 0, 0, 0
+    local sumDt = 0
+    for i = 2, #r do
+        local a, b = r[i-1], r[i]
+        local dt = b.t - a.t
+        local dA, dM, dC = v2(a.a, b.a), v2(a.m, b.m), v2(a.c, b.c)
+        sumDt = sumDt + dt
+        if b.v > 100 then
+            if dA < 0.05 then stallA = stallA + 1 end
+            if dM < 0.05 then stallM = stallM + 1 end
+            if dC < 0.05 then stallC = stallC + 1 end
+        end
+        b.line = ("%5.1f %6.1f %6.1f %6.1f %7.1f %7.1f %4.0f"):format(
+            dt*1000, dA, dM, dC, b.ay, b.cy, b.v)
+    end
+    local mean = sumDt / math.max(1, #r-1)
+    for i = 2, #r do
+        if (r[i].t - r[i-1].t) > mean * 2 then spikeDt = spikeDt + 1 end
+    end
+    for i = 2, #r do log("TK:  " .. r[i].line) end
+    log(("TK[%s]: mean dt %.1f ms, %d dt spikes (>2x mean)"):format(tk.side, mean*1000, spikeDt))
+    log(("TK[%s]: while moving, frames with no step - actor %d, mesh %d, camera %d"):format(
+        tk.side, stallA, stallM, stallC))
+end
+
+local function tkHook()
+    if tk.hooked then return true end
+    local ok, err = pcall(function()
+        RegisterHook("/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:ReceiveTick",
+        function(ctx)
+            if not tk.on then return end
+            pcall(function()
+                local p = ctx:get()
+                if p:IsLocallyControlled() ~= true then return end
+                local world = UEHelpers.GetWorld()
+                local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+                local pc = p.Controller
+                local cam = pc.PlayerCameraManager
+                local a = p:K2_GetActorLocation()
+                local m = p.Mesh:K2_GetComponentLocation()
+                local c = cam:GetCameraLocation()
+                local vel = p.CharacterMovement.Velocity
+                tk.rows[#tk.rows+1] = {
+                    t  = gs:GetTimeSeconds(world),
+                    a  = { X = a.X, Y = a.Y },
+                    m  = { X = m.X, Y = m.Y },
+                    c  = { X = c.X, Y = c.Y },
+                    ay = p:K2_GetActorRotation().Yaw,
+                    cy = pc:GetControlRotation().Yaw,
+                    v  = math.sqrt(vel.X^2 + vel.Y^2),
+                }
+                if #tk.rows >= 240 then tk.on = false; tkReport() end
+            end)
+        end)
+    end)
+    tk.hooked = ok
+    if not ok then log("TK: hook failed: " .. tostring(err)) end
+    return ok
+end
+
+local function tickTrace()
+    ExecuteInGameThread(function()
+        local pc = UEHelpers.GetPlayerController()
+        tk.side = (pc and safe(function() return pc:HasAuthority() end, false)) and "HOST" or "CLIENT"
+        if not tkHook() then return end
+        tk.rows, tk.on = {}, true
+        log("TK[" .. tk.side .. "]: recording 240 frames from ReceiveTick - be running")
+    end)
+end
+
+RegisterConsoleCommandHandler("sdmp_ticktrace", function() tickTrace() return true end)
+
+log("SDMPDiag: sdmp_ticktrace samples actor/mesh/camera inside ReceiveTick.")
