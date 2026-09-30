@@ -1826,3 +1826,149 @@ end
 RegisterConsoleCommandHandler("sdmp_ticktrace", function() tickTrace() return true end)
 
 log("SDMPDiag: sdmp_ticktrace samples actor/mesh/camera inside ReceiveTick.")
+
+-- ticktrace result: frames are steady (4.1 ms, no hitches) and the actor moves
+-- smoothly ~3 units a frame - except every so often it jumps 10-17 units in one
+-- frame, and the yaw snaps back to an old value (148 -> 17.6) and re-turns.
+-- Something is writing old position/rotation onto our own pawn. The frame is
+-- fine; the pawn is being teleported.
+--
+-- sdmp_snaptrace is ticktrace plus an event log: every way the pawn can be
+-- moved from outside (net RPCs, OnRep, BP SetActorLocation/Rotation, the
+-- character BP's own MC_/Client_/OnRep_ functions) is hooked and stamped with
+-- the frame it landed on. The report lists what fired on each snap frame.
+local st = { hooked = false, on = false, rows = {}, ev = {}, pawnAddr = nil, side = "?", count = {} }
+
+local ST_NATIVE = {
+    "/Script/Engine.Actor:K2_SetActorLocation",
+    "/Script/Engine.Actor:K2_SetActorRotation",
+    "/Script/Engine.Actor:K2_SetActorLocationAndRotation",
+    "/Script/Engine.Actor:K2_SetActorTransform",
+    "/Script/Engine.Actor:K2_TeleportTo",
+    "/Script/Engine.Actor:K2_AddActorWorldOffset",
+    "/Script/Engine.Actor:K2_AddActorWorldRotation",
+    "/Script/Engine.Actor:OnRep_ReplicatedMovement",
+    "/Script/Engine.Character:OnRep_ReplicatedBasedMovement",
+    "/Script/Engine.Character:ClientMoveResponsePacked",
+    "/Script/Engine.Character:ClientAdjustPosition",
+    "/Script/Engine.Character:ClientVeryShortAdjustPosition",
+    "/Script/Engine.Character:ClientAdjustRootMotionPosition",
+    "/Script/Engine.Character:ClientAckGoodMove",
+    "/Script/Engine.Character:LaunchCharacter",
+    "/Script/Engine.Controller:SetControlRotation",
+    "/Script/Engine.Controller:ClientSetRotation",
+    "/Script/Engine.Controller:ClientSetLocation",
+}
+
+local function stAddr(o) return safe(function() return o:GetAddress() end, nil) end
+
+local function stMark(name, ctx)
+    if not st.on then return end
+    local mine = false
+    pcall(function()
+        local o = ctx:get()
+        local a = o:GetAddress()
+        if a == st.pawnAddr then mine = true; return end
+        -- controller functions: is it our controller?
+        local p = o.Pawn
+        if p and p:IsValid() and p:GetAddress() == st.pawnAddr then mine = true end
+    end)
+    if not mine then return end
+    st.ev[#st.ev+1] = { f = #st.rows, n = name }
+    st.count[name] = (st.count[name] or 0) + 1
+end
+
+local function stReport()
+    local r = st.rows
+    local steps = {}
+    for i = 2, #r do
+        steps[i] = v2(r[i-1].a, r[i].a)
+    end
+    local byFrame = {}
+    for _, e in ipairs(st.ev) do
+        byFrame[e.f] = byFrame[e.f] or {}
+        table.insert(byFrame[e.f], e.n)
+    end
+    local snaps = 0
+    log(("ST[%s]: snap frames (step > 2x neighbours, or yaw jump > 3 deg):"):format(st.side))
+    for i = 3, #r - 1 do
+        local nb = (steps[i-1] + steps[i+1]) / 2
+        local dyaw = math.abs(((r[i].ay - r[i-1].ay + 180) % 360) - 180)
+        if (steps[i] > 2 * nb and steps[i] - nb > 2) or dyaw > 3 then
+            snaps = snaps + 1
+            local evs = {}
+            for f = i - 2, i do
+                for _, n in ipairs(byFrame[f] or {}) do evs[#evs+1] = n .. "@" .. (f - i) end
+            end
+            log(("ST:  frame %3d  step %5.1f (nb %4.1f)  yaw %6.1f->%6.1f  events: %s"):format(
+                i, steps[i], nb, r[i-1].ay, r[i].ay, #evs > 0 and table.concat(evs, ", ") or "NONE"))
+        end
+    end
+    log(("ST[%s]: %d snaps in %d frames"):format(st.side, snaps, #r))
+    local parts = {}
+    for k, v in pairs(st.count) do parts[#parts+1] = k .. "=" .. v end
+    table.sort(parts)
+    log("ST: event totals: " .. (#parts > 0 and table.concat(parts, "  ") or "none"))
+end
+
+local function stHookAll(pawn)
+    if st.hooked then return end
+    st.hooked = true
+    local ok, bad = 0, {}
+    local function hook(path, name)
+        local good = pcall(function()
+            RegisterHook(path, function(ctx) stMark(name, ctx) end)
+        end)
+        if good then ok = ok + 1 else bad[#bad+1] = name end
+    end
+    for _, path in ipairs(ST_NATIVE) do hook(path, shortName(path)) end
+    -- every network-driven function on the character BP
+    pcall(function()
+        pawn:GetClass():ForEachFunction(function(fn)
+            local n = safe(function() return fn:GetFName():ToString() end, "")
+            if n:match("^MC_") or n:match("^Client_") or n:match("^OnRep_") then
+                hook(BPC .. n, n)
+            end
+        end)
+    end)
+    -- the per-frame sampler
+    local good = pcall(function()
+        RegisterHook(BPC .. "ReceiveTick", function(ctx)
+            if not st.on then return end
+            pcall(function()
+                local p = ctx:get()
+                if p:GetAddress() ~= st.pawnAddr then return end
+                local pc = p.Controller
+                local a = p:K2_GetActorLocation()
+                local vel = p.CharacterMovement.Velocity
+                st.rows[#st.rows+1] = {
+                    a  = { X = a.X, Y = a.Y },
+                    ay = p:K2_GetActorRotation().Yaw,
+                    cy = pc:GetControlRotation().Yaw,
+                    v  = math.sqrt(vel.X^2 + vel.Y^2),
+                }
+                if #st.rows >= 480 then st.on = false; stReport() end
+            end)
+        end)
+    end)
+    if good then ok = ok + 1 else bad[#bad+1] = "ReceiveTick" end
+    log(("ST: hooked %d functions"):format(ok))
+    if #bad > 0 then log("ST: couldn't hook: " .. table.concat(bad, ", ")) end
+end
+
+local function snapTrace()
+    ExecuteInGameThread(function()
+        local pc = UEHelpers.GetPlayerController()
+        local p = pc and safe(function() return pc.Pawn end, nil) or nil
+        if not (p and p:IsValid()) then log("ST: no pawn"); return end
+        st.side = safe(function() return pc:HasAuthority() end, false) and "HOST" or "CLIENT"
+        st.pawnAddr = stAddr(p)
+        stHookAll(p)
+        st.rows, st.ev, st.count, st.on = {}, {}, {}, true
+        log("ST[" .. st.side .. "]: recording 480 frames - sprint and turn a bit")
+    end)
+end
+
+RegisterConsoleCommandHandler("sdmp_snaptrace", function() snapTrace() return true end)
+
+log("SDMPDiag: sdmp_snaptrace logs what moved the pawn on each snap frame.")
