@@ -1950,6 +1950,16 @@ local function stReport()
         end
         st.lastStalls, st.lastDoubles = stall, dbl
         log(("ST[%s]: median step %.1f, %d stalled frames, %d catch-up frames"):format(st.side, med, stall, dbl))
+        local tpAll, tpStall, tpNext = 0, 0, 0
+        for i = 2, #r do
+            if r[i].tp == true then tpAll = tpAll + 1 end
+            if r[i].v > 100 and med > 0 and steps[i] < med * 0.25 then
+                if r[i].tp == true then tpStall = tpStall + 1 end
+                if r[i+1] and r[i+1].tp == true then tpNext = tpNext + 1 end
+            end
+        end
+        log(("ST[%s]: bJustTeleported true on %d/%d frames; on %d of %d stalls (next frame: %d)"):format(
+            st.side, tpAll, #r - 1, tpStall, stall, tpNext))
     end
     -- Which events line up with stalls: hits on stall frames (or the frame
     -- before) vs total hits.
@@ -1985,9 +1995,10 @@ local function stReport()
                 local function d(a, b) return (a and b) and v2(a, b) or -1 end
                 local cells = {}
                 for j = i - 1, i + 1 do
-                    cells[#cells+1] = ("[%s step=%.1f lastUpd=%.1f vel=%.0f acc=%.0f in=%.2f]"):format(
+                    cells[#cells+1] = ("[%s step=%.1f lastUpd=%.1f vel=%.0f tp=%s nu=%s]"):format(
                         j == i and "STALL" or (j < i and "prev" or "next"),
-                        steps[j] or -1, d(r[j-1] and r[j-1].lu, r[j].lu), r[j].v, r[j].acc or -1, r[j].inp or -1)
+                        steps[j] or -1, d(r[j-1] and r[j-1].lu, r[j].lu), r[j].v,
+                        tostring(r[j].tp), tostring(r[j].nu))
                 end
                 log("ST stall f" .. i .. " " .. table.concat(cells, " "))
             end
@@ -2072,6 +2083,8 @@ local function stHookAll(pawn)
                     m  = mloc and { X = mloc.X, Y = mloc.Y } or nil,
                     lu = lu and { X = lu.X, Y = lu.Y } or nil,
                     acc = acc and math.sqrt(acc.X^2 + acc.Y^2) or -1,
+                    tp = safe(function() return cmc.bJustTeleported end, nil),
+                    nu = safe(function() return cmc.bNetworkUpdateReceived end, nil),
                     inp = inp and math.sqrt(inp.X^2 + inp.Y^2) or -1,
                     t  = safe(function()
                         return StaticFindObject("/Script/Engine.Default__GameplayStatics"):GetTimeSeconds(UEHelpers.GetWorld())
