@@ -2324,6 +2324,7 @@ do
     -- the speed limits are. Run on both sides during a phase, the host's copy
     -- and the client's own pawn can be compared second by second.
     A.mon = function(tag, p)
+        if true then return end -- off: keep test runs light
         pcall(function()
             local cmc = p.CharacterMovement
             local l = p:K2_GetActorLocation()
@@ -2594,8 +2595,7 @@ do
                         alog(("moved joiner next to host -> %s"):format(tostring(ok)))
                     end
                     pcall(function() p.bCanBeDamaged = false end)
-                    A.dumpMove("host-own", myPawn())
-                    A.dumpMove("host-copy-of-client", p)
+                    -- (config dumps done - nothing differed)
                 end
             end
             for _, c in ipairs(listControllers()) do
@@ -2607,7 +2607,7 @@ do
             end
             if (fread("sdmp_htrace.txt") or "") == "go" then
                 fwrite("sdmp_htrace.txt", "0")
-                A.hostTrace()
+                -- A.hostTrace()  (off: keep test runs light)
                 -- Control: run the exact same scripted walk/sprint + snaptrace
                 -- on the HOST's own pawn at the same 60fps cap. The host looks
                 -- smooth; if the instrument still counts stalls there, the
@@ -2644,7 +2644,7 @@ do
     local function startRun()
         local p, pc = myPawn()
         A.hookRun()
-        if not A.dumped then A.dumped = true; A.dumpMove("client-own", (myPawn())) end
+
         if not A.capped then A.capped = true; console("t.MaxFPS 60") end
         A.run = { frames = 0, phase = "walk", n = 0, sprintOk = nil }
         alog("scripted run: 3s walk, then sprint + snaptrace, turning halfway")
@@ -2798,11 +2798,18 @@ do
                 --   3 host 60 / client uncapped
                 -- Note this is two games on one PC, so part of it may be the
                 -- uncapped host hogging the machine rather than the netcode.
+                -- That didn't hold up: this run host60/client60 had 80 stalls
+                -- (last run: 1) and host120/client60 had 11. Same settings,
+                -- opposite results, and Mason saw it come and go within one
+                -- run, plus black flashes getting worse until a crash. That
+                -- reads like the PC itself: two full UE5 games on one GPU
+                -- fighting for VRAM and time. Both instances now start at
+                -- the lowest graphics settings, and the same setting runs
+                -- three times so we can see how much it varies on its own.
                 local PHASES = {
-                    { name = "host60 client60",   rep = "on", trust = "off", acks = "default", net = "fps60",  on = {}, off = {} },
-                    { name = "host120 client60",  rep = "on", trust = "off", acks = "default", net = "fps120", on = {}, off = {} },
-                    { name = "host60 client uncapped", rep = "on", trust = "off", acks = "default", net = "fps60",
-                      on = { "t.MaxFPS 0" }, off = { "t.MaxFPS 60" } },
+                    { name = "low gfx #1", rep = "on", trust = "off", acks = "default", net = "fps60", on = {}, off = {} },
+                    { name = "low gfx #2", rep = "on", trust = "off", acks = "default", net = "fps60", on = {}, off = {} },
+                    { name = "low gfx #3", rep = "on", trust = "off", acks = "default", net = "fps60", on = {}, off = {} },
                 }
                 A.PH = PHASES
                 A.results = A.results or {}
@@ -2996,6 +3003,9 @@ do
         if not A.role then return end
         alog(("boot: auto=%s quit=%s dir=%s"):format(tostring(A.auto), tostring(A.quit), modDir()))
         if not A.auto then return end
+        -- two games share one GPU in a test run; keep both light
+        console("scalability 0")
+        console("r.ScreenPercentage 50")
         -- join-crash trace retired: the cause is found and fixed, and its
         -- always-on BeginPlay/NewObject hooks are the prime suspect for the
         -- UE4SS access violation the client hit right after joining
