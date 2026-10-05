@@ -1932,6 +1932,23 @@ local function stReport()
             log("ST mesh: " .. table.concat(mparts, " ", i, math.min(i + 59, #mparts, 240)))
         end
     end
+    do
+        -- frame-quantized view: how many frames moved ~0, and how many moved
+        -- 2+ frames' worth, relative to the median step while moving
+        local mv = {}
+        for i = 2, #r do if steps[i] > 0.5 then mv[#mv+1] = steps[i] end end
+        table.sort(mv)
+        local med = mv[math.max(1, math.floor(#mv / 2))] or 0
+        local stall, dbl = 0, 0
+        for i = 2, #r do
+            if r[i].v > 100 and med > 0 then
+                if steps[i] < med * 0.25 then stall = stall + 1 end
+                if steps[i] > med * 1.75 then dbl = dbl + 1 end
+            end
+        end
+        st.lastStalls, st.lastDoubles = stall, dbl
+        log(("ST[%s]: median step %.1f, %d stalled frames, %d catch-up frames"):format(st.side, med, stall, dbl))
+    end
     st.lastSnaps = snaps
     st.lastCounts = {}
     for k, v in pairs(st.count) do st.lastCounts[k] = v end
@@ -2429,6 +2446,7 @@ do
     local function startRun()
         local p, pc = myPawn()
         A.hookRun()
+        if not A.capped then A.capped = true; console("t.MaxFPS 60") end
         A.run = { frames = 0, phase = "walk", n = 0, sprintOk = nil }
         alog("scripted run: 3s walk, then sprint + snaptrace, turning halfway")
     end
@@ -2535,16 +2553,26 @@ do
                 -- result (we're turning, accel ramps) is a visible pop. Test it
                 -- with combining off, and separately with the frame rate capped
                 -- (fewer frames per packet = less combining).
+                -- At a 60fps cap the raw series is unambiguous: every frame is
+                -- 17ms, and the pawn moves exactly 0, 1, 2 or 3 frames' worth
+                -- (0 / 12.5 / 25 / 37.5) - a frame of movement goes missing
+                -- and turns up on a neighbouring frame. The mesh does the same,
+                -- so it's on screen. Stalls come about every 6-8 frames, close
+                -- to the rate of move responses (~13/s). Now both phases at
+                -- 60fps so the steps stay clean: normal vs server corrections
+                -- off. If the stalls survive with corrections off, it's acks
+                -- or the client's own tick; if they vanish, it's corrections.
                 local PHASES = {
-                    { name = "normal",       rep = "on", trust = "off", on = {},
-                      off = {} },
-                    { name = "client capped 60fps", rep = "on", trust = "off",
-                      on = { "t.MaxFPS 60" }, off = { "t.MaxFPS 0" } },
+                    { name = "60fps normal",         rep = "on", trust = "off",
+                      on = {}, off = {} },
+                    { name = "60fps no corrections", rep = "on", trust = "on",
+                      on = {}, off = {} },
                 }
                 A.PH = PHASES
                 A.results = A.results or {}
                 A.phase = A.phase or 1
                 A.results[A.phase] = { snaps = st.lastSnaps, counts = st.lastCounts or {},
+                    stalls = st.lastStalls, doubles = st.lastDoubles,
                     speed = A.run and A.run.lastSpeed or -1 }
                 alog(("phase %d (%s): %s snaps"):format(A.phase, PHASES[A.phase].name, tostring(st.lastSnaps)))
                 for _, c in ipairs(PHASES[A.phase].off or {}) do console(c) end
@@ -2559,7 +2587,8 @@ do
                     local parts = {}
                     for i, ph in ipairs(PHASES) do
                         local r = A.results[i] or {}
-                        parts[#parts+1] = ("%s=%s snaps (top speed %s)"):format(ph.name, tostring(r.snaps), tostring(r.speed))
+                        parts[#parts+1] = ("%s=%s snaps, %s stalls, %s catch-ups (top speed %s)"):format(
+                            ph.name, tostring(r.snaps), tostring(r.stalls), tostring(r.doubles), tostring(r.speed))
                     end
                     alog("PHASE RESULT: " .. table.concat(parts, " | "))
                     fwrite("sdmp_done.txt", "1")
