@@ -2479,6 +2479,74 @@ do
     -- record the whole attack path on the host: the zombie's attack/trace/
     -- damage functions, every ApplyDamage and who it hit, and the damage
     -- functions on both players.
+    -- What does a zombie look like at the moment it tries to attack the client?
+    -- Every number/bool/object variable on BP_MasterZombie_C and its AI
+    -- controller, plus how far it is from each player. First call per zombie
+    -- (up to 3 zombies), then the first zombie again a few seconds later.
+    A.zProbe = function(zb, args, who)
+        local z = A.ztest
+        if not (z and zb and safe(function() return zb:IsValid() end, false)) then return end
+        z.probed = z.probed or {}
+        local key = safe(function() return zb:GetAddress() end, 0)
+        local pr = z.probed[key]
+        if pr then
+            if pr.again or z.t < pr.t + 4 or key ~= z.firstZ then return end
+            pr.again = true
+        else
+            z.np = (z.np or 0) + 1
+            if z.np > 3 then return end
+            z.probed[key] = { t = z.t }
+            z.firstZ = z.firstZ or key
+        end
+        local tag = ("ZP %s#%d%s"):format(className(zb), z.np, pr and " (+4s)" or "")
+        local zl = safe(function() return zb:K2_GetActorLocation() end, nil)
+        local function dist(a)
+            local l = safe(function() return a:K2_GetActorLocation() end, nil)
+            if not (l and zl) then return "?" end
+            return ("%.0f"):format(math.sqrt((l.X - zl.X)^2 + (l.Y - zl.Y)^2 + (l.Z - zl.Z)^2))
+        end
+        alog(("%s dist client=%s host=%s args=%d"):format(tag, dist(z.p), dist(myPawn()), #args))
+        for i, a in ipairs(args) do
+            local v = safe(function() return a:get() end, nil)
+            alog(("%s   arg%d = %s"):format(tag, i, type(v) == "userdata" and who(v) or tostring(v)))
+        end
+        local function dump(obj, cls, label)
+            if not (obj and cls) then return end
+            local vals = {}
+            pcall(function()
+                cls:ForEachProperty(function(prop)
+                    local pn = safe(function() return prop:GetFName():ToString() end, nil)
+                    if not pn or pn:find("^Uber") or pn:find("^K2Node") or pn:find("^CallFunc") or pn:find("^Temp_") then return end
+                    local v = safe(function() return obj[pn] end, nil)
+                    local tv = type(v)
+                    if tv == "number" then
+                        if v ~= math.floor(v) then v = ("%.4g"):format(v) end
+                        vals[#vals+1] = pn .. "=" .. tostring(v)
+                    elseif tv == "boolean" then
+                        vals[#vals+1] = pn .. "=" .. tostring(v)
+                    elseif tv == "userdata" then
+                        local inner = safe(function() return v:get() end, nil)
+                        if type(inner) == "number" or type(inner) == "boolean" then
+                            vals[#vals+1] = pn .. "=" .. tostring(inner)
+                        elseif safe(function() return v:IsValid() ~= nil end, false) then
+                            vals[#vals+1] = pn .. "=" .. who(v)
+                        end
+                    end
+                end)
+            end)
+            table.sort(vals)
+            for i = 1, #vals, 12 do
+                alog(("%s %s: %s"):format(tag, label, table.concat(vals, "  ", i, math.min(i + 11, #vals))))
+            end
+        end
+        dump(zb, StaticFindObject("/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"), "zombie")
+        local ctl = safe(function() return zb.Controller end, nil)
+        if ctl and safe(function() return ctl:IsValid() end, false) then
+            alog(("%s controller=%s"):format(tag, className(ctl)))
+            dump(ctl, safe(function() return ctl:GetClass() end, nil), "ai")
+        end
+    end
+
     A.zTick = function()
         local z = A.ztest
         z.t = z.t + 1
@@ -2487,6 +2555,7 @@ do
         local hp = myPawn()
         local function who(a)
             if not a then return "nil" end
+            if type(a) ~= "userdata" or not safe(function() return a:IsValid() end, false) then return "null" end
             local ad = safe(function() return a:GetAddress() end, nil)
             if ad and ad == safe(function() return cp:GetAddress() end, -1) then return "CLIENT" end
             if ad and hp and ad == safe(function() return hp:GetAddress() end, -2) then return "HOST" end
@@ -2508,10 +2577,17 @@ do
                 zc:ForEachFunction(function(fn)
                     local fname = safe(function() return fn:GetFName():ToString() end, "")
                     if fname:find("Attack") or fname:find("Damage") or fname:find("Trace") or fname:find("Hit")
-                       or fname:find("Target") then
+                       or fname:find("Target") or fname:find("Distance") or fname:find("Range")
+                       or fname:find("Montage") or fname:find("Can") or fname:find("Player") then
                         if not fname:find("Delegate") and not fname:find("Ubergraph") then
                             if pcall(function()
-                                RegisterHook(zp .. ":" .. fname, function(ctx) mark("zombie:" .. fname) end)
+                                RegisterHook(zp .. ":" .. fname, function(ctx, ...)
+                                    mark("zombie:" .. fname)
+                                    if fname == "AttackPlayer" then
+                                        local zb = safe(function() return ctx:get() end, nil)
+                                        A.zProbe(zb, { ... }, who)
+                                    end
+                                end)
                             end) then n = n + 1 end
                         end
                     end
