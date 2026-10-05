@@ -1916,6 +1916,22 @@ local function stReport()
         end
     end
     log(("ST[%s]: %d snaps in %d frames"):format(st.side, snaps, #r))
+    -- raw series, so the shape is visible and not just the snap count:
+    -- per frame "step@dt_ms" for actor, then mesh steps separately
+    do
+        local parts, mparts, zero, dbl = {}, {}, 0, 0
+        for i = 2, #r do
+            local dt = (r[i].t or 0) - (r[i-1].t or 0)
+            parts[#parts+1] = ("%.1f@%.0f"):format(steps[i], dt * 1000)
+            if r[i].m and r[i-1].m then mparts[#mparts+1] = ("%.1f"):format(v2(r[i-1].m, r[i].m)) end
+        end
+        for i = 1, math.min(#parts, 240), 40 do
+            log("ST raw: " .. table.concat(parts, " ", i, math.min(i + 39, #parts, 240)))
+        end
+        for i = 1, math.min(#mparts, 240), 60 do
+            log("ST mesh: " .. table.concat(mparts, " ", i, math.min(i + 59, #mparts, 240)))
+        end
+    end
     st.lastSnaps = snaps
     st.lastCounts = {}
     for k, v in pairs(st.count) do st.lastCounts[k] = v end
@@ -1955,8 +1971,13 @@ local function stHookAll(pawn)
                 local pc = p.Controller
                 local a = p:K2_GetActorLocation()
                 local vel = p.CharacterMovement.Velocity
+                local mloc = safe(function() return p.Mesh:K2_GetComponentLocation() end, nil)
                 st.rows[#st.rows+1] = {
                     a  = { X = a.X, Y = a.Y },
+                    m  = mloc and { X = mloc.X, Y = mloc.Y } or nil,
+                    t  = safe(function()
+                        return StaticFindObject("/Script/Engine.Default__GameplayStatics"):GetTimeSeconds(UEHelpers.GetWorld())
+                    end, 0),
                     ay = p:K2_GetActorRotation().Yaw,
                     cy = pc:GetControlRotation().Yaw,
                     v  = math.sqrt(vel.X^2 + vel.Y^2),
@@ -2517,8 +2538,6 @@ do
                 local PHASES = {
                     { name = "normal",       rep = "on", trust = "off", on = {},
                       off = {} },
-                    { name = "no move combining", rep = "on", trust = "off",
-                      on = { "p.NetEnableMoveCombining 0" }, off = { "p.NetEnableMoveCombining 1" } },
                     { name = "client capped 60fps", rep = "on", trust = "off",
                       on = { "t.MaxFPS 60" }, off = { "t.MaxFPS 0" } },
                 }
