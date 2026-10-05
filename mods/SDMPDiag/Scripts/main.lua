@@ -2450,6 +2450,27 @@ do
         end)
     end
 
+    -- Host-side send rate. MaxNetTickRate caps how often the net driver
+    -- ticks (sends) independently of the frame rate.
+    A.hostNet = function(mode)
+        local w = UEHelpers.GetWorld()
+        local nd = w and safe(function() return w.NetDriver end, nil) or nil
+        local before = nd and safe(function() return nd.MaxNetTickRate end, "?") or "?"
+        if mode == "net60" then
+            pcall(function() nd.MaxNetTickRate = 60 end)
+            console("t.MaxFPS 0")
+        elseif mode == "fps60" then
+            pcall(function() nd.MaxNetTickRate = A.origNetTick or 0 end)
+            console("t.MaxFPS 60")
+        else
+            if A.origNetTick then pcall(function() nd.MaxNetTickRate = A.origNetTick end) end
+            console("t.MaxFPS 0")
+        end
+        if A.origNetTick == nil and type(before) == "number" then A.origNetTick = before end
+        alog(("host net mode %s: MaxNetTickRate %s -> %s"):format(tostring(mode), tostring(before),
+            tostring(nd and safe(function() return nd.MaxNetTickRate end, "?") or "?")))
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
@@ -2585,20 +2606,19 @@ do
                 -- on the HOST's own pawn at the same 60fps cap. The host looks
                 -- smooth; if the instrument still counts stalls there, the
                 -- stall count is partly how we sample, not what's on screen.
-                if not A.hostRan and A.startRun then
-                    A.hostRan = true
-                    console("t.MaxFPS 60")
-                    A.startRun()
-                end
+                -- (host control run removed: capping the host at 60fps for it is
+                -- what dropped the client from ~70 stalls to 11 - now tested
+                -- properly as phases below)
             end
             -- phase requests from the client: "set:<rep>:<trust>" -> "ok:<same>"
             local req = fread("sdmp_phase.txt") or ""
-            local r, t, ak = req:match("^set:(%a+):(%a+):?(%a*)$")
+            local r, t, ak, hn = req:match("^set:(%a+):(%a+):?(%a*):?(%w*)$")
             if r then
                 repMove(r == "on")
                 trustClient(t == "on")
                 A.acks(ak == "fast")
-                fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak)
+                A.hostNet(hn)
+                fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
             A.serveT = (A.serveT or 0) + 1
@@ -2749,8 +2769,17 @@ do
                 -- stalls vs 75. Saved-move starvation is out. This run is one
                 -- normal 60fps phase with per-frame movement-component state on
                 -- every stalled frame.
+                -- Control run result: with the HOST capped at 60fps too, the
+                -- client dropped from ~70 stalls to 11 and looked better. On a
+                -- listen server the net driver sends every host frame (~180/s
+                -- uncapped). Test whether it's the host's send rate:
+                --   1 host uncapped (baseline)
+                --   2 host NetDriver.MaxNetTickRate = 60 (host keeps its fps)
+                --   3 host capped at 60fps (repeat of the control)
                 local PHASES = {
-                    { name = "60fps normal", rep = "on", trust = "off", acks = "default", on = {}, off = {} },
+                    { name = "host uncapped",     rep = "on", trust = "off", acks = "default", net = "default", on = {}, off = {} },
+                    { name = "host net tick 60",  rep = "on", trust = "off", acks = "default", net = "net60",   on = {}, off = {} },
+                    { name = "host fps 60",       rep = "on", trust = "off", acks = "default", net = "fps60",   on = {}, off = {} },
                 }
                 A.PH = PHASES
                 A.results = A.results or {}
@@ -2764,8 +2793,9 @@ do
                     A.phase = A.phase + 1
                     local ph = PHASES[A.phase]
                     for _, c in ipairs(ph.on or {}) do console(c) end
-                    A.want = "ok:" .. ph.rep .. ":" .. ph.trust .. ":" .. (ph.acks or "")
-                    fwrite("sdmp_phase.txt", "set:" .. ph.rep .. ":" .. ph.trust .. ":" .. (ph.acks or ""))
+                    local tail = ph.rep .. ":" .. ph.trust .. ":" .. (ph.acks or "") .. ":" .. (ph.net or "")
+                    A.want = "ok:" .. tail
+                    fwrite("sdmp_phase.txt", "set:" .. tail)
                     A.step, A.t = "waitB", 0
                 else
                     local parts = {}
