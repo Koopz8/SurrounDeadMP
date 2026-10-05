@@ -2196,6 +2196,115 @@ LoopAsync(1000, function()
     return false
 end)
 
+-- The attack montage only ever plays on the host (PlayAnimMontage isn't
+-- replicated and the zombie has no multicast for it), so on a client zombies
+-- deal damage without ever swinging. Clients play the swing themselves: a live
+-- zombie within melee range of any player, not running, swings on the same
+-- 1.45-2.05s rhythm the host uses. The client copy's damage is zeroed first,
+-- because the montage's notifies run the hit traces and the hit code has no
+-- authority check - a client swing would otherwise hurt the local copy of the
+-- player (ApplyDamage with 0 does nothing; the blood puff still shows).
+local ZA = { next = {}, tick = 0, plays = 0, logged = 0, sndErr = false }
+local function zombieSwingMirror()
+    local world = UEHelpers.GetWorld()
+    if not (world and safe(function() return world:IsValid() end, false)) then return end
+    local gm = safe(function() return world.AuthorityGameMode end, nil)
+    local isHost = gm and safe(function() return gm:IsValid() end, false)
+    ZA.tick = ZA.tick + 0.25
+    ZA.st = ZA.st or { at = 0 }
+    local st = ZA.st
+    local report = ZA.tick >= st.at
+    if report then st.at = ZA.tick + 4 end
+    if isHost then return end   -- host / single player: real swings
+    local players = {}
+    for _, pc in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if safe(function() return pc:IsValid() end, false) then
+            local l = safe(function() return pc:K2_GetActorLocation() end, nil)
+            if l then players[#players + 1] = { X = l.X, Y = l.Y, Z = l.Z } end
+        end
+    end
+    if #players == 0 then
+        if report then log("ZA status: client, no BP_PlayerCharacter_C found") end
+        return
+    end
+    st.nz, st.best, st.bspd, st.bdz = 0, 1e9, -1, 0
+    local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local seen = {}
+    for _, z in ipairs(safe(function() return FindAllOf("BP_MasterZombie_C") end, nil) or {}) do
+        if safe(function() return z:IsValid() end, false) then
+            local key = safe(function() return z:GetAddress() end, nil)
+            if key then
+                seen[key] = true
+                -- client copy never deals damage; the host's copy does that
+                if safe(function() return z.DamageToDo end, 0) ~= 0 then
+                    pcall(function() z.DamageToDo = 0 end)
+                    pcall(function() z.DamageMultiplier = 0 end)
+                    pcall(function() z["CanCauseRadDamage?"] = false end)
+                end
+                local dead = safe(function() return z["IsDead?"] end, false)
+                local zl = safe(function() return z:K2_GetActorLocation() end, nil)
+                st.nz = st.nz + 1
+                if zl then
+                    for _, p in ipairs(players) do
+                        local d = math.sqrt((p.X - zl.X)^2 + (p.Y - zl.Y)^2)
+                        if d < st.best then
+                            st.best, st.bdz, st.bdead = d, p.Z - zl.Z, dead
+                            local v = safe(function() return z:GetVelocity() end, nil)
+                            st.bspd = v and math.sqrt(v.X * v.X + v.Y * v.Y) or -1
+                        end
+                    end
+                end
+                if zl and not dead and (ZA.next[key] or 0) <= ZA.tick then
+                    local close = false
+                    for _, p in ipairs(players) do
+                        local d2 = (p.X - zl.X)^2 + (p.Y - zl.Y)^2
+                        if d2 < 220 * 220 and math.abs(p.Z - zl.Z) < 200 then close = true; break end
+                    end
+                    local v = close and safe(function() return z:GetVelocity() end, nil)
+                    if close and v and (v.X * v.X + v.Y * v.Y) < 300 * 300 then
+                        local arr = safe(function() return z.AttackMontage end, nil)
+                        local n = arr and safe(function() return arr:GetArrayNum() end, 0) or 0
+                        if n > 0 then
+                            local m = safe(function() local e = arr[math.random(1, n)]; return e.get and e:get() or e end, nil)
+                            if m and safe(function() return m:IsValid() end, false) then
+                                local ok = pcall(function() z:PlayAnimMontage(m, 1.0, FName("None")) end)
+                                if gs and gs:IsValid() then
+                                    local sok = pcall(function()
+                                        gs:PlaySoundAtLocation(z, z.AttackSound, zl, { Pitch = 0, Yaw = 0, Roll = 0 }, 1.0, 1.0, 0.0, nil, nil, nil, nil)
+                                    end)
+                                    if not sok and not ZA.sndErr then ZA.sndErr = true; log("ZA: attack sound failed") end
+                                end
+                                ZA.plays = ZA.plays + 1
+                                if ZA.logged < 6 then
+                                    ZA.logged = ZA.logged + 1
+                                    log(("ZA: %s swings (montage ok=%s, %d so far)"):format(className(z), tostring(ok), ZA.plays))
+                                end
+                            end
+                        end
+                        local lo = safe(function() return z.TimeBetweenAttacksMin end, 1.45) or 1.45
+                        local hi = safe(function() return z.TimeBetweenAttacksMax end, 2.05) or 2.05
+                        ZA.next[key] = ZA.tick + lo + math.random() * (hi - lo)
+                    end
+                end
+            end
+        end
+    end
+    for k in pairs(ZA.next) do if not seen[k] then ZA.next[k] = nil end end
+    if report and st.nz > 0 then
+        log(("ZA status: players=%d zombies=%d nearest=%.0f dz=%.0f speed=%.0f dead=%s swings=%d"):format(
+            #players, st.nz, st.best, st.bdz, st.bspd, tostring(st.bdead), ZA.plays))
+    elseif report then
+        log(("ZA status: players=%d, no BP_MasterZombie_C found"):format(#players))
+    end
+end
+LoopAsync(250, function()
+    ExecuteInGameThread(function()
+        local ok, err = pcall(zombieSwingMirror)
+        if not ok then log("ZA error: " .. tostring(err)) end
+    end)
+    return false
+end)
+
 -- Auto mode. Driving two game windows by hand (or by remote control) is slow
 -- and flaky: the console ignores pasted text, the game grabs the mouse, and
 -- every run is a dozen typed commands. So the bats pass a role on the command
