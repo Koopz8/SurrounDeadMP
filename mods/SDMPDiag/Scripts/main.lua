@@ -1900,8 +1900,16 @@ local function stReport()
             for f = i - 2, i do
                 for _, n in ipairs(byFrame[f] or {}) do evs[#evs+1] = n .. "@" .. (f - i) end
             end
-            log(("ST:  frame %3d  step %5.1f (nb %4.1f)  yaw %6.1f->%6.1f  events: %s"):format(
-                i, steps[i], nb, r[i-1].ay, r[i].ay, #evs > 0 and table.concat(evs, ", ") or "NONE"))
+            -- signed: how much of this step went along the direction we were
+            -- already moving. Negative = pulled back, big positive = shoved ahead.
+            local px, py = r[i-1].a.X - r[i-2].a.X, r[i-1].a.Y - r[i-2].a.Y
+            local pl = math.sqrt(px*px + py*py)
+            local fwd = 0
+            if pl > 0.001 then
+                fwd = ((r[i].a.X - r[i-1].a.X) * px + (r[i].a.Y - r[i-1].a.Y) * py) / pl
+            end
+            log(("ST:  frame %3d  step %5.1f (nb %4.1f) fwd %6.1f  yaw %6.1f->%6.1f  events: %s"):format(
+                i, steps[i], nb, fwd, r[i-1].ay, r[i].ay, #evs > 0 and table.concat(evs, ", ") or "NONE"))
         end
     end
     log(("ST[%s]: %d snaps in %d frames"):format(st.side, snaps, #r))
@@ -1963,6 +1971,10 @@ local function snapTrace()
         if not (p and p:IsValid()) then log("ST: no pawn"); return end
         st.side = safe(function() return pc:HasAuthority() end, false) and "HOST" or "CLIENT"
         st.pawnAddr = stAddr(p)
+        -- unpacked movement RPCs so an ack (ClientAckGoodMove) and a correction
+        -- (ClientAdjustPosition) show up as different names. Needs typing on
+        -- the host too: net.UsePackedMovementRPCs 0
+        rwCvar("net.UsePackedMovementRPCs 0")
         stHookAll(p)
         st.rows, st.ev, st.count, st.on = {}, {}, {}, true
         log("ST[" .. st.side .. "]: recording 480 frames - sprint and turn a bit")
@@ -1972,3 +1984,422 @@ end
 RegisterConsoleCommandHandler("sdmp_snaptrace", function() snapTrace() return true end)
 
 log("SDMPDiag: sdmp_snaptrace logs what moved the pawn on each snap frame.")
+
+-- ===========================================================================
+-- Auto mode. Driving two game windows by hand (or by remote control) is slow
+-- and flaky: the console ignores pasted text, the game grabs the mouse, and
+-- every run is a dozen typed commands. So the bats pass a role on the command
+-- line and the mod does the whole run sheet itself:
+--
+--   -sdmprole=host    ipdriver -> listen -> Continue -> wait for joiners ->
+--                     spawn them -> netperf
+--   -sdmprole=client  wait for host ready -> ipdriver -> connect -> input/UI ->
+--                     drop the main menu -> scripted walk/sprint/turn with
+--                     snaptrace running -> summary
+--   -sdmpauto         actually do it (role alone just tags the log)
+--   -sdmpquit         both quit when the client finishes, for back-to-back runs
+--
+-- The two processes hand off through files next to this script, since they
+-- share the Mods folder. Everything is logged with an AUTO prefix.
+-- ===========================================================================
+do
+    local A = { role = nil, auto = false, quit = false, step = "init", t = 0,
+                worldAddr = nil, tries = 0, run = nil }
+
+    local function alog(s) log("AUTO[" .. (A.role or "?") .. "] " .. s) end
+
+    local function modDir()
+        local src = debug.getinfo(1, "S").source or ""
+        local dir = src:match("^@(.*)[/\\]Scripts[/\\]main%.lua$")
+        return dir or "ue4ss/Mods/SDMPDiag"
+    end
+    local function fpath(n) return modDir() .. "/" .. n end
+    local function fwrite(n, s)
+        local f = io.open(fpath(n), "w"); if f then f:write(s); f:close(); return true end
+        return false
+    end
+    local function fread(n)
+        local f = io.open(fpath(n), "r"); if not f then return nil end
+        local s = f:read("*a"); f:close(); return s
+    end
+
+    local function cmdline()
+        local ksl = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        local s = safe(function() return ksl:GetCommandLine():ToString() end, nil)
+        if not s then s = safe(function() return tostring(ksl:GetCommandLine()) end, "") end
+        return s or ""
+    end
+
+    local function console(cmd)
+        local ksl = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+        local ok = pcall(function()
+            ksl:ExecuteConsoleCommand(UEHelpers.GetWorld(), cmd, UEHelpers.GetPlayerController())
+        end)
+        alog("console '" .. cmd .. "' -> " .. tostring(ok))
+    end
+
+    local function myPawn()
+        local pc = UEHelpers.GetPlayerController()
+        local p = pc and safe(function() return pc.Pawn end, nil) or nil
+        if p and p:IsValid() then return p, pc end
+        return nil, pc
+    end
+
+    local function worldAddr()
+        local w = UEHelpers.GetWorld()
+        return w and safe(function() return w:GetAddress() end, nil) or nil
+    end
+
+    local function menu()
+        local m = nil
+        pcall(function()
+            local all = FindAllOf("MenuWidget_C")
+            if all then for _, w in ipairs(all) do if w:IsValid() then m = w end end end
+        end)
+        return m
+    end
+
+    -- If the menu class guess is wrong, say what widgets do exist so the next
+    -- run can use the right name, and carry on after a timeout.
+    -- First launch shows "PRESS ANY KEY" and the menu doesn't exist until a
+    -- key goes in. Its OnKeyDown override just broadcasts EventKeyDown, so call
+    -- it with empty geometry/key-event structs - the key itself is ignored.
+    local function pressAnyKey()
+        local w = nil
+        pcall(function()
+            for _, x in ipairs(FindAllOf("PressAnyKeyWidget_C") or {}) do
+                if x:IsValid() and safe(function() return x:IsInViewport() end, true) then w = x end
+            end
+        end)
+        if not w then return end
+        -- The widget's own OnKeyDown needs a real FKey, which Lua can't build.
+        -- What it feeds is the MainMenu level script's Event_KeyDown, which
+        -- takes down the prompt and calls CreateMenu - call that directly.
+        local lvl = nil
+        pcall(function()
+            for _, l in ipairs(FindAllOf("MainMenu_C") or {}) do if l:IsValid() then lvl = l end end
+        end)
+        if not lvl then alog("PressAnyKey: no MainMenu_C level script"); return end
+        for _, fn in ipairs({ "Event_KeyDown", "CreateMenu" }) do
+            local ok, err = pcall(function() lvl[fn](lvl) end)
+            alog("PressAnyKey: MainMenu_C:" .. fn .. " -> " .. (ok and "called" or ("threw: " .. tostring(err))))
+            if ok then return end
+        end
+    end
+
+    local function menuOrTimeout()
+        if menu() then return true end
+        if (A.waitMenu or 0) % 3 == 1 then pressAnyKey() end
+        A.waitMenu = (A.waitMenu or 0) + 1
+        if A.waitMenu == 15 then
+            local seen = {}
+            pcall(function()
+                for _, w in ipairs(FindAllOf("UserWidget") or {}) do
+                    if w:IsValid() then seen[className(w)] = true end
+                end
+            end)
+            local list = {}
+            for k in pairs(seen) do list[#list+1] = k end
+            table.sort(list)
+            alog("no MenuWidget_C after 15s. live widgets: " .. table.concat(list, ", "))
+            A.dumpUI()
+        end
+        return A.waitMenu >= 20
+    end
+
+    -- Discovery: where the menu buttons live and what they can be told to do.
+    A.dumpUI = function()
+        local function fnames(obj)
+            local out = {}
+            pcall(function()
+                obj:GetClass():ForEachFunction(function(fn)
+                    out[#out+1] = safe(function() return fn:GetFName():ToString() end, "?")
+                end)
+            end)
+            return table.concat(out, ", ")
+        end
+        pcall(function()
+            for _, l in ipairs(FindAllOf("LevelScriptActor") or {}) do
+                if l:IsValid() then alog("UI LevelScript " .. className(l) .. " functions: " .. fnames(l)) end
+            end
+        end)
+        pcall(function()
+            for _, x in ipairs(FindAllOf("PressAnyKeyWidget_C") or {}) do
+                local props = {}
+                x:GetClass():ForEachProperty(function(pr)
+                    props[#props+1] = safe(function() return pr:GetFName():ToString() end, "?")
+                end)
+                alog("UI PressAnyKeyWidget props: " .. table.concat(props, ", "))
+                break
+            end
+        end)
+        pcall(function()
+            local gi = UEHelpers.GetGameInstance()
+            alog("UI GameInstance " .. className(gi) .. " functions: " .. fnames(gi))
+        end)
+        local shown = {}
+        for _, cls in ipairs({ "ButtonWidget_C", "PressAnyKeyWidget_C", "CommandButton_C", "SaveMenu_C" }) do
+            pcall(function()
+                for _, w in ipairs(FindAllOf(cls) or {}) do
+                    if w:IsValid() then
+                        alog("UI " .. safe(function() return w:GetFullName() end, "?"))
+                        if not shown[cls] then shown[cls] = true; alog("UI " .. cls .. " functions: " .. fnames(w)) end
+                    end
+                end
+            end)
+        end
+    end
+
+    -- Find the Continue button's handler on the menu and call it - the same
+    -- thing a click does. Names aren't known yet, so log everything the first
+    -- time and try anything with "continue" in it.
+    local function pressContinue()
+        local m = menu()
+        if not m then alog("no MenuWidget_C to press Continue on"); return false end
+        local names, cands = {}, {}
+        pcall(function()
+            m:GetClass():ForEachFunction(function(fn)
+                local n = safe(function() return fn:GetFName():ToString() end, "")
+                names[#names+1] = n
+                -- click handlers only; hovering Continue does nothing useful
+                if n:lower():find("continue") and not n:find("Hover") then cands[#cands+1] = n end
+            end)
+        end)
+        if A.tries == 0 then alog("MenuWidget functions: " .. table.concat(names, ", ")) end
+        A.tries = A.tries + 1
+        -- MenuWidget has two: the Continue button and a ContinueGame button
+        -- (probably on a confirm/save panel). Alternate between them across
+        -- retries so whichever one actually loads gets its turn.
+        table.sort(cands)
+        if #cands == 0 then alog("no Continue click handler on the menu"); return false end
+        local pick = cands[((A.tries - 1) % #cands) + 1]
+        for _, n in ipairs({ pick }) do
+            local ok, err = pcall(function() m[n](m) end)
+            alog("Continue via " .. n .. " -> " .. (ok and "called" or ("threw: " .. tostring(err))))
+            if ok then return true end
+        end
+        alog("no callable Continue handler found")
+        return false
+    end
+
+    -- ---------------------------------------------------------------- host
+    local function hostTick()
+        if A.step == "init" then
+            fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0")
+            -- No need to get past "press any key": the listen travel reloads
+            -- the map and the menu comes back up without it.
+            if not UEHelpers.GetPlayerController() then return end
+            A.boot = (A.boot or 0) + 1
+            if A.boot < 3 then return end
+            ExecuteInGameThread(setIpDriver)
+            A.worldAddr = worldAddr()
+            ExecuteInGameThread(hostListen)
+            A.step, A.t = "listening", 0
+        elseif A.step == "listening" then
+            -- wait for the listen travel to swap the world and the menu to come
+            -- back (or 30s, in case the new world reuses the old address)
+            A.lt = (A.lt or 0) + 1
+            if (worldAddr() ~= A.worldAddr and menuOrTimeout()) or A.lt > 30 then
+                A.t = A.t + 1
+                if A.t >= 3 then
+                    ExecuteInGameThread(netStatus)
+                    A.step, A.t = "continue", 0
+                end
+            end
+        elseif A.step == "continue" then
+            if myPawn() then A.step = "ingame"; return end
+            if A.t % 10 == 0 then pressContinue() end
+            A.t = A.t + 1
+            if A.t > 60 then alog("FAIL: no host pawn 60s after Continue"); A.step = "dead" end
+        elseif A.step == "ingame" then
+            ExecuteInGameThread(netStatus)
+            -- test runs shouldn't end with the host dead in a ditch
+            console("god")
+            fwrite("sdmp_ready.txt", "1")
+            alog("host is in game and listening - client may join")
+            A.step, A.t = "serving", 0
+        elseif A.step == "serving" then
+            -- Spawn joiners - but only through the engine route, and only once
+            -- they've had time to load the map. A joiner's controller exists
+            -- while it's still loading; ServerRestartPlayer refuses it then, and
+            -- hostSpawn2's manual fallback spawned a fresh character every
+            -- second (42 of them in the first auto run). Never again.
+            A.seen = A.seen or {}
+            local world = UEHelpers.GetWorld()
+            local gm = world and safe(function() return world.AuthorityGameMode end, nil)
+            local cls = StaticFindObject(PC_PATH)
+            if gm and cls and safe(function() return gm.DefaultPawnClass:GetFName():ToString() end, "") ~= "BP_PlayerCharacter_C" then
+                pcall(function() gm.DefaultPawnClass = cls end)
+            end
+            for _, c in ipairs(listControllers()) do
+                local key = safe(function() return c:GetAddress() end, nil)
+                local p = safe(function() return c.Pawn end, nil)
+                if key and not (p and p:IsValid()) then
+                    A.seen[key] = (A.seen[key] or 0) + 1
+                    local n = A.seen[key]
+                    if n >= 8 and n % 5 == 3 and n <= 60 then
+                        local ok, err = pcall(function() c:ServerRestartPlayer() end)
+                        local p2 = safe(function() return c.Pawn end, nil)
+                        alog(("joiner pawnless %ds: ServerRestartPlayer -> %s, pawn=%s"):format(
+                            n, ok and "ok" or tostring(err), (p2 and p2:IsValid()) and className(p2) or "none"))
+                        if p2 and p2:IsValid() then netPerf() end
+                    end
+                elseif key and A.seen[key] and A.seen[key] > 0 then
+                    alog("joiner has pawn " .. className(p))
+                    A.seen[key] = -1
+                    netPerf()
+                end
+            end
+            if A.quit and (fread("sdmp_done.txt") or ""):find("1") then
+                alog("client finished - quitting")
+                A.step = "quit"
+                console("quit")
+            end
+        end
+    end
+
+    -- -------------------------------------------------------------- client
+    local function startRun()
+        local p, pc = myPawn()
+        A.hookRun()
+        A.run = { frames = 0, phase = "walk", n = 0, sprintOk = nil }
+        alog("scripted run: 3s walk, then sprint + snaptrace, turning halfway")
+    end
+
+    local function clientTick()
+        if A.step == "init" then
+            if not UEHelpers.GetPlayerController() then return end
+            if not (fread("sdmp_ready.txt") or ""):find("1") then
+                A.t = A.t + 1
+                if A.t % 10 == 1 then alog("waiting for host to be ready") end
+                if A.t > 240 then alog("FAIL: host never became ready"); A.step = "dead" end
+                return
+            end
+            ExecuteInGameThread(setIpDriver)
+            -- The menu runs inside PersistentLevel - the same map we're about
+            -- to join. Joining straight from it loads PersistentLevel while
+            -- the old copy is still in memory, and the async loader dies on
+            -- RecastNavMesh-Default ("found in memory ... does not have all
+            -- load flags"). Hop through the engine's empty Entry map first so
+            -- the old world is fully gone before the join.
+            console("open /Engine/Maps/Entry")
+            A.step, A.t = "entry", 0
+        elseif A.step == "entry" then
+            A.t = A.t + 1
+            if A.t == 4 then
+                pcall(function()
+                    StaticFindObject("/Script/Engine.Default__KismetSystemLibrary"):CollectGarbage()
+                end)
+            end
+            if A.t >= 6 then
+                alog("on Entry map, old world released - connecting")
+                A.step, A.t = "connect", 0
+            end
+        elseif A.step == "connect" then
+            local p = myPawn()
+            if p then A.step, A.t = "joined", 0; return end
+            if A.t % 45 == 0 then console("open 127.0.0.1:7777") end
+            A.t = A.t + 1
+            if A.t > 120 then alog("FAIL: never got a pawn after 2 min"); A.step = "dead" end
+        elseif A.step == "joined" then
+            local p = myPawn()
+            local role = ROLE[safe(function() return p.Role end, -1)] or "?"
+            alog("have pawn " .. className(p) .. " role=" .. role)
+            -- the client's main menu never closes on its own; take it down
+            -- rather than clicking Continue, which runs the client's own
+            -- save-load flow
+            local m = menu()
+            if m then
+                alog("removing main menu -> " .. tostring(pcall(function() m:RemoveFromParent() end)))
+            end
+            fixInput2()
+            buildUI()
+            console("god")
+            A.step, A.t = "settle", 0
+        elseif A.step == "settle" then
+            A.t = A.t + 1
+            if A.t >= 5 then startRun(); A.step = "running" end
+        elseif A.step == "running" then
+            if A.run and A.run.phase == "done" then
+                alog("run finished")
+                fwrite("sdmp_done.txt", "1")
+                A.step, A.t = "finished", 0
+            end
+        elseif A.step == "finished" then
+            A.t = A.t + 1
+            if A.quit and A.t >= 5 then A.step = "quit"; console("quit") end
+        end
+    end
+
+    -- The run is driven from the pawn's own tick so input is applied once per
+    -- frame - driving it from LoopAsync would make the input itself uneven.
+    -- Registered lazily: a BP function can't be hooked until its class loads,
+    -- which is after the menu.
+    A.hookRun = function()
+        if A.runHooked then return end
+        A.runHooked = true
+        local ok, err = pcall(function()
+        RegisterHook(BPC .. "ReceiveTick", function(ctx)
+            local r = A.run
+            if not r or r.phase == "done" then return end
+            pcall(function()
+                local p = ctx:get()
+                if p:IsLocallyControlled() ~= true then return end
+                local pc = p.Controller
+                r.frames = r.frames + 1
+                if r.phase == "walk" then
+                    if r.frames == 1 then r.t0 = os.clock() end
+                    if os.clock() - r.t0 > 3 then
+                        r.phase = "sprint"
+                        r.sprintOk = pcall(function() p:Event_Sprint() end)
+                        alog("Event_Sprint -> " .. tostring(r.sprintOk))
+                        snapTrace()
+                        r.t1 = os.clock()
+                    end
+                elseif r.phase == "sprint" then
+                    -- turn gently in the second second
+                    if os.clock() - r.t1 > 1.0 then pcall(function() pc:AddYawInput(0.6) end) end
+                    if not st.on and os.clock() - r.t1 > 1.0 then
+                        pcall(function() p:Event_StopSprint() end)
+                        local spd = safe(function()
+                            local v = p.CharacterMovement.Velocity
+                            return math.sqrt(v.X*v.X + v.Y*v.Y) end, -1)
+                        alog(("RESULT: snaptrace done, last speed %.0f, sprint call %s"):format(
+                            spd, tostring(r.sprintOk)))
+                        r.phase = "done"
+                        return
+                    end
+                    if os.clock() - r.t1 > 15 then alog("FAIL: snaptrace never finished"); r.phase = "done"; return end
+                end
+                local yaw = pc:GetControlRotation().Yaw * math.pi / 180
+                p:AddMovementInput({ X = math.cos(yaw), Y = math.sin(yaw), Z = 0.0 }, 1.0, false)
+            end)
+        end)
+        end)
+        alog("run hook registered = " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
+    end
+
+    -- -------------------------------------------------------------- start
+    local function boot()
+        local cl = cmdline()
+        A.role = cl:match("%-sdmprole=(%a+)")
+        A.auto = cl:find("%-sdmpauto") ~= nil
+        A.quit = cl:find("%-sdmpquit") ~= nil
+        if not A.role then return end
+        alog(("boot: auto=%s quit=%s dir=%s"):format(tostring(A.auto), tostring(A.quit), modDir()))
+        if not A.auto then return end
+        LoopAsync(1000, function()
+            ExecuteInGameThread(function()
+                local ok, err = pcall(A.role == "host" and hostTick or clientTick)
+                if not ok then alog("tick error in step " .. A.step .. ": " .. tostring(err)) end
+            end)
+            if A.step == "dead" and A.quit then A.step = "quit"; ExecuteInGameThread(function() console("quit") end) end
+            return A.step == "dead" or A.step == "quit"
+        end)
+    end
+
+    -- the command line is readable once the engine is up; give it a moment
+    ExecuteWithDelay(3000, function() ExecuteInGameThread(boot) end)
+end
+
+log("SDMPDiag: auto mode - launch with -sdmprole=host|client -sdmpauto (tools/test.bat).")
