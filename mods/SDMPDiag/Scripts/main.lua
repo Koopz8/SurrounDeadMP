@@ -2472,6 +2472,104 @@ do
             tostring(nd and safe(function() return nd.MaxNetTickRate end, "?") or "?")))
     end
 
+    -- Zombie test (test.bat zombie). Open problem #2: zombies chase the client
+    -- but never hurt it. BP_MasterZombie calls GetPlayerCharacter (= player
+    -- index 0 = the host) somewhere, which is the classic single-player
+    -- assumption. Put the client next to a zombie, leave it damageable, and
+    -- record the whole attack path on the host: the zombie's attack/trace/
+    -- damage functions, every ApplyDamage and who it hit, and the damage
+    -- functions on both players.
+    A.zTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local cp = z.p
+        if not (cp and safe(function() return cp:IsValid() end, false)) then return end
+        local hp = myPawn()
+        local function who(a)
+            if not a then return "nil" end
+            local ad = safe(function() return a:GetAddress() end, nil)
+            if ad and ad == safe(function() return cp:GetAddress() end, -1) then return "CLIENT" end
+            if ad and hp and ad == safe(function() return hp:GetAddress() end, -2) then return "HOST" end
+            return className(a)
+        end
+        if z.t == 1 then
+            z.count, z.shown = {}, {}
+            local function mark(name, detail)
+                z.count[name] = (z.count[name] or 0) + 1
+                if (z.shown[name] or 0) < 6 then
+                    z.shown[name] = (z.shown[name] or 0) + 1
+                    alog("ZT " .. name .. (detail and (" " .. detail) or ""))
+                end
+            end
+            local zp = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
+            local zc = StaticFindObject(zp)
+            local n = 0
+            if zc and zc:IsValid() then
+                zc:ForEachFunction(function(fn)
+                    local fname = safe(function() return fn:GetFName():ToString() end, "")
+                    if fname:find("Attack") or fname:find("Damage") or fname:find("Trace") or fname:find("Hit")
+                       or fname:find("Target") then
+                        if not fname:find("Delegate") and not fname:find("Ubergraph") then
+                            if pcall(function()
+                                RegisterHook(zp .. ":" .. fname, function(ctx) mark("zombie:" .. fname) end)
+                            end) then n = n + 1 end
+                        end
+                    end
+                end)
+            end
+            pcall(function()
+                RegisterHook("/Script/Engine.GameplayStatics:ApplyDamage", function(ctx, damaged, dmg, inst, causer)
+                    local d = safe(function() return damaged:get() end, nil)
+                    local c = safe(function() return causer:get() end, nil)
+                    mark("ApplyDamage->" .. who(d), ("dmg=%s causer=%s"):format(
+                        tostring(safe(function() return dmg:get() end, "?")), who(c)))
+                end)
+                n = n + 1
+            end)
+            local pcCls = StaticFindObject(PC_PATH)
+            if pcCls and pcCls:IsValid() then
+                pcCls:ForEachFunction(function(fn)
+                    local fname = safe(function() return fn:GetFName():ToString() end, "")
+                    if (fname:find("Damage") or fname:find("Health") or fname:find("Hurt") or fname:find("Died"))
+                       and not fname:find("Delegate") and not fname:find("Ubergraph") then
+                        if pcall(function()
+                            RegisterHook(BPC .. fname, function(ctx) mark("player:" .. fname .. "@" .. who(safe(function() return ctx:get() end, nil))) end)
+                        end) then n = n + 1 end
+                    end
+                end)
+            end
+            alog("ZT: hooked " .. n .. " functions; client is damageable")
+        end
+        -- every 8s: put the client 150 units from the nearest zombie to the host
+        if z.t % 8 == 2 and z.t < 40 then
+            local best, bd = nil, 1e18
+            local hl = safe(function() return hp:K2_GetActorLocation() end, nil)
+            pcall(function()
+                for _, a in ipairs(FindAllOf("Character") or {}) do
+                    if a:IsValid() and className(a):find("Zombie") and hl then
+                        local l = a:K2_GetActorLocation()
+                        local d = (l.X - hl.X)^2 + (l.Y - hl.Y)^2
+                        if d < bd then best, bd = a, d end
+                    end
+                end
+            end)
+            if best then
+                local l = best:K2_GetActorLocation()
+                local ok = safe(function() return cp:K2_TeleportTo({ X = l.X + 150, Y = l.Y, Z = l.Z + 30 }, cp:K2_GetActorRotation()) end, false)
+                alog(("ZT: client -> next to %s (%.0f from host) teleport=%s"):format(className(best), math.sqrt(bd), tostring(ok)))
+            else
+                alog("ZT: no zombie found near the host")
+            end
+        end
+        if z.t == 45 then
+            local parts = {}
+            for k, v in pairs(z.count or {}) do parts[#parts+1] = k .. "=" .. v end
+            table.sort(parts)
+            alog("ZT RESULT: " .. (#parts > 0 and table.concat(parts, "  ") or "nothing fired"))
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
@@ -2594,7 +2692,11 @@ do
                         local ok = safe(function() return p:K2_TeleportTo(dest, rot) end, false)
                         alog(("moved joiner next to host -> %s"):format(tostring(ok)))
                     end
-                    pcall(function() p.bCanBeDamaged = false end)
+                    if A.test == "zombie" then
+                        A.ztest = { p = p, t = 0 }
+                    else
+                        pcall(function() p.bCanBeDamaged = false end)
+                    end
                     -- (config dumps done - nothing differed)
                 end
             end
@@ -2627,6 +2729,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
+            if A.ztest then A.zTick() end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
@@ -2723,6 +2826,12 @@ do
             end
             fixInput2()
             buildUI()
+            if A.test == "zombie" then
+                -- no client-side god: we want the damage to land
+                alog("zombie test: standing still, host drives it")
+                A.step, A.t = "zwait", 0
+                return
+            end
             console("god")
             A.step, A.t = "settle", 0
         elseif A.step == "settle" then
@@ -2846,6 +2955,11 @@ do
                 startRun(); A.step = "running"
             elseif A.t > 20 then
                 alog("FAIL: host never confirmed " .. tostring(A.want)); fwrite("sdmp_done.txt", "1"); A.step, A.t = "finished", 0
+            end
+        elseif A.step == "zwait" then
+            A.t = A.t + 1
+            if (fread("sdmp_done.txt") or ""):find("1") or A.t > 120 then
+                A.step, A.t = "finished", 0
             end
         elseif A.step == "finished" then
             A.t = A.t + 1
@@ -3000,6 +3114,7 @@ do
         A.role = cl:match("%-sdmprole=(%a+)")
         A.auto = cl:find("%-sdmpauto") ~= nil
         A.quit = cl:find("%-sdmpquit") ~= nil
+        A.test = cl:match("%-sdmptest=(%a+)")
         if not A.role then return end
         alog(("boot: auto=%s quit=%s dir=%s"):format(tostring(A.auto), tostring(A.quit), modDir()))
         if not A.auto then return end
