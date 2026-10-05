@@ -2364,6 +2364,7 @@ do
             A.t = A.t + 1
             if A.t > 120 then alog("FAIL: never got a pawn after 2 min"); A.step = "dead" end
         elseif A.step == "joined" then
+            A.tron = false
             local p = myPawn()
             local role = ROLE[safe(function() return p.Role end, -1)] or "?"
             alog("have pawn " .. className(p) .. " role=" .. role)
@@ -2441,6 +2442,61 @@ do
         alog("run hook registered = " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
     end
 
+    -- --------------------------------------------------- join crash trace
+    -- Four guesses at the RecastNavMesh join crash have been wrong, so stop
+    -- guessing and record. On the client, from boot until we have a pawn:
+    --   * every RecastNavMesh constructed (the crash says an export was
+    --     already in memory without load flags - who made it, and when?)
+    --   * the first BeginPlay of each class (the crash stack runs through
+    --     ProcessEvent, so some Blueprint is triggering the load)
+    --   * every SD_GameInstance function call (the game instance survives
+    --     map loads, so its hooks can't go stale like a level's would)
+    -- The last lines before the crash name the culprit.
+    A.trace = function()
+        if A.traced then return end
+        A.traced = true
+        A.tron = true
+        local seen = {}
+        local function tlog(s)
+            if A.tron then log("TRACE " .. s) end
+        end
+        pcall(function()
+            NotifyOnNewObject("/Script/NavigationSystem.RecastNavMesh", function(o)
+                tlog("NEW RecastNavMesh " .. safe(function() return o:GetFullName() end, "?"))
+            end)
+        end)
+        pcall(function()
+            RegisterBeginPlayPreHook(function(ctx)
+                if not A.tron then return end
+                pcall(function()
+                    local a = ctx:get()
+                    local c = className(a)
+                    if not seen[c] then
+                        seen[c] = true
+                        tlog("BeginPlay " .. c)
+                    end
+                end)
+            end)
+        end)
+        pcall(function()
+            local gi = UEHelpers.GetGameInstance()
+            local cls = gi:GetClass()
+            local path = safe(function() return cls:GetFullName() end, "")
+            path = path:match("^%S+%s+(.+)$") or path
+            local n = 0
+            cls:ForEachFunction(function(fn)
+                local name = safe(function() return fn:GetFName():ToString() end, "")
+                if name ~= "" and not name:find("Ubergraph") and not name:find("DelegateSignature") then
+                    if pcall(function()
+                        RegisterHook(path .. ":" .. name, function() tlog("GI " .. name) end)
+                    end) then n = n + 1 end
+                end
+            end)
+            alog("trace: hooked " .. n .. " game instance functions on " .. path)
+        end)
+        alog("trace armed")
+    end
+
     -- -------------------------------------------------------------- start
     local function boot()
         local cl = cmdline()
@@ -2450,6 +2506,7 @@ do
         if not A.role then return end
         alog(("boot: auto=%s quit=%s dir=%s"):format(tostring(A.auto), tostring(A.quit), modDir()))
         if not A.auto then return end
+        if A.role == "client" then A.trace() end
         LoopAsync(1000, function()
             ExecuteInGameThread(function()
                 local ok, err = pcall(A.role == "host" and hostTick or clientTick)
