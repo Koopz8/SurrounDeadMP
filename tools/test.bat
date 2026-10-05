@@ -20,4 +20,8 @@ start "" "%EXE%" -windowed -ResX=960 -ResY=540 -WinX=0 -WinY=40 -sdmprole=host -
 REM let the host get far enough to read its role before the client starts
 timeout /t 20 /nobreak >nul
 
-start "" "%EXE%" -windowed -ResX=960 -ResY=540 -WinX=980 -WinY=40 -sdmprole=client -sdmpauto %QUIT%
+REM The client starts on the engine's empty Entry map instead of the menu.
+REM The menu lives inside PersistentLevel, and joining a host while that map is
+REM already in memory crashes the loader on RecastNavMesh-Default - even after
+REM travelling away from it first.
+start "" "%EXE%" /Engine/Maps/Entry -windowed -ResX=960 -ResY=540 -WinX=980 -WinY=40 -sdmprole=client -sdmpauto %QUIT%

@@ -2301,7 +2301,12 @@ do
             -- RecastNavMesh-Default ("found in memory ... does not have all
             -- load flags"). Hop through the engine's empty Entry map first so
             -- the old world is fully gone before the join.
-            console("open /Engine/Maps/Entry")
+            -- test.bat now starts the client straight on Entry, so it never
+            -- loads PersistentLevel before joining. The hop below only runs if
+            -- it was launched some other way.
+            local wname = safe(function() return UEHelpers.GetWorld():GetFName():ToString() end, "?")
+            alog("client starting on map " .. wname)
+            if wname ~= "Entry" then console("open /Engine/Maps/Entry") end
             A.step, A.t = "entry", 0
         elseif A.step == "entry" then
             A.t = A.t + 1
