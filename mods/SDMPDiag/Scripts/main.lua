@@ -2459,9 +2459,9 @@ do
         if mode == "net60" then
             pcall(function() nd.MaxNetTickRate = 60 end)
             console("t.MaxFPS 0")
-        elseif mode == "fps60" then
-            pcall(function() nd.MaxNetTickRate = A.origNetTick or 0 end)
-            console("t.MaxFPS 60")
+        elseif mode == "fps60" or mode == "fps120" then
+            if A.origNetTick then pcall(function() nd.MaxNetTickRate = A.origNetTick end) end
+            console(mode == "fps60" and "t.MaxFPS 60" or "t.MaxFPS 120")
         else
             if A.origNetTick then pcall(function() nd.MaxNetTickRate = A.origNetTick end) end
             console("t.MaxFPS 0")
@@ -2721,7 +2721,15 @@ do
             A.step, A.t = "settle", 0
         elseif A.step == "settle" then
             A.t = A.t + 1
-            if A.t >= 5 then startRun(); A.step = "running" end
+            -- phase 1 has host settings too (host fps 60): request them first
+            if not A.p1sent then
+                A.p1sent = true
+                A.want = "ok:on:off:default:fps60"
+                fwrite("sdmp_phase.txt", "set:on:off:default:fps60")
+            end
+            if A.t >= 5 and ((fread("sdmp_phase.txt") or "") == A.want or A.t > 20) then
+                startRun(); A.step = "running"
+            end
         elseif A.step == "running" then
             local mp = myPawn()
             if mp then A.mon("client-own", mp) end
@@ -2776,10 +2784,19 @@ do
                 --   1 host uncapped (baseline)
                 --   2 host NetDriver.MaxNetTickRate = 60 (host keeps its fps)
                 --   3 host capped at 60fps (repeat of the control)
+                -- FOUND THE LEVER. host uncapped 77 stalls, host net tick 60 95
+                -- (send rate isn't it), host fps 60 -> 1 stall, 1 snap. It's
+                -- the host's FRAME RATE. Now map it out:
+                --   1 host 60 / client 60   (confirm)
+                --   2 host 120 / client 60  (is it the ratio, or just "host fast"?)
+                --   3 host 60 / client uncapped
+                -- Note this is two games on one PC, so part of it may be the
+                -- uncapped host hogging the machine rather than the netcode.
                 local PHASES = {
-                    { name = "host uncapped",     rep = "on", trust = "off", acks = "default", net = "default", on = {}, off = {} },
-                    { name = "host net tick 60",  rep = "on", trust = "off", acks = "default", net = "net60",   on = {}, off = {} },
-                    { name = "host fps 60",       rep = "on", trust = "off", acks = "default", net = "fps60",   on = {}, off = {} },
+                    { name = "host60 client60",   rep = "on", trust = "off", acks = "default", net = "fps60",  on = {}, off = {} },
+                    { name = "host120 client60",  rep = "on", trust = "off", acks = "default", net = "fps120", on = {}, off = {} },
+                    { name = "host60 client uncapped", rep = "on", trust = "off", acks = "default", net = "fps60",
+                      on = { "t.MaxFPS 0" }, off = { "t.MaxFPS 60" } },
                 }
                 A.PH = PHASES
                 A.results = A.results or {}
