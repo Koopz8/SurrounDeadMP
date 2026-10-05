@@ -1873,8 +1873,10 @@ local function stMark(name, ctx)
         local a = o:GetAddress()
         if a == st.pawnAddr then mine = true; return end
         -- controller functions: is it our controller?
-        local p = o.Pawn
-        if p and p:IsValid() and p:GetAddress() == st.pawnAddr then mine = true end
+        local p = safe(function() return o.Pawn end, nil)
+        if p and p:IsValid() and p:GetAddress() == st.pawnAddr then mine = true; return end
+        local ow = safe(function() return o:GetOwner() end, nil)
+        if ow and ow:IsValid() and ow:GetAddress() == st.pawnAddr then mine = true end
     end)
     if not mine then return end
     st.ev[#st.ev+1] = { f = #st.rows, n = name }
@@ -1949,6 +1951,29 @@ local function stReport()
         st.lastStalls, st.lastDoubles = stall, dbl
         log(("ST[%s]: median step %.1f, %d stalled frames, %d catch-up frames"):format(st.side, med, stall, dbl))
     end
+    -- Which events line up with stalls: hits on stall frames (or the frame
+    -- before) vs total hits.
+    do
+        local stallSet, nStall = {}, 0
+        for i = 3, #r - 1 do
+            if r[i].v > 100 and steps[i] < 0.5 then stallSet[i] = true; nStall = nStall + 1 end
+        end
+        local onStall, total = {}, {}
+        for _, e in ipairs(st.ev) do
+            total[e.n] = (total[e.n] or 0) + 1
+            -- event recorded after row f was taken lands in row f+1's step
+            if stallSet[e.f + 1] or stallSet[e.f] then onStall[e.n] = (onStall[e.n] or 0) + 1 end
+        end
+        local list = {}
+        for n, c in pairs(total) do list[#list+1] = { n = n, s = onStall[n] or 0, t = c } end
+        table.sort(list, function(a, b) return a.s > b.s end)
+        local out = {}
+        for i = 1, math.min(12, #list) do
+            out[#out+1] = ("%s %d/%d"):format(list[i].n, list[i].s, list[i].t)
+        end
+        log(("ST corr: %d stall frames. event: hits near a stall / total hits -> %s"):format(
+            nStall, #out > 0 and table.concat(out, ", ") or "no events at all"))
+    end
     -- On each stalled frame (and the frames either side): did the movement
     -- component run? LastUpdateLocation moves only when PerformMovement runs.
     -- Velocity/accel/input say whether it had a reason to move.
@@ -1988,15 +2013,42 @@ local function stHookAll(pawn)
         if good then ok = ok + 1 else bad[#bad+1] = name end
     end
     for _, path in ipairs(ST_NATIVE) do hook(path, shortName(path)) end
-    -- every network-driven function on the character BP
+    -- Every Blueprint function on the character and its controller, plus the
+    -- native component setters. The stall-frame log showed velocity still
+    -- climbing on the stalled frame while the position didn't move at all -
+    -- the movement maths ran, the move didn't land. Something on those
+    -- frames is setting or holding the transform; whatever fires on nearly
+    -- every stall frame and rarely otherwise is it.
+    local skip = { ReceiveTick = true, ExecuteUbergraph_BP_PlayerCharacter = true }
     pcall(function()
         pawn:GetClass():ForEachFunction(function(fn)
             local n = safe(function() return fn:GetFName():ToString() end, "")
-            if n:match("^MC_") or n:match("^Client_") or n:match("^OnRep_") then
-                hook(BPC .. n, n)
-            end
+            if n ~= "" and not skip[n] and not n:find("Ubergraph") and not n:find("DelegateSignature") then hook(BPC .. n, n) end
         end)
     end)
+    pcall(function()
+        local pc = pawn.Controller
+        local cls = pc:GetClass()
+        local path = safe(function() return cls:GetFullName() end, "")
+        path = path:match("^%S+%s+(.+)$") or path
+        if path:find("^/Game/") then
+            cls:ForEachFunction(function(fn)
+                local n = safe(function() return fn:GetFName():ToString() end, "")
+                if n ~= "" and not n:find("Ubergraph") and not n:find("DelegateSignature") and n ~= "ReceiveTick" then hook(path .. ":" .. n, "PC." .. n) end
+            end)
+        end
+    end)
+    for _, n in ipairs({ "K2_SetWorldLocation", "K2_SetWorldRotation", "K2_SetWorldTransform",
+                         "K2_SetWorldLocationAndRotation", "K2_SetRelativeLocation", "K2_SetRelativeRotation",
+                         "K2_SetRelativeTransform", "K2_SetRelativeLocationAndRotation",
+                         "K2_AddWorldOffset", "K2_AddWorldRotation", "K2_AddRelativeLocation",
+                         "K2_AddLocalOffset", "SetWorldScale3D" }) do
+        hook("/Script/Engine.SceneComponent:" .. n, "SC." .. n)
+    end
+    for _, n in ipairs({ "StopMovementImmediately", "SetMovementMode", "AddImpulse", "AddForce",
+                         "SetPlaneConstraintEnabled", "DisableMovement" }) do
+        hook("/Script/Engine.CharacterMovementComponent:" .. n, "CMC." .. n)
+    end
     -- the per-frame sampler
     local good = pcall(function()
         RegisterHook(BPC .. "ReceiveTick", function(ctx)
