@@ -2124,6 +2124,78 @@ RegisterConsoleCommandHandler("sdmp_snaptrace", function() snapTrace() return tr
 log("SDMPDiag: sdmp_snaptrace logs what moved the pawn on each snap frame.")
 
 -- ===========================================================================
+-- Zombies never hit remote players. The zombie's attack is all animation:
+-- AttackPlayer plays a montage on the server, and AnimNotify_ZombieAttack*
+-- inside that montage starts the Left/RightArmTrace / AttackTrace sphere traces
+-- that call ApplyDamage. Nothing about it is replicated. On a listen server the
+-- zombie's mesh only animates when the HOST can see it, so a zombie swinging at
+-- a client somewhere off the host's screen plays a frozen montage, no notify
+-- fires, and the trace never runs. Fix: on the host, any zombie within ~50 m of
+-- a remote player always ticks its animation; put it back once nobody's near.
+local ZF = { touched = {}, logged = 0 }
+local function zombieAnimFix()
+    local world = UEHelpers.GetWorld()
+    if not (world and safe(function() return world:IsValid() end, false)) then return end
+    local gm = safe(function() return world.AuthorityGameMode end, nil)
+    if not (gm and safe(function() return gm:IsValid() end, false)) then return end
+    local remote = {}
+    for _, c in ipairs(listControllers()) do
+        if safe(function() return c:IsLocalController() end, true) == false then
+            local p = safe(function() return c.Pawn end, nil)
+            if p and safe(function() return p:IsValid() end, false) then
+                local l = safe(function() return p:K2_GetActorLocation() end, nil)
+                if l then remote[#remote + 1] = { X = l.X, Y = l.Y, Z = l.Z } end
+            end
+        end
+    end
+    if #remote == 0 and next(ZF.touched) == nil then return end
+    local seen = {}
+    local zs = safe(function() return FindAllOf("BP_MasterZombie_C") end, nil) or {}
+    for _, z in ipairs(zs) do
+        if safe(function() return z:IsValid() end, false) then
+            local key = safe(function() return z:GetAddress() end, nil)
+            local mesh = safe(function() return z.Mesh end, nil)
+            if key and mesh and safe(function() return mesh:IsValid() end, false) then
+                seen[key] = true
+                local zl = safe(function() return z:K2_GetActorLocation() end, nil)
+                local near = false
+                if zl then
+                    for _, r in ipairs(remote) do
+                        if (r.X - zl.X)^2 + (r.Y - zl.Y)^2 + (r.Z - zl.Z)^2 < 5000 * 5000 then near = true; break end
+                    end
+                end
+                local t = ZF.touched[key]
+                if near and not t then
+                    local orig = safe(function() local v = mesh.VisibilityBasedAnimTickOption; return type(v) == "number" and v or v:get() end, nil)
+                    local uro = safe(function() return mesh.bEnableUpdateRateOptimizations end, nil)
+                    pcall(function() mesh.VisibilityBasedAnimTickOption = 0 end)   -- AlwaysTickPoseAndRefreshBones
+                    pcall(function() mesh.bEnableUpdateRateOptimizations = false end)
+                    ZF.touched[key] = { mesh = mesh, orig = orig, uro = uro }
+                    if ZF.logged < 8 then
+                        ZF.logged = ZF.logged + 1
+                        log(("ZF: %s near a remote player - animation always ticks (was %s, uro %s)"):format(
+                            className(z), tostring(orig), tostring(uro)))
+                    end
+                elseif t and not near then
+                    if t.orig then pcall(function() mesh.VisibilityBasedAnimTickOption = t.orig end) end
+                    if t.uro ~= nil then pcall(function() mesh.bEnableUpdateRateOptimizations = t.uro end) end
+                    ZF.touched[key] = nil
+                end
+            end
+        end
+    end
+    for k in pairs(ZF.touched) do
+        if not seen[k] then ZF.touched[k] = nil end   -- dead or despawned
+    end
+end
+LoopAsync(1000, function()
+    ExecuteInGameThread(function()
+        local ok, err = pcall(zombieAnimFix)
+        if not ok then log("ZF error: " .. tostring(err)) end
+    end)
+    return false
+end)
+
 -- Auto mode. Driving two game windows by hand (or by remote control) is slow
 -- and flaky: the console ignores pasted text, the game grabs the mouse, and
 -- every run is a dozen typed commands. So the bats pass a role on the command
