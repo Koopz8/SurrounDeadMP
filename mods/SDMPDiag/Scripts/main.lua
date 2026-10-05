@@ -2504,18 +2504,35 @@ do
                 -- server stops simulating the client entirely, so "no snaps"
                 -- there meant nothing. Back to normal vs no-corrections, now
                 -- with the host tracing its copy of the client frame by frame.
+                -- Last run: no-corrections still snapped 31 times (normal 32), so
+                -- the server isn't causing it. The host's copy only advances
+                -- when a move packet lands, which is normal. The snaps are
+                -- client-local. Suspect: move combining. At 240 fps the client
+                -- merges several frames into one packet, and when it merges it
+                -- rewinds to the start of the pending move and re-simulates the
+                -- lot - any difference between that and the frame-by-frame
+                -- result (we're turning, accel ramps) is a visible pop. Test it
+                -- with combining off, and separately with the frame rate capped
+                -- (fewer frames per packet = less combining).
                 local PHASES = {
-                    { name = "normal",         rep = "on", trust = "off" },
-                    { name = "no corrections", rep = "on", trust = "on" },
+                    { name = "normal",       rep = "on", trust = "off", on = {},
+                      off = {} },
+                    { name = "no move combining", rep = "on", trust = "off",
+                      on = { "p.NetEnableMoveCombining 0" }, off = { "p.NetEnableMoveCombining 1" } },
+                    { name = "client capped 60fps", rep = "on", trust = "off",
+                      on = { "t.MaxFPS 60" }, off = { "t.MaxFPS 0" } },
                 }
+                A.PH = PHASES
                 A.results = A.results or {}
                 A.phase = A.phase or 1
                 A.results[A.phase] = { snaps = st.lastSnaps, counts = st.lastCounts or {},
                     speed = A.run and A.run.lastSpeed or -1 }
                 alog(("phase %d (%s): %s snaps"):format(A.phase, PHASES[A.phase].name, tostring(st.lastSnaps)))
+                for _, c in ipairs(PHASES[A.phase].off or {}) do console(c) end
                 if A.phase < #PHASES then
                     A.phase = A.phase + 1
                     local ph = PHASES[A.phase]
+                    for _, c in ipairs(ph.on or {}) do console(c) end
                     A.want = "ok:" .. ph.rep .. ":" .. ph.trust
                     fwrite("sdmp_phase.txt", "set:" .. ph.rep .. ":" .. ph.trust)
                     A.step, A.t = "waitB", 0
