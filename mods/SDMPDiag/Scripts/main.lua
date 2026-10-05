@@ -2307,11 +2307,14 @@ do
                     pcall(function() p.bCanBeDamaged = false end)
                 end
             end
-            if not A.trusted and (fread("sdmp_phase.txt") or ""):find("^trust$") then
-                A.trusted = true
-                trustClient(true)
-                fwrite("sdmp_phase.txt", "trusted")
-                alog("phase B: server corrections off for remote players")
+            -- phase requests from the client: "set:<rep>:<trust>" -> "ok:<same>"
+            local req = fread("sdmp_phase.txt") or ""
+            local r, t = req:match("^set:(%a+):(%a+)$")
+            if r then
+                repMove(r == "on")
+                trustClient(t == "on")
+                fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t)
+                alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
@@ -2412,32 +2415,46 @@ do
             if A.t >= 5 then startRun(); A.step = "running" end
         elseif A.step == "running" then
             if A.run and A.run.phase == "done" then
+                -- Same scripted run under each host setting. Run B of the last
+                -- test (corrections off) still snapped - every snap a pull
+                -- BACK of ~11 units with no move RPC at all. Something local
+                -- is restoring an older position. Prime suspect: replicated
+                -- movement (the server's lagging copy) being applied to our
+                -- own pawn, so phase 2 turns that off.
+                local PHASES = {
+                    { name = "normal",          rep = "on",  trust = "off" },
+                    { name = "repmove off",     rep = "off", trust = "off" },
+                    { name = "repmove off + no corrections", rep = "off", trust = "on" },
+                }
                 A.results = A.results or {}
-                A.results[#A.results+1] = { snaps = st.lastSnaps, counts = st.lastCounts or {} }
-                if #A.results == 1 then
-                    -- A/B: same run again with the server told not to correct us
-                    alog("run A (normal) finished - asking host to stop correcting us")
-                    fwrite("sdmp_phase.txt", "trust")
+                A.phase = A.phase or 1
+                A.results[A.phase] = { snaps = st.lastSnaps, counts = st.lastCounts or {},
+                    speed = A.run and A.run.lastSpeed or -1 }
+                alog(("phase %d (%s): %s snaps"):format(A.phase, PHASES[A.phase].name, tostring(st.lastSnaps)))
+                if A.phase < #PHASES then
+                    A.phase = A.phase + 1
+                    local ph = PHASES[A.phase]
+                    A.want = "ok:" .. ph.rep .. ":" .. ph.trust
+                    fwrite("sdmp_phase.txt", "set:" .. ph.rep .. ":" .. ph.trust)
                     A.step, A.t = "waitB", 0
                 else
-                    local function c(r, k) return (r.counts or {})[k] or 0 end
-                    local a, b = A.results[1], A.results[2]
-                    alog(("AB RESULT: snaps normal=%s trustclient=%s | corrections (ClientAdjustPosition) %d vs %d | acks %d vs %d"):format(
-                        tostring(a.snaps), tostring(b.snaps),
-                        c(a, "ClientAdjustPosition") + c(a, "ClientVeryShortAdjustPosition"),
-                        c(b, "ClientAdjustPosition") + c(b, "ClientVeryShortAdjustPosition"),
-                        c(a, "ClientAckGoodMove"), c(b, "ClientAckGoodMove")))
+                    local parts = {}
+                    for i, ph in ipairs(PHASES) do
+                        local r = A.results[i] or {}
+                        parts[#parts+1] = ("%s=%s snaps (top speed %s)"):format(ph.name, tostring(r.snaps), tostring(r.speed))
+                    end
+                    alog("PHASE RESULT: " .. table.concat(parts, " | "))
                     fwrite("sdmp_done.txt", "1")
                     A.step, A.t = "finished", 0
                 end
             end
         elseif A.step == "waitB" then
             A.t = A.t + 1
-            if (fread("sdmp_phase.txt") or ""):find("trusted") then
-                alog("host confirmed - run B")
+            if (fread("sdmp_phase.txt") or "") == A.want then
+                alog("host confirmed " .. A.want .. " - next run")
                 startRun(); A.step = "running"
             elseif A.t > 20 then
-                alog("FAIL: host never confirmed phase B"); fwrite("sdmp_done.txt", "1"); A.step, A.t = "finished", 0
+                alog("FAIL: host never confirmed " .. tostring(A.want)); fwrite("sdmp_done.txt", "1"); A.step, A.t = "finished", 0
             end
         elseif A.step == "finished" then
             A.t = A.t + 1
@@ -2485,6 +2502,11 @@ do
                     end
                     if os.clock() - r.t1 > 15 then alog("FAIL: snaptrace never finished"); r.phase = "done"; return end
                 end
+                pcall(function()
+                    local v = p.CharacterMovement.Velocity
+                    local sp = math.sqrt(v.X*v.X + v.Y*v.Y)
+                    if sp > (r.lastSpeed or 0) then r.lastSpeed = math.floor(sp) end
+                end)
                 local yaw = pc:GetControlRotation().Yaw * math.pi / 180
                 p:AddMovementInput({ X = math.cos(yaw), Y = math.sin(yaw), Z = 0.0 }, 1.0, false)
             end)
