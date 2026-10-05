@@ -2581,6 +2581,15 @@ do
             if (fread("sdmp_htrace.txt") or "") == "go" then
                 fwrite("sdmp_htrace.txt", "0")
                 A.hostTrace()
+                -- Control: run the exact same scripted walk/sprint + snaptrace
+                -- on the HOST's own pawn at the same 60fps cap. The host looks
+                -- smooth; if the instrument still counts stalls there, the
+                -- stall count is partly how we sample, not what's on screen.
+                if not A.hostRan and A.startRun then
+                    A.hostRan = true
+                    console("t.MaxFPS 60")
+                    A.startRun()
+                end
             end
             -- phase requests from the client: "set:<rep>:<trust>" -> "ok:<same>"
             local req = fread("sdmp_phase.txt") or ""
@@ -2614,6 +2623,8 @@ do
         A.run = { frames = 0, phase = "walk", n = 0, sprintOk = nil }
         alog("scripted run: 3s walk, then sprint + snaptrace, turning halfway")
     end
+
+    A.startRun = startRun
 
     local function clientTick()
         if A.step == "init" then
