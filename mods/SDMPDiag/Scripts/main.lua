@@ -2347,6 +2347,7 @@ do
                 -- with exactly this error. With async net loading off it just
                 -- resolves to null instead.
                 console("net.AllowAsyncLoading 0")
+                A.noClientNav()
                 alog("on Entry map, old world released - connecting")
                 A.step, A.t = "connect", 0
             end
@@ -2440,6 +2441,38 @@ do
         end)
         end)
         alog("run hook registered = " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
+    end
+
+    -- FOUND IT (trace run 1). During the join the client constructs its own
+    -- RecastNavMesh_<n> in PersistentLevel - spawned, not loaded. That's the
+    -- client's navigation system auto-creating nav data for the "Default"
+    -- agent, which it names RecastNavMesh-Default. It does that while the map
+    -- package is still streaming in, so when the loader reaches the real
+    -- RecastNavMesh-Default export it finds a same-named object already in
+    -- memory that it didn't load -> "found in memory ... does not have all
+    -- load flags". (The client has a nav system even on Entry: AbstractNavData
+    -- began play there.) Clients never path-find here, so tell the nav system
+    -- not to create nav data on its own - on the CDO, so the new world's
+    -- instance inherits it, and on the current instance for good measure.
+    A.noClientNav = function()
+        local function patch(ns, tag)
+            if not (ns and safe(function() return ns:IsValid() end, false)) then return end
+            local before = safe(function() return ns.bAutoCreateNavigationData end, "?")
+            local cs = safe(function() return ns.bAllowClientSideNavigation end, "?")
+            pcall(function() ns.bAutoCreateNavigationData = false end)
+            alog(("nav %s %s: bAutoCreateNavigationData %s -> %s, bAllowClientSideNavigation=%s"):format(
+                tag, className(ns), tostring(before),
+                tostring(safe(function() return ns.bAutoCreateNavigationData end, "?")), tostring(cs)))
+        end
+        patch(StaticFindObject("/Script/NavigationSystem.Default__NavigationSystemV1"), "CDO")
+        local w = UEHelpers.GetWorld()
+        local inst = w and safe(function() return w.NavigationSystem end, nil) or nil
+        if inst and safe(function() return inst:IsValid() end, false) then
+            patch(inst, "world")
+            -- a game subclass would have its own CDO
+            local cdo = safe(function() return inst:GetClass():GetCDO() end, nil)
+            patch(cdo, "subclass CDO")
+        end
     end
 
     -- --------------------------------------------------- join crash trace
