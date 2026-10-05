@@ -2188,6 +2188,22 @@ do
         return false
     end
 
+    -- One line per pawn: where it is and what its movement component thinks
+    -- the speed limits are. Run on both sides during a phase, the host's copy
+    -- and the client's own pawn can be compared second by second.
+    A.mon = function(tag, p)
+        pcall(function()
+            local cmc = p.CharacterMovement
+            local l = p:K2_GetActorLocation()
+            local v = cmc.Velocity
+            alog(("MON %s pos=%.0f,%.0f vel=%.0f maxWalk=%.0f maxAccel=%.0f mode=%s"):format(
+                tag, l.X, l.Y, math.sqrt(v.X*v.X + v.Y*v.Y),
+                safe(function() return cmc.MaxWalkSpeed end, -1),
+                safe(function() return cmc.MaxAcceleration end, -1),
+                tostring(safe(function() return cmc.MovementMode end, "?"))))
+        end)
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
@@ -2307,6 +2323,13 @@ do
                     pcall(function() p.bCanBeDamaged = false end)
                 end
             end
+            for _, c in ipairs(listControllers()) do
+                local rp = safe(function() return c.Pawn end, nil)
+                if rp and safe(function() return rp:IsValid() end, false)
+                   and safe(function() return c:IsLocalController() end, true) == false then
+                    A.mon("host-copy", rp)
+                end
+            end
             -- phase requests from the client: "set:<rep>:<trust>" -> "ok:<same>"
             local req = fread("sdmp_phase.txt") or ""
             local r, t = req:match("^set:(%a+):(%a+)$")
@@ -2414,6 +2437,8 @@ do
             A.t = A.t + 1
             if A.t >= 5 then startRun(); A.step = "running" end
         elseif A.step == "running" then
+            local mp = myPawn()
+            if mp then A.mon("client-own", mp) end
             if A.run and A.run.phase == "done" then
                 -- Same scripted run under each host setting. Run B of the last
                 -- test (corrections off) still snapped - every snap a pull
