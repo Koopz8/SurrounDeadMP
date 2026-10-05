@@ -2216,6 +2216,28 @@ do
             if A.t > 60 then alog("FAIL: no host pawn 60s after Continue"); A.step = "dead" end
         elseif A.step == "ingame" then
             ExecuteInGameThread(netStatus)
+            -- The join crash. Starting the client on Entry didn't help (and the
+            -- game ignores a map on the command line anyway), so it isn't a
+            -- stale copy on the client. Next suspect: the navmesh actor has a
+            -- stable name in the map package; if the server replicates it, the
+            -- client resolves that path and starts its own async load of
+            -- PersistentLevel while the travel is still loading it - and the
+            -- loader trips over the half-made RecastNavMesh-Default. Clients
+            -- don't run navigation here (bAllowClientSideNavigation=False), so
+            -- the navmesh has no reason to replicate. Log it and turn it off.
+            pcall(function()
+                for _, nm in ipairs(FindAllOf("RecastNavMesh") or {}) do
+                    if nm:IsValid() then
+                        local before = safe(function() return nm.bReplicates end, "?")
+                        local nlc = safe(function() return nm.bNetLoadOnClient end, "?")
+                        pcall(function() nm:SetReplicates(false) end)
+                        alog(("navmesh %s: bReplicates %s -> %s, bNetLoadOnClient=%s"):format(
+                            safe(function() return nm:GetFName():ToString() end, "?"),
+                            tostring(before), tostring(safe(function() return nm.bReplicates end, "?")),
+                            tostring(nlc)))
+                    end
+                end
+            end)
             -- test runs shouldn't end with the host dead in a ditch
             console("god")
             fwrite("sdmp_ready.txt", "1")
