@@ -16,6 +16,9 @@ local function safe(fn, fallback)
 end
 
 local function className(obj)
+    -- a null UObject wrapper isn't nil in Lua, and touching it is a native
+    -- crash pcall can't catch, so check IsValid before anything else
+    if not obj or not safe(function() return obj:IsValid() end, false) then return "<null>" end
     return safe(function() return obj:GetClass():GetFName():ToString() end, "<?>")
 end
 
@@ -2228,8 +2231,19 @@ do
             local world = UEHelpers.GetWorld()
             local gm = world and safe(function() return world.AuthorityGameMode end, nil)
             local cls = StaticFindObject(PC_PATH)
-            if gm and cls and safe(function() return gm.DefaultPawnClass:GetFName():ToString() end, "") ~= "BP_PlayerCharacter_C" then
-                pcall(function() gm.DefaultPawnClass = cls end)
+            -- DefaultPawnClass starts out null. Calling GetFName on a null
+            -- UObject isn't a Lua error pcall can catch - it's a native read of
+            -- offset 0x18 and the whole game goes down (that was the host
+            -- crash on the last three auto runs). IsValid first, always, and
+            -- only do this once.
+            if not A.dpSet and gm and gm:IsValid() and cls and cls:IsValid() then
+                local dp = safe(function() return gm.DefaultPawnClass end, nil)
+                local name = (dp and dp:IsValid()) and safe(function() return dp:GetFName():ToString() end, "") or ""
+                if name ~= "BP_PlayerCharacter_C" then
+                    alog("DefaultPawnClass was " .. (name ~= "" and name or "null") .. " -> BP_PlayerCharacter_C : " ..
+                        tostring(pcall(function() gm.DefaultPawnClass = cls end)))
+                end
+                A.dpSet = true
             end
             for _, c in ipairs(listControllers()) do
                 local key = safe(function() return c:GetAddress() end, nil)
