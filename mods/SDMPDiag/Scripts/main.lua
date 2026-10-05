@@ -2569,7 +2569,13 @@ do
                             n, ok and "ok" or tostring(err), (p2 and p2:IsValid()) and className(p2) or "none"))
                         if p2 and p2:IsValid() then netPerf() end
                     end
-                elseif key and A.seen[key] and A.seen[key] > 0 then
+                elseif key and p and p:IsValid() and not (A.handled or {})[key]
+                       and safe(function() return c:IsLocalController() end, true) == false then
+                    -- (was: only when we'd seen it pawnless first - a joiner
+                    -- that already had a pawn on first sight never got moved
+                    -- to the host, which is why it kept spawning in hordes)
+                    A.handled = A.handled or {}
+                    A.handled[key] = true
                     alog("joiner has pawn " .. className(p))
                     A.seen[key] = -1
                     netPerf()
@@ -2990,7 +2996,10 @@ do
         if not A.role then return end
         alog(("boot: auto=%s quit=%s dir=%s"):format(tostring(A.auto), tostring(A.quit), modDir()))
         if not A.auto then return end
-        if A.role == "client" then A.trace() end
+        -- join-crash trace retired: the cause is found and fixed, and its
+        -- always-on BeginPlay/NewObject hooks are the prime suspect for the
+        -- UE4SS access violation the client hit right after joining
+        -- if A.role == "client" then A.trace() end
         LoopAsync(1000, function()
             ExecuteInGameThread(function()
                 local ok, err = pcall(A.role == "host" and hostTick or clientTick)
