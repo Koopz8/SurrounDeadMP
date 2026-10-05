@@ -2290,6 +2290,21 @@ do
                     alog("joiner has pawn " .. className(p))
                     A.seen[key] = -1
                     netPerf()
+                    -- Joiners spawn at a PlayerStart ~2.5 km away, and last run
+                    -- that was in the middle of a horde - the client couldn't
+                    -- move, so the run measured nothing. Bring them to the host
+                    -- (players should spawn together for beta anyway), and for
+                    -- test runs make them immune server-side; the client's own
+                    -- "god" only covers its local copy.
+                    local hp = myPawn()
+                    local hl = hp and safe(function() return hp:K2_GetActorLocation() end, nil)
+                    if hl then
+                        local dest = { X = hl.X + 250.0, Y = hl.Y + 150.0, Z = hl.Z + 50.0 }
+                        local rot = safe(function() return hp:K2_GetActorRotation() end, { Pitch = 0, Yaw = 0, Roll = 0 })
+                        local ok = safe(function() return p:K2_TeleportTo(dest, rot) end, false)
+                        alog(("moved joiner next to host -> %s"):format(tostring(ok)))
+                    end
+                    pcall(function() p.bCanBeDamaged = false end)
                 end
             end
             if not A.trusted and (fread("sdmp_phase.txt") or ""):find("^trust$") then
