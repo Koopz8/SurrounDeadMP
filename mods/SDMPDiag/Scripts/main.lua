@@ -2250,6 +2250,11 @@ do
                     netPerf()
                 end
             end
+            A.serveT = (A.serveT or 0) + 1
+            if A.quit and A.serveT > 300 then
+                alog("FAIL: no finished client after 5 min - quitting")
+                A.step = "quit"; console("quit"); return
+            end
             if A.quit and (fread("sdmp_done.txt") or ""):find("1") then
                 alog("client finished - quitting")
                 A.step = "quit"
@@ -2296,8 +2301,15 @@ do
                 A.step, A.t = "connect", 0
             end
         elseif A.step == "connect" then
+            -- The Entry map hands us a standalone DefaultPawn, so "have a pawn"
+            -- isn't enough - wait for our own character, owned by the server.
+            -- (First auto run took the DefaultPawn as joined, never connected,
+            -- then crashed in a hook on a class the Entry hop had unloaded.)
             local p = myPawn()
-            if p then A.step, A.t = "joined", 0; return end
+            if p and className(p) == "BP_PlayerCharacter_C"
+               and (ROLE[safe(function() return p.Role end, -1)] or "") == "AutonomousProxy" then
+                A.step, A.t = "joined", 0; return
+            end
             if A.t % 45 == 0 then console("open 127.0.0.1:7777") end
             A.t = A.t + 1
             if A.t > 120 then alog("FAIL: never got a pawn after 2 min"); A.step = "dead" end
