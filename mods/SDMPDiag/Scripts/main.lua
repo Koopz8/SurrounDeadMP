@@ -2204,10 +2204,58 @@ do
         end)
     end
 
+    -- Host-side twin of snaptrace: per frame, where is the SERVER's copy of
+    -- the client? If the server copy is smooth while the client snaps, the
+    -- client is mis-replaying its own moves. If the server copy itself
+    -- jumps, the server is applying the client's moves unevenly.
+    A.ht = { on = false, rows = {}, hooked = false }
+    A.hostTrace = function()
+        if not A.ht.hooked then
+            A.ht.hooked = true
+            pcall(function()
+                RegisterHook(BPC .. "ReceiveTick", function(ctx)
+                    if not A.ht.on then return end
+                    pcall(function()
+                        local p = ctx:get()
+                        if p:IsLocallyControlled() ~= false then return end
+                        local l = p:K2_GetActorLocation()
+                        local rows = A.ht.rows
+                        rows[#rows+1] = { X = l.X, Y = l.Y }
+                        if #rows >= 720 then
+                            A.ht.on = false
+                            local steps, snaps, back, zero = {}, 0, 0, 0
+                            for i = 2, #rows do
+                                steps[i] = math.sqrt((rows[i].X-rows[i-1].X)^2 + (rows[i].Y-rows[i-1].Y)^2)
+                                if steps[i] < 0.01 then zero = zero + 1 end
+                            end
+                            local lines = {}
+                            for i = 3, #rows - 1 do
+                                local nb = (steps[i-1] + steps[i+1]) / 2
+                                if steps[i] > 2 * nb and steps[i] - nb > 2 then
+                                    snaps = snaps + 1
+                                    local px, py = rows[i-1].X - rows[i-2].X, rows[i-1].Y - rows[i-2].Y
+                                    local pl = math.sqrt(px*px + py*py)
+                                    local fwd = pl > 0.001 and ((rows[i].X-rows[i-1].X)*px + (rows[i].Y-rows[i-1].Y)*py) / pl or 0
+                                    if fwd < 0 then back = back + 1 end
+                                    if #lines < 25 then lines[#lines+1] = ("f%d %.1f(%+.1f)"):format(i, steps[i], fwd) end
+                                end
+                            end
+                            alog(("HT: server copy over %d frames: %d snaps (%d backward), %d frames with no movement"):format(
+                                #rows, snaps, back, zero))
+                            if #lines > 0 then alog("HT: " .. table.concat(lines, "  ")) end
+                        end
+                    end)
+                end)
+            end)
+        end
+        A.ht.rows, A.ht.on = {}, true
+        alog("HT: tracing server copy of the client for 720 frames")
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
-            fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0")
+            fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0"); fwrite("sdmp_htrace.txt", "0")
             -- No need to get past "press any key": the listen travel reloads
             -- the map and the menu comes back up without it.
             if not UEHelpers.GetPlayerController() then return end
@@ -2330,6 +2378,10 @@ do
                     A.mon("host-copy", rp)
                 end
             end
+            if (fread("sdmp_htrace.txt") or "") == "go" then
+                fwrite("sdmp_htrace.txt", "0")
+                A.hostTrace()
+            end
             -- phase requests from the client: "set:<rep>:<trust>" -> "ok:<same>"
             local req = fread("sdmp_phase.txt") or ""
             local r, t = req:match("^set:(%a+):(%a+)$")
@@ -2446,10 +2498,15 @@ do
                 -- is restoring an older position. Prime suspect: replicated
                 -- movement (the server's lagging copy) being applied to our
                 -- own pawn, so phase 2 turns that off.
+                -- repmove off is out: the MON lines showed the host's copy of
+                -- the client frozen in place while the client's own pawn
+                -- covered ~10,000 units a second at a reported 400 - the
+                -- server stops simulating the client entirely, so "no snaps"
+                -- there meant nothing. Back to normal vs no-corrections, now
+                -- with the host tracing its copy of the client frame by frame.
                 local PHASES = {
-                    { name = "normal",          rep = "on",  trust = "off" },
-                    { name = "repmove off",     rep = "off", trust = "off" },
-                    { name = "repmove off + no corrections", rep = "off", trust = "on" },
+                    { name = "normal",         rep = "on", trust = "off" },
+                    { name = "no corrections", rep = "on", trust = "on" },
                 }
                 A.results = A.results or {}
                 A.phase = A.phase or 1
@@ -2510,6 +2567,7 @@ do
                         r.sprintOk = pcall(function() p:Event_Sprint() end)
                         alog("Event_Sprint -> " .. tostring(r.sprintOk))
                         snapTrace()
+                        fwrite("sdmp_htrace.txt", "go")
                         r.t1 = os.clock()
                     end
                 elseif r.phase == "sprint" then
