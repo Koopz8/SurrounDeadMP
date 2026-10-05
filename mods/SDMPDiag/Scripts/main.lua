@@ -2023,7 +2023,10 @@ local function stHookAll(pawn)
     pcall(function()
         pawn:GetClass():ForEachFunction(function(fn)
             local n = safe(function() return fn:GetFName():ToString() end, "")
-            if n ~= "" and not skip[n] and not n:find("Ubergraph") and not n:find("DelegateSignature") then hook(BPC .. n, n) end
+            -- broad hooking came back flat (Event_AutoRun etc. hit at the base
+            -- rate) and 849 hooks perturb the very thing we're timing, so back
+            -- to network-driven functions only
+            if n:match("^MC_") or n:match("^Client_") or n:match("^OnRep_") then hook(BPC .. n, n) end
         end)
     end)
     pcall(function()
@@ -2031,7 +2034,7 @@ local function stHookAll(pawn)
         local cls = pc:GetClass()
         local path = safe(function() return cls:GetFullName() end, "")
         path = path:match("^%S+%s+(.+)$") or path
-        if path:find("^/Game/") then
+        if false and path:find("^/Game/") then
             cls:ForEachFunction(function(fn)
                 local n = safe(function() return fn:GetFName():ToString() end, "")
                 if n ~= "" and not n:find("Ubergraph") and not n:find("DelegateSignature") and n ~= "ReceiveTick" then hook(path .. ":" .. n, "PC." .. n) end
@@ -2399,6 +2402,41 @@ do
         end
     end
 
+    -- Full movement-component config, plus tick settings, for one pawn. The
+    -- stall correlation came back flat (no Blueprint function lines up with
+    -- the stalls), so compare configuration instead: the host's own pawn is
+    -- smooth, the client's own pawn isn't, same class.
+    A.dumpMove = function(tag, p)
+        pcall(function()
+            local cmc = p.CharacterMovement
+            local vals = {}
+            cmc:GetClass():ForEachProperty(function(pr)
+                local n = safe(function() return pr:GetFName():ToString() end, nil)
+                if not n then return end
+                local v = safe(function() return cmc[n] end, nil)
+                local tv = type(v)
+                if tv == "number" or tv == "boolean" then
+                    if tv == "number" and v ~= math.floor(v) then v = ("%.4g"):format(v) end
+                    vals[#vals+1] = n .. "=" .. tostring(v)
+                end
+            end)
+            table.sort(vals)
+            for i = 1, #vals, 25 do
+                alog(("CFG %s cmc: %s"):format(tag, table.concat(vals, " ", i, math.min(i + 24, #vals))))
+            end
+            local function tk(o, f)
+                return safe(function() local t = o[f]; return ("interval=%s group=%s enabled=%s"):format(
+                    tostring(safe(function() return t.TickInterval end, "?")),
+                    tostring(safe(function() return t.TickGroup end, "?")),
+                    tostring(safe(function() return t.bCanEverTick end, "?"))) end, "?")
+            end
+            alog(("CFG %s ticks: actor[%s] cmc[%s] mesh[%s] meshAnimTick=%s role=%s"):format(tag,
+                tk(p, "PrimaryActorTick"), tk(cmc, "PrimaryComponentTick"), tk(p.Mesh, "PrimaryComponentTick"),
+                tostring(safe(function() return p.Mesh.VisibilityBasedAnimTickOption end, "?")),
+                ROLE[safe(function() return p.Role end, -1)] or "?"))
+        end)
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
@@ -2516,6 +2554,8 @@ do
                         alog(("moved joiner next to host -> %s"):format(tostring(ok)))
                     end
                     pcall(function() p.bCanBeDamaged = false end)
+                    A.dumpMove("host-own", myPawn())
+                    A.dumpMove("host-copy-of-client", p)
                 end
             end
             for _, c in ipairs(listControllers()) do
@@ -2556,6 +2596,7 @@ do
     local function startRun()
         local p, pc = myPawn()
         A.hookRun()
+        if not A.dumped then A.dumped = true; A.dumpMove("client-own", (myPawn())) end
         if not A.capped then A.capped = true; console("t.MaxFPS 60") end
         A.run = { frames = 0, phase = "walk", n = 0, sprintOk = nil }
         alog("scripted run: 3s walk, then sprint + snaptrace, turning halfway")
