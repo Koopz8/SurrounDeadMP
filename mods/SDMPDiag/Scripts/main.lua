@@ -2338,6 +2338,15 @@ do
                 end)
             end
             if A.t >= 6 then
+                -- Navmesh replication was already off (bReplicates=false), so
+                -- that theory's dead. But it's also bNetLoadOnClient=false: the
+                -- client destroys its own copy while loading the map. If any
+                -- replicated actor (a zombie's AI, say) points at it, the
+                -- client's package map resolves that path by async-loading
+                -- PersistentLevel again, finds the destroyed export, and dies
+                -- with exactly this error. With async net loading off it just
+                -- resolves to null instead.
+                console("net.AllowAsyncLoading 0")
                 alog("on Entry map, old world released - connecting")
                 A.step, A.t = "connect", 0
             end
