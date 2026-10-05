@@ -1916,6 +1916,9 @@ local function stReport()
         end
     end
     log(("ST[%s]: %d snaps in %d frames"):format(st.side, snaps, #r))
+    st.lastSnaps = snaps
+    st.lastCounts = {}
+    for k, v in pairs(st.count) do st.lastCounts[k] = v end
     local parts = {}
     for k, v in pairs(st.count) do parts[#parts+1] = k .. "=" .. v end
     table.sort(parts)
@@ -2188,7 +2191,7 @@ do
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
-            fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0")
+            fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0")
             -- No need to get past "press any key": the listen travel reloads
             -- the map and the menu comes back up without it.
             if not UEHelpers.GetPlayerController() then return end
@@ -2240,6 +2243,9 @@ do
             end)
             -- test runs shouldn't end with the host dead in a ditch
             console("god")
+            -- unpacked movement RPCs both sides, so the client log can tell
+            -- ClientAckGoodMove (fine) from ClientAdjustPosition (correction)
+            console("net.UsePackedMovementRPCs 0")
             fwrite("sdmp_ready.txt", "1")
             alog("host is in game and listening - client may join")
             A.step, A.t = "serving", 0
@@ -2285,6 +2291,12 @@ do
                     A.seen[key] = -1
                     netPerf()
                 end
+            end
+            if not A.trusted and (fread("sdmp_phase.txt") or ""):find("^trust$") then
+                A.trusted = true
+                trustClient(true)
+                fwrite("sdmp_phase.txt", "trusted")
+                alog("phase B: server corrections off for remote players")
             end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
@@ -2385,9 +2397,32 @@ do
             if A.t >= 5 then startRun(); A.step = "running" end
         elseif A.step == "running" then
             if A.run and A.run.phase == "done" then
-                alog("run finished")
-                fwrite("sdmp_done.txt", "1")
-                A.step, A.t = "finished", 0
+                A.results = A.results or {}
+                A.results[#A.results+1] = { snaps = st.lastSnaps, counts = st.lastCounts or {} }
+                if #A.results == 1 then
+                    -- A/B: same run again with the server told not to correct us
+                    alog("run A (normal) finished - asking host to stop correcting us")
+                    fwrite("sdmp_phase.txt", "trust")
+                    A.step, A.t = "waitB", 0
+                else
+                    local function c(r, k) return (r.counts or {})[k] or 0 end
+                    local a, b = A.results[1], A.results[2]
+                    alog(("AB RESULT: snaps normal=%s trustclient=%s | corrections (ClientAdjustPosition) %d vs %d | acks %d vs %d"):format(
+                        tostring(a.snaps), tostring(b.snaps),
+                        c(a, "ClientAdjustPosition") + c(a, "ClientVeryShortAdjustPosition"),
+                        c(b, "ClientAdjustPosition") + c(b, "ClientVeryShortAdjustPosition"),
+                        c(a, "ClientAckGoodMove"), c(b, "ClientAckGoodMove")))
+                    fwrite("sdmp_done.txt", "1")
+                    A.step, A.t = "finished", 0
+                end
+            end
+        elseif A.step == "waitB" then
+            A.t = A.t + 1
+            if (fread("sdmp_phase.txt") or ""):find("trusted") then
+                alog("host confirmed - run B")
+                startRun(); A.step = "running"
+            elseif A.t > 20 then
+                alog("FAIL: host never confirmed phase B"); fwrite("sdmp_done.txt", "1"); A.step, A.t = "finished", 0
             end
         elseif A.step == "finished" then
             A.t = A.t + 1
@@ -2422,7 +2457,7 @@ do
                     end
                 elseif r.phase == "sprint" then
                     -- turn gently in the second second
-                    if os.clock() - r.t1 > 1.0 then pcall(function() pc:AddYawInput(0.6) end) end
+                    if os.clock() - r.t1 > 1.0 then pcall(function() pc:AddYawInput(0.15) end) end
                     if not st.on and os.clock() - r.t1 > 1.0 then
                         pcall(function() p:Event_StopSprint() end)
                         local spd = safe(function()

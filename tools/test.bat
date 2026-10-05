@@ -14,6 +14,7 @@ if /I "%1"=="stay" set QUIT=
 REM clear the handoff files from the last run
 echo 0> "%GAME%\ue4ss\Mods\SDMPDiag\sdmp_ready.txt"
 echo 0> "%GAME%\ue4ss\Mods\SDMPDiag\sdmp_done.txt"
+echo 0> "%GAME%\ue4ss\Mods\SDMPDiag\sdmp_phase.txt"
 
 start "" "%EXE%" -windowed -ResX=960 -ResY=540 -WinX=0 -WinY=40 -sdmprole=host -sdmpauto %QUIT%
 
