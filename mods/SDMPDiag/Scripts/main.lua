@@ -2290,6 +2290,37 @@ do
         alog("HT: tracing server copy of the client for 720 frames")
     end
 
+    -- Server-side ack/adjustment throttles on the remote players' movement
+    -- components. Logs the values either way.
+    A.acks = function(fast)
+        for _, c in ipairs(listControllers()) do
+            local rp = safe(function() return c.Pawn end, nil)
+            if rp and safe(function() return rp:IsValid() end, false)
+               and safe(function() return c:IsLocalController() end, true) == false then
+                pcall(function()
+                    local cmc = rp.CharacterMovement
+                    local function g(n) return tostring(safe(function() return cmc[n] end, "?")) end
+                    alog(("acks before: AckGoodMoves=%s Adjustments=%s LargeCorr=%s LargeDist=%s MaxSmooth=%s"):format(
+                        g("NetworkMinTimeBetweenClientAckGoodMoves"), g("NetworkMinTimeBetweenClientAdjustments"),
+                        g("NetworkMinTimeBetweenClientAdjustmentsLargeCorrection"), g("NetworkLargeClientCorrectionDistance"),
+                        g("NetworkMaxSmoothUpdateDistance")))
+                    if fast then
+                        cmc.NetworkMinTimeBetweenClientAckGoodMoves = 0.0
+                        cmc.NetworkMinTimeBetweenClientAdjustments = 0.0
+                        cmc.NetworkMinTimeBetweenClientAdjustmentsLargeCorrection = 0.0
+                    else
+                        cmc.NetworkMinTimeBetweenClientAckGoodMoves = 0.1
+                        cmc.NetworkMinTimeBetweenClientAdjustments = 0.1
+                        cmc.NetworkMinTimeBetweenClientAdjustmentsLargeCorrection = 0.05
+                    end
+                    alog(("acks after (%s): AckGoodMoves=%s Adjustments=%s"):format(
+                        fast and "fast" or "default",
+                        g("NetworkMinTimeBetweenClientAckGoodMoves"), g("NetworkMinTimeBetweenClientAdjustments")))
+                end)
+            end
+        end
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
@@ -2422,11 +2453,12 @@ do
             end
             -- phase requests from the client: "set:<rep>:<trust>" -> "ok:<same>"
             local req = fread("sdmp_phase.txt") or ""
-            local r, t = req:match("^set:(%a+):(%a+)$")
+            local r, t, ak = req:match("^set:(%a+):(%a+):?(%a*)$")
             if r then
                 repMove(r == "on")
                 trustClient(t == "on")
-                fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t)
+                A.acks(ak == "fast")
+                fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
             A.serveT = (A.serveT or 0) + 1
@@ -2562,11 +2594,17 @@ do
                 -- 60fps so the steps stay clean: normal vs server corrections
                 -- off. If the stalls survive with corrections off, it's acks
                 -- or the client's own tick; if they vanish, it's corrections.
+                -- Result: corrections off -> 0 catch-ups but still 50 stalled
+                -- frames. So frames of movement are genuinely LOST on the
+                -- client (corrections were putting them back). The client CMC
+                -- skips performing a move when it can't allocate a saved move -
+                -- the saved-move buffer only drains when the server acks, and
+                -- the server only acks every NetworkMinTimeBetweenClientAckGoodMoves
+                -- (0.1s by default; ~13 responses/s is what we see). Test: have
+                -- the host ack every move.
                 local PHASES = {
-                    { name = "60fps normal",         rep = "on", trust = "off",
-                      on = {}, off = {} },
-                    { name = "60fps no corrections", rep = "on", trust = "on",
-                      on = {}, off = {} },
+                    { name = "60fps normal",    rep = "on", trust = "off", acks = "default", on = {}, off = {} },
+                    { name = "60fps fast acks", rep = "on", trust = "off", acks = "fast",    on = {}, off = {} },
                 }
                 A.PH = PHASES
                 A.results = A.results or {}
@@ -2580,8 +2618,8 @@ do
                     A.phase = A.phase + 1
                     local ph = PHASES[A.phase]
                     for _, c in ipairs(ph.on or {}) do console(c) end
-                    A.want = "ok:" .. ph.rep .. ":" .. ph.trust
-                    fwrite("sdmp_phase.txt", "set:" .. ph.rep .. ":" .. ph.trust)
+                    A.want = "ok:" .. ph.rep .. ":" .. ph.trust .. ":" .. (ph.acks or "")
+                    fwrite("sdmp_phase.txt", "set:" .. ph.rep .. ":" .. ph.trust .. ":" .. (ph.acks or ""))
                     A.step, A.t = "waitB", 0
                 else
                     local parts = {}
