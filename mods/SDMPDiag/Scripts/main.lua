@@ -1949,6 +1949,25 @@ local function stReport()
         st.lastStalls, st.lastDoubles = stall, dbl
         log(("ST[%s]: median step %.1f, %d stalled frames, %d catch-up frames"):format(st.side, med, stall, dbl))
     end
+    -- On each stalled frame (and the frames either side): did the movement
+    -- component run? LastUpdateLocation moves only when PerformMovement runs.
+    -- Velocity/accel/input say whether it had a reason to move.
+    do
+        local shown = 0
+        for i = 3, #r - 1 do
+            if r[i].v > 100 and steps[i] < 0.5 and shown < 12 then
+                shown = shown + 1
+                local function d(a, b) return (a and b) and v2(a, b) or -1 end
+                local cells = {}
+                for j = i - 1, i + 1 do
+                    cells[#cells+1] = ("[%s step=%.1f lastUpd=%.1f vel=%.0f acc=%.0f in=%.2f]"):format(
+                        j == i and "STALL" or (j < i and "prev" or "next"),
+                        steps[j] or -1, d(r[j-1] and r[j-1].lu, r[j].lu), r[j].v, r[j].acc or -1, r[j].inp or -1)
+                end
+                log("ST stall f" .. i .. " " .. table.concat(cells, " "))
+            end
+        end
+    end
     st.lastSnaps = snaps
     st.lastCounts = {}
     for k, v in pairs(st.count) do st.lastCounts[k] = v end
@@ -1989,9 +2008,16 @@ local function stHookAll(pawn)
                 local a = p:K2_GetActorLocation()
                 local vel = p.CharacterMovement.Velocity
                 local mloc = safe(function() return p.Mesh:K2_GetComponentLocation() end, nil)
+                local cmc = p.CharacterMovement
+                local lu = safe(function() return cmc:GetLastUpdateLocation() end, nil)
+                local acc = safe(function() return cmc:GetCurrentAcceleration() end, nil)
+                local inp = safe(function() return p:GetLastMovementInputVector() end, nil)
                 st.rows[#st.rows+1] = {
                     a  = { X = a.X, Y = a.Y },
                     m  = mloc and { X = mloc.X, Y = mloc.Y } or nil,
+                    lu = lu and { X = lu.X, Y = lu.Y } or nil,
+                    acc = acc and math.sqrt(acc.X^2 + acc.Y^2) or -1,
+                    inp = inp and math.sqrt(inp.X^2 + inp.Y^2) or -1,
                     t  = safe(function()
                         return StaticFindObject("/Script/Engine.Default__GameplayStatics"):GetTimeSeconds(UEHelpers.GetWorld())
                     end, 0),
@@ -2602,9 +2628,12 @@ do
                 -- the server only acks every NetworkMinTimeBetweenClientAckGoodMoves
                 -- (0.1s by default; ~13 responses/s is what we see). Test: have
                 -- the host ack every move.
+                -- Fast acks (480 responses instead of 119) changed nothing: 77
+                -- stalls vs 75. Saved-move starvation is out. This run is one
+                -- normal 60fps phase with per-frame movement-component state on
+                -- every stalled frame.
                 local PHASES = {
-                    { name = "60fps normal",    rep = "on", trust = "off", acks = "default", on = {}, off = {} },
-                    { name = "60fps fast acks", rep = "on", trust = "off", acks = "fast",    on = {}, off = {} },
+                    { name = "60fps normal", rep = "on", trust = "off", acks = "default", on = {}, off = {} },
                 }
                 A.PH = PHASES
                 A.results = A.results or {}
