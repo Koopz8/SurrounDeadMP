@@ -2692,16 +2692,47 @@ local function clothingResend(why)
                         log(("CS:   %s.%s = %s"):format(string.format("%X", safe(function() return p:GetAddress() end, 0)),
                             it.n, mesh and safe(function() return mesh:GetFName():ToString() end, "?") or "none"))
                     end
-                    local ok, err = pcall(function() p:MC_AttachClothing(c, mesh, {}, true, FName("None"), false) end)
-                    if ok then sent = sent + 1
-                    elseif not CS.err then CS.err = true; log("CS: MC_AttachClothing failed: " .. tostring(err)) end
+                    -- queued, not sent: Unreal drops unreliable multicasts past
+                    -- net.MaxRPCPerNetUpdate (default 2) per actor per net update
+                    CS.queue = CS.queue or {}
+                    CS.queue[#CS.queue + 1] = { p = p, c = c, mesh = mesh }
+                    sent = sent + 1
                 end
             end
         end
     end
-    log(("CS: resent %d clothing/body meshes on %d players (%s)"):format(sent, pawns, why))
+    log(("CS: queued %d clothing/body meshes on %d players (%s)"):format(sent, pawns, why))
+end
+local function clothingDrain()
+    if not CS.queue or #CS.queue == 0 then return end
+    if not CS.cvar then
+        CS.cvar = true
+        pcall(function()
+            StaticFindObject("/Script/Engine.Default__KismetSystemLibrary"):ExecuteConsoleCommand(
+                UEHelpers.GetWorld(), "net.MaxRPCPerNetUpdate 16", nil)
+        end)
+        log("CS: net.MaxRPCPerNetUpdate -> 16")
+    end
+    local perPawn = {}
+    local i = 1
+    while i <= #CS.queue do
+        local it = CS.queue[i]
+        local k = safe(function() return it.p:GetAddress() end, 0)
+        if (perPawn[k] or 0) >= 2 then
+            i = i + 1
+        else
+            table.remove(CS.queue, i)
+            if dnValid(it.p) and dnValid(it.c) then
+                perPawn[k] = (perPawn[k] or 0) + 1
+                local ok, err = pcall(function() it.p:MC_AttachClothing(it.c, it.mesh, {}, true, FName("None"), false) end)
+                if not ok and not CS.err then CS.err = true; log("CS: MC_AttachClothing failed: " .. tostring(err)) end
+            end
+        end
+    end
+    if #CS.queue == 0 then log("CS: clothing resend sent") end
 end
 local function clothingSync()
+    clothingDrain()
     local now = os.time()
     for _, c in ipairs(listControllers()) do
         if safe(function() return c:IsLocalController() end, true) == false then
@@ -3489,6 +3520,7 @@ do
         if (z.ph == "end" and z.t - z.pt >= 6) or z.t > 220 then
             if not z.reported then
                 z.reported = true
+                if not A.quit then console("god"); alog("DT: host god mode toggled back off") end
                 alog(("DT RESULT: revived=%s bledOut=%s hostKeptCharacter=%s (t=%ds)"):format(
                     tostring(z.revived or false), tostring(z.bled or false), tostring(z.hostOk), z.t))
                 DN.BLEED = 60
