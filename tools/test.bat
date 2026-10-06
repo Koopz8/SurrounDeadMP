@@ -6,6 +6,7 @@ REM ue4ss\UE4SS.log - search for AUTO and ST.
 REM
 REM Pass "stay" to keep both windows open afterwards:  test.bat stay
 REM Pass "zombie" for the zombie-damage test:          test.bat zombie
+REM Pass "downed" for the downed / revive test:         test.bat downed
 REM (either order, e.g. test.bat zombie stay)
 
 set GAME=C:\Program Files (x86)\Steam\steamapps\common\SurrounDead\SurrounDead\Binaries\Win64
@@ -16,6 +17,8 @@ if /I "%2"=="stay" set QUIT=
 set TEST=
 if /I "%1"=="zombie" set TEST=-sdmptest=zombie
 if /I "%2"=="zombie" set TEST=-sdmptest=zombie
+if /I "%1"=="downed" set TEST=-sdmptest=downed
+if /I "%2"=="downed" set TEST=-sdmptest=downed
 
 REM clear the handoff files from the last run
 echo 0> "%GAME%\ue4ss\Mods\SDMPDiag\sdmp_ready.txt"

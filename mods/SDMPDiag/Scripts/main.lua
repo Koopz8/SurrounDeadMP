@@ -2215,7 +2215,10 @@ local function zombieSwingMirror()
     local st = ZA.st
     local report = ZA.tick >= st.at
     if report then st.at = ZA.tick + 4 end
-    if isHost then return end   -- host / single player: real swings
+    if isHost then   -- host / single player: real swings
+        if report and (ZA.hostSaid or 0) < 3 then ZA.hostSaid = (ZA.hostSaid or 0) + 1; log("ZA status: has authority, not mirroring") end
+        return
+    end
     local players = {}
     for _, pc in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
         if safe(function() return pc:IsValid() end, false) then
@@ -2264,8 +2267,17 @@ local function zombieSwingMirror()
                     if close and v and (v.X * v.X + v.Y * v.Y) < 300 * 300 then
                         local arr = safe(function() return z.AttackMontage end, nil)
                         local n = arr and safe(function() return arr:GetArrayNum() end, 0) or 0
+                        if n == 0 and not ZA.nErr then ZA.nErr = true; log("ZA: zombie has no AttackMontage entries on this machine") end
                         if n > 0 then
-                            local m = safe(function() local e = arr[math.random(1, n)]; return e.get and e:get() or e end, nil)
+                            local e = safe(function() return arr[math.random(1, n)] end, nil)
+                            local m = e
+                            if not (m and safe(function() return m:IsValid() end, false)) then
+                                m = safe(function() return e:get() end, nil)
+                            end
+                            if not (m and safe(function() return m:IsValid() end, false)) and not ZA.mErr then
+                                ZA.mErr = true
+                                log(("ZA: couldn't read an attack montage (n=%d, elem=%s)"):format(n, type(e)))
+                            end
                             if m and safe(function() return m:IsValid() end, false) then
                                 local ok = pcall(function() z:PlayAnimMontage(m, 1.0, FName("None")) end)
                                 if gs and gs:IsValid() then
@@ -2303,6 +2315,295 @@ LoopAsync(250, function()
         if not ok then log("ZA error: " .. tostring(err)) end
     end)
     return false
+end)
+
+-- ===========================================================================
+-- Downed / revive. In co-op, a hit that would kill you puts you down instead:
+-- you crawl, can't jump, and bleed out over DN.BLEED seconds (zombie hits
+-- while down take a couple of seconds off). A partner crouching next to you
+-- for DN.REVIVE seconds gets you back up at DN.UP_HP health. Single player is
+-- untouched (no remote players = vanilla death).
+--
+-- Host is authoritative. Lethal damage is caught in a PRE hook on the native
+-- GameplayStatics:ApplyDamage (zombie hits, bleeding etc. all go through it;
+-- Blueprint hooks only run after the function, too late). State goes to every
+-- machine through PlayerState.Score, which the game doesn't use:
+--   0 = fine, 100+N = down with N seconds left, 1000+P = being revived, P%.
+-- Each machine then handles its own pawn (crouch, crawl speed, no jump) so
+-- client prediction agrees with the host, and shows the notifications.
+--
+-- Bleeding out uses the game's own death, which calls
+-- GetPlayerController(self, 0).UnPossess() - on the host that's the HOST's
+-- controller, so a client dying used to take the host's character away. We
+-- re-possess the host's pawn straight after.
+-- ===========================================================================
+local DN = { BLEED = 60, REVIVE = 5, DOWN_HP = 5, UP_HP = 30, RANGE = 200,
+             down = {}, allowKill = {}, me = nil, lastMsg = 0, msgT = 0, nErr = false }
+
+local function dnLocalPC()
+    for _, c in ipairs(listControllers()) do
+        if safe(function() return c:IsLocalController() end, false) == true then return c end
+    end
+    return nil
+end
+local function dnIsHost()
+    local world = UEHelpers.GetWorld()
+    if not (world and safe(function() return world:IsValid() end, false)) then return false end
+    local gm = safe(function() return world.AuthorityGameMode end, nil)
+    return gm ~= nil and safe(function() return gm:IsValid() end, false)
+end
+local function dnCoop()   -- host with at least one remote player
+    for _, c in ipairs(listControllers()) do
+        if safe(function() return c:IsLocalController() end, true) == false then return true end
+    end
+    return false
+end
+local function dnHealth(p) return safe(function() return p.MedicalComponent.Health end, nil) end
+local function dnSetHealth(p, h)
+    pcall(function() p.MedicalComponent.Health = h end)
+    pcall(function() p:SendHealthToClient(h) end)
+end
+local function dnState(p)  -- read the replicated state off any pawn
+    local sc = safe(function() return p.PlayerState.Score end, 0) or 0
+    if sc >= 1000 then return "reviving", sc - 1000 end
+    if sc >= 100 then return "down", sc - 100 end
+    return "up", 0
+end
+local function dnPublish(p, v)
+    local ps = safe(function() return p.PlayerState end, nil)
+    if not (ps and safe(function() return ps:IsValid() end, false)) then return end
+    if safe(function() return ps.Score end, -1) == v then return end
+    pcall(function() ps.Score = v end)
+    pcall(function()
+        StaticFindObject("/Script/NetCore.Default__NetPushModelHelpers"):MarkPropertyDirty(ps, FName("Score"))
+    end)
+end
+DN.isDown = function(p)
+    local k = safe(function() return p:GetAddress() end, nil)
+    return k ~= nil and DN.down[k] ~= nil
+end
+
+local function dnNotify(txt, pawn)
+    local ok = pcall(function()
+        local gfl = StaticFindObject("/Game/Blueprints/GameFunctionLibrary.Default__GameFunctionLibrary_C")
+        gfl:CreateNotificationUI(FText(txt), nil, { R = 1.0, G = 0.35, B = 0.3, A = 1.0 }, 3.0, false, pawn)
+    end)
+    if not ok and not DN.nErr then DN.nErr = true; log("DN: notification failed (" .. txt .. ")") end
+end
+
+local function dnEnter(p)
+    local key = safe(function() return p:GetAddress() end, nil)
+    if not key or DN.down[key] then return end
+    local cmc = safe(function() return p.CharacterMovement end, nil)
+    DN.down[key] = { p = p, t = DN.BLEED, rev = 0,
+        walk = safe(function() return cmc.MaxWalkSpeed end, nil),
+        crouch = safe(function() return cmc.MaxWalkSpeedCrouched end, nil),
+        jump = safe(function() return cmc.JumpZVelocity end, nil) }
+    dnSetHealth(p, DN.DOWN_HP)
+    dnPublish(p, 100 + DN.BLEED)
+    log(("DN: %s is DOWN (%ds to bleed out)"):format(className(p), DN.BLEED))
+end
+
+local function dnRestoreMove(p, d)
+    local cmc = safe(function() return p.CharacterMovement end, nil)
+    if not cmc then return end
+    if d.walk then pcall(function() cmc.MaxWalkSpeed = d.walk end) end
+    if d.crouch then pcall(function() cmc.MaxWalkSpeedCrouched = d.crouch end) end
+    if d.jump then pcall(function() cmc.JumpZVelocity = d.jump end) end
+end
+
+local function dnBleedOut(key, d)
+    local p = d.p
+    DN.down[key] = nil
+    dnPublish(p, 0)
+    dnRestoreMove(p, d)
+    local pc = dnLocalPC()
+    local hostPawn = pc and safe(function() return pc.Pawn end, nil)
+    log("DN: " .. className(p) .. " bled out")
+    DN.allowKill[key] = true
+    local ok, err = pcall(function()
+        StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(p, 1000.0, nil, nil, nil)
+    end)
+    DN.allowKill[key] = nil
+    if not ok then log("DN: kill failed: " .. tostring(err)) end
+    -- the game's death unpossesses GetPlayerController(0) = the host
+    DN.repossess = { pc = pc, pawn = hostPawn, n = 0 }
+end
+
+local function dnHostTick()
+    -- put the host back in its own body if a remote death took it
+    local r = DN.repossess
+    if r then
+        r.n = r.n + 1
+        if r.pc and r.pawn and safe(function() return r.pc:IsValid() and r.pawn:IsValid() end, false) then
+            local cur = safe(function() return r.pc.Pawn end, nil)
+            local curOk = cur and safe(function() return cur:IsValid() end, false)
+            if not curOk or cur:GetAddress() ~= r.pawn:GetAddress() then
+                local ok = pcall(function() r.pc:Possess(r.pawn) end)
+                log("DN: host lost its pawn to the death code - re-possess " .. tostring(ok))
+                DN.repossess = nil
+            end
+        end
+        if r.n > 8 then DN.repossess = nil end
+    end
+    if not dnCoop() then return end
+    local players = {}
+    for _, pc in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if safe(function() return pc:IsValid() end, false) and not safe(function() return pc["PlayerDead?"] end, false) then
+            players[#players + 1] = pc
+        end
+    end
+    for _, p in ipairs(players) do
+        -- slow drains (hunger, radiation...) that never hit ApplyDamage
+        local h = dnHealth(p)
+        if h and h <= 2 and not DN.isDown(p) then dnEnter(p) end
+    end
+    for key, d in pairs(DN.down) do
+        local p = d.p
+        if not safe(function() return p:IsValid() end, false) then
+            DN.down[key] = nil
+        else
+            if (dnHealth(p) or 0) ~= DN.DOWN_HP then dnSetHealth(p, DN.DOWN_HP) end
+            local cmc = safe(function() return p.CharacterMovement end, nil)
+            if cmc then
+                pcall(function() cmc.MaxWalkSpeed = 70 end)
+                pcall(function() cmc.MaxWalkSpeedCrouched = 70 end)
+                pcall(function() cmc.JumpZVelocity = 0 end)
+            end
+            local pl = safe(function() return p:K2_GetActorLocation() end, nil)
+            local reviver = nil
+            for _, o in ipairs(players) do
+                if o:GetAddress() ~= key and not DN.isDown(o) and safe(function() return o.bIsCrouched end, false) then
+                    local ol = safe(function() return o:K2_GetActorLocation() end, nil)
+                    if pl and ol and (ol.X - pl.X)^2 + (ol.Y - pl.Y)^2 + (ol.Z - pl.Z)^2 < DN.RANGE * DN.RANGE then
+                        reviver = o; break
+                    end
+                end
+            end
+            if reviver then
+                d.rev = d.rev + 0.25 / DN.REVIVE
+            else
+                d.rev = 0
+                d.t = d.t - 0.25
+            end
+            if d.rev >= 1 then
+                DN.down[key] = nil
+                dnRestoreMove(p, d)
+                dnSetHealth(p, DN.UP_HP)
+                dnPublish(p, 0)
+                log("DN: " .. className(p) .. " revived by " .. className(reviver))
+            elseif d.t <= 0 then
+                dnBleedOut(key, d)
+            elseif d.rev > 0 then
+                dnPublish(p, 1000 + math.floor(d.rev * 100))
+            else
+                dnPublish(p, 100 + math.ceil(d.t))
+            end
+        end
+    end
+end
+
+-- every machine: look after its own pawn, tell the player what's going on
+local function dnLocalTick()
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    if not (me and safe(function() return me:IsValid() end, false)) then return end
+    if className(me) ~= "BP_PlayerCharacter_C" then return end
+    DN.msgT = DN.msgT + 0.25
+    local st, n = dnState(me)
+    local cmc = safe(function() return me.CharacterMovement end, nil)
+    if st ~= "up" then
+        if not DN.me then
+            DN.me = { walk = safe(function() return cmc.MaxWalkSpeed end, nil),
+                      crouch = safe(function() return cmc.MaxWalkSpeedCrouched end, nil),
+                      jump = safe(function() return cmc.JumpZVelocity end, nil) }
+            log("DN: local player is down")
+            DN.lastMsg = -99
+        end
+        if cmc then
+            pcall(function() cmc.MaxWalkSpeed = 70 end)
+            pcall(function() cmc.MaxWalkSpeedCrouched = 70 end)
+            pcall(function() cmc.JumpZVelocity = 0 end)
+        end
+        if not safe(function() return me.bIsCrouched end, false) then pcall(function() me:Crouch(false) end) end
+        if DN.msgT - DN.lastMsg >= 4 then
+            DN.lastMsg = DN.msgT
+            if st == "reviving" then
+                dnNotify(("Being revived... %d%%"):format(n), me)
+            else
+                dnNotify(("You're down! Bleeding out in %ds - your partner can crouch next to you to revive"):format(n), me)
+            end
+        end
+        return
+    end
+    if DN.me then
+        dnRestoreMove(me, DN.me)
+        pcall(function() me:UnCrouch(false) end)
+        DN.me = nil
+        log("DN: local player is back up")
+        dnNotify("You're back on your feet", me)
+    end
+    -- partner down?
+    if DN.msgT - DN.lastMsg >= 4 then
+        for _, o in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+            if safe(function() return o:IsValid() end, false) and o:GetAddress() ~= me:GetAddress() then
+                local ost, on = dnState(o)
+                if ost == "down" then
+                    DN.lastMsg = DN.msgT
+                    dnNotify(("Your partner is down! Crouch next to them to revive (%ds)"):format(on), me)
+                    break
+                elseif ost == "reviving" then
+                    DN.lastMsg = DN.msgT
+                    dnNotify(("Reviving partner... %d%%"):format(on), me)
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- lethal hits become downed (host only, co-op only)
+pcall(function()
+    RegisterHook("/Script/Engine.GameplayStatics:ApplyDamage", function(ctx, damaged, dmg)
+        if not dnIsHost() then return end
+        local a = safe(function() return damaged:get() end, nil)
+        if not (a and safe(function() return a:IsValid() end, false)) then return end
+        if className(a) ~= "BP_PlayerCharacter_C" then return end
+        local key = safe(function() return a:GetAddress() end, nil)
+        if not key or DN.allowKill[key] then return end
+        if not dnCoop() then return end
+        local d = safe(function() return dmg:get() end, 0) or 0
+        if d <= 0 then return end
+        local dd = DN.down[key]
+        if dd then
+            pcall(function() dmg:set(0.0) end)
+            dd.t = dd.t - 2
+            return
+        end
+        local h = dnHealth(a)
+        if h and h - d <= 0 then
+            pcall(function() dmg:set(0.0) end)
+            dnEnter(a)
+        end
+    end)
+end)
+
+LoopAsync(250, function()
+    ExecuteInGameThread(function()
+        if dnIsHost() then
+            local ok, err = pcall(dnHostTick)
+            if not ok then log("DN host error: " .. tostring(err)) end
+        end
+        local ok, err = pcall(dnLocalTick)
+        if not ok and not DN.lErr then DN.lErr = true; log("DN local error: " .. tostring(err)) end
+    end)
+    return false
+end)
+RegisterConsoleCommandHandler("sdmp_down", function()   -- debug: down yourself / everyone on host
+    ExecuteInGameThread(function()
+        for _, p in ipairs(FindAllOf("BP_PlayerCharacter_C") or {}) do if p:IsValid() then dnEnter(p) end end
+    end)
+    return true
 end)
 
 -- Auto mode. Driving two game windows by hand (or by remote control) is slow
@@ -2827,6 +3128,93 @@ do
         end
     end
 
+    -- Downed test: zombies put the client down, the host crouches next to it
+    -- to revive; then down again and left to bleed out (shortened to 20s),
+    -- checking the host keeps its own character afterwards.
+    A.dTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        z.ph = z.ph or "down1"
+        local cp, hp = z.p, myPawn()
+        if not (cp and safe(function() return cp:IsValid() end, false)) then
+            if z.ph ~= "end" then alog("DT: client pawn gone in phase " .. z.ph); z.ph = "end"; z.pt = z.t end
+        end
+        local function toZombie()
+            local best, bd = nil, 1e18
+            local hl = safe(function() return hp:K2_GetActorLocation() end, nil)
+            for _, a in ipairs(safe(function() return FindAllOf("BP_MasterZombie_C") end, nil) or {}) do
+                if a:IsValid() and hl and not safe(function() return a["IsDead?"] end, false) then
+                    local l = a:K2_GetActorLocation()
+                    local d = (l.X - hl.X)^2 + (l.Y - hl.Y)^2
+                    if d < bd then best, bd = a, d end
+                end
+            end
+            if best then
+                local l = best:K2_GetActorLocation()
+                pcall(function() cp:K2_TeleportTo({ X = l.X + 150, Y = l.Y, Z = l.Z + 30 }, cp:K2_GetActorRotation()) end)
+            end
+        end
+        local function toHost()
+            local l = safe(function() return hp:K2_GetActorLocation() end, nil)
+            if l then pcall(function() cp:K2_TeleportTo({ X = l.X + 120, Y = l.Y, Z = l.Z + 30 }, cp:K2_GetActorRotation()) end) end
+        end
+        local down = z.ph ~= "end" and DN.isDown(cp)
+        if z.ph == "down1" or z.ph == "down2" then
+            if down then
+                alog(("DT: client DOWN at %ds (phase %s), health=%s"):format(z.t, z.ph, tostring(safe(function() return cp.MedicalComponent.Health end, "?"))))
+                toHost()
+                z.pt = z.t
+                if z.ph == "down1" then
+                    z.ph = "revive"
+                    pcall(function() hp:Crouch(false) end)
+                else
+                    z.ph = "bleed"
+                end
+            elseif z.t % 8 == 2 then
+                toZombie()
+            end
+        elseif z.ph == "revive" then
+            if not safe(function() return hp.bIsCrouched end, false) then pcall(function() hp:Crouch(false) end) end
+            if not down then
+                alog(("DT: client REVIVED after %ds, health=%s"):format(z.t - z.pt,
+                    tostring(safe(function() return cp.MedicalComponent.Health end, "?"))))
+                z.revived = true
+                pcall(function() hp:UnCrouch(false) end)
+                DN.BLEED = 20
+                z.ph, z.pt = "down2", z.t
+            elseif z.t - z.pt > 20 then
+                alog("DT: FAIL revive didn't finish in 20s")
+                pcall(function() hp:UnCrouch(false) end)
+                DN.BLEED = 20
+                z.ph, z.pt = "down2", z.t
+            end
+        elseif z.ph == "bleed" then
+            if not down then
+                local pc
+                for _, c in ipairs(FindAllOf("PlayerController") or {}) do
+                    if c:IsValid() and safe(function() return c:IsLocalController() end, false) then pc = c end
+                end
+                local hostOk = pc and safe(function() return pc.Pawn:GetAddress() == hp:GetAddress() end, false)
+                alog(("DT: client bled out after %ds; client dead=%s; host still has its character=%s"):format(
+                    z.t - z.pt, tostring(safe(function() return cp["PlayerDead?"] end, "?")), tostring(hostOk)))
+                z.bled, z.hostOk = true, hostOk
+                z.ph, z.pt = "end", z.t
+            elseif z.t - z.pt > 45 then
+                alog("DT: FAIL no bleed-out after 45s")
+                z.ph, z.pt = "end", z.t
+            end
+        end
+        if (z.ph == "end" and z.t - z.pt >= 6) or z.t > 220 then
+            if not z.reported then
+                z.reported = true
+                alog(("DT RESULT: revived=%s bledOut=%s hostKeptCharacter=%s (t=%ds)"):format(
+                    tostring(z.revived or false), tostring(z.bled or false), tostring(z.hostOk), z.t))
+                DN.BLEED = 60
+                fwrite("sdmp_done.txt", "1")
+            end
+        end
+    end
+
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
@@ -2949,7 +3337,7 @@ do
                         local ok = safe(function() return p:K2_TeleportTo(dest, rot) end, false)
                         alog(("moved joiner next to host -> %s"):format(tostring(ok)))
                     end
-                    if A.test == "zombie" then
+                    if A.test == "zombie" or A.test == "downed" then
                         A.ztest = { p = p, t = 0 }
                     else
                         pcall(function() p.bCanBeDamaged = false end)
@@ -2986,7 +3374,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then A.zTick() end
+            if A.ztest then (A.test == "downed" and A.dTick or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
@@ -3083,7 +3471,7 @@ do
             end
             fixInput2()
             buildUI()
-            if A.test == "zombie" then
+            if A.test == "zombie" or A.test == "downed" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -3215,7 +3603,7 @@ do
             end
         elseif A.step == "zwait" then
             A.t = A.t + 1
-            if (fread("sdmp_done.txt") or ""):find("1") or A.t > 120 then
+            if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 A.step, A.t = "finished", 0
             end
         elseif A.step == "finished" then
