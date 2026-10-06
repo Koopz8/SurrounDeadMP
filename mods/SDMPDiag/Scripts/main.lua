@@ -2640,13 +2640,39 @@ local function clothingResend(why)
         if dnValid(p) and not safe(function() return p["PlayerDead?"] end, false) then
             pawns = pawns + 1
             local main = safe(function() return p.Mesh:GetAddress() end, 0)
-            local comps = safe(function() return p:K2_GetComponentsByClass(smc) end, nil)
+            -- the character Blueprint's own component variables (Torso, Arms,
+            -- the clothing slots...) - every one holding a skeletal mesh component
+            if not CS.names then
+                CS.names = {}
+                local cls = StaticFindObject("/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C")
+                pcall(function()
+                    cls:ForEachProperty(function(prop)
+                        local n = safe(function() return prop:GetFName():ToString() end, nil)
+                        if n then
+                            local v = safe(function() return p[n] end, nil)
+                            if type(v) == "userdata" and dnValid(v) and className(v):find("SkeletalMeshComponent") then
+                                CS.names[#CS.names + 1] = n
+                            end
+                        end
+                    end)
+                end)
+                log("CS: clothing/body slots: " .. table.concat(CS.names, ", "))
+            end
             local list = {}
-            if comps then pcall(function() comps:ForEach(function(_, e) list[#list + 1] = e:get() end) end) end
-            for _, c in ipairs(list) do
-                if dnValid(c) and safe(function() return c:GetAddress() end, 0) ~= main then
-                    local mesh = safe(function() return c:GetSkeletalMeshAsset() end, nil)
+            for _, n in ipairs(CS.names) do
+                local c = safe(function() return p[n] end, nil)
+                if dnValid(c) then list[#list + 1] = { n = n, c = c } end
+            end
+            for _, it in ipairs(list) do
+                local c = it.c
+                if safe(function() return c:GetAddress() end, 0) ~= main then
+                    local mesh = safe(function() return c:GetSkeletalMeshAsset() end, nil) or safe(function() return c.SkeletalMesh end, nil)
                     if mesh ~= nil and not dnValid(mesh) then mesh = nil end
+                    if (CS.shown or 0) < 40 then
+                        CS.shown = (CS.shown or 0) + 1
+                        log(("CS:   %s.%s = %s"):format(string.format("%X", safe(function() return p:GetAddress() end, 0)),
+                            it.n, mesh and safe(function() return mesh:GetFName():ToString() end, "?") or "none"))
+                    end
                     local ok, err = pcall(function() p:MC_AttachClothing(c, mesh, {}, true, FName("None"), false) end)
                     if ok then sent = sent + 1
                     elseif not CS.err then CS.err = true; log("CS: MC_AttachClothing failed: " .. tostring(err)) end
