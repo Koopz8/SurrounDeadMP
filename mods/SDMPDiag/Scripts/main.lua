@@ -2506,8 +2506,11 @@ local function dnHostTick()
     end
     for _, p in ipairs(players) do
         -- slow drains (hunger, radiation...) that never hit ApplyDamage
+        -- a freshly spawned character sits at 0 health until its save data
+        -- loads, so leave anything younger than 10s alone
+        local age = safe(function() return p:GetGameTimeSinceCreation() end, 0) or 0
         local h = dnHealth(p)
-        if h and h <= 2 and not DN.isDown(p) then dnEnter(p) end
+        if age >= 10 and h and h <= 2 and not DN.isDown(p) then dnEnter(p) end
     end
     for key, d in pairs(DN.down) do
         local p = d.p
@@ -2550,6 +2553,28 @@ local function dnHostTick()
             else
                 dnPublish(p, 100 + math.ceil(d.t))
             end
+        end
+    end
+end
+
+-- List every player character this machine knows about (debugging the extra
+-- character that shows up after a death).
+DN.census = function(tag)
+    local pcs = safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}
+    log(("CENSUS %s: %d player characters"):format(tag, #pcs))
+    for i, p in ipairs(pcs) do
+        if dnValid(p) then
+            local c = safe(function() return p.Controller end, nil)
+            local cs = dnValid(c) and (className(c) .. (safe(function() return c:IsLocalController() end, false) and "(local)" or "(remote)")) or "none"
+            local l = safe(function() return p:K2_GetActorLocation() end, nil)
+            local role = safe(function() return p:GetLocalRole() end, "?")
+            if type(role) == "userdata" then role = safe(function() return role:get() end, "?") end
+            log(("CENSUS %s  #%d %s role=%s ctl=%s dead=%s hp=%s age=%.0f hidden=%s at %s"):format(tag, i,
+                string.format("%X", safe(function() return p:GetAddress() end, 0)) , tostring(role), cs,
+                tostring(safe(function() return p["PlayerDead?"] end, "?")), tostring(dnHealth(p)),
+                safe(function() return p:GetGameTimeSinceCreation() end, -1) or -1,
+                tostring(safe(function() return p.bHidden end, "?")),
+                l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?"))
         end
     end
 end
@@ -3251,12 +3276,14 @@ do
                 alog(("DT: client bled out after %ds; client dead=%s; host still has its character=%s"):format(
                     z.t - z.pt, tostring(safe(function() return cp["PlayerDead?"] end, "?")), tostring(hostOk)))
                 z.bled, z.hostOk = true, hostOk
+                DN.census("host after bleed-out")
                 z.ph, z.pt = "end", z.t
             elseif z.t - z.pt > 45 then
                 alog("DT: FAIL no bleed-out after 45s")
                 z.ph, z.pt = "end", z.t
             end
         end
+        if z.ph == "end" and z.t - z.pt == 4 then DN.census("host +4s") end
         if (z.ph == "end" and z.t - z.pt >= 6) or z.t > 220 then
             if not z.reported then
                 z.reported = true
@@ -3656,7 +3683,9 @@ do
             end
         elseif A.step == "zwait" then
             A.t = A.t + 1
+            if A.test == "downed" and A.t % 6 == 0 then DN.census("client t=" .. A.t) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
+                if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0
             end
         elseif A.step == "finished" then
