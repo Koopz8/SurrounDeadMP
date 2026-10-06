@@ -2579,6 +2579,51 @@ DN.census = function(tag)
     end
 end
 
+-- A client loads the same save as the host and runs the single-player "spawn
+-- the player at the saved spot" itself, so it ends up with an extra character
+-- of its own standing where the host is (role Authority on a client = made
+-- locally, nobody else can see it). Remove those, and log which game function
+-- made them so we can stop it at the source.
+DN.ghosts = DN.ghosts or {}
+local function dnGhostSweep()
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) then
+            local role = safe(function() return p:GetLocalRole() end, 0)
+            if type(role) == "userdata" then role = safe(function() return role:get() end, 0) end
+            if role == 3 then
+                local k = safe(function() return p:GetAddress() end, 0)
+                if not DN.ghosts[k] then
+                    DN.ghosts[k] = true
+                    local l = safe(function() return p:K2_GetActorLocation() end, nil)
+                    local ok = pcall(function() p:K2_DestroyActor() end)
+                    log(("DN: removed a client-only ghost character at %s -> %s"):format(
+                        l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?", tostring(ok)))
+                end
+            end
+        end
+    end
+end
+local function dnHookSpawns()
+    if DN.spawnHooked then return end
+    local gi = StaticFindObject("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C")
+    if not dnValid(gi) then return end
+    DN.spawnHooked = true
+    local n = 0
+    pcall(function()
+        gi:ForEachFunction(function(fn)
+            local name = safe(function() return fn:GetFName():ToString() end, "")
+            if name:find("Spawn") and not name:find("Delegate") and not name:find("Ubergraph") then
+                if pcall(function()
+                    RegisterHook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:" .. name, function()
+                        log(("GI: %s ran (%s)"):format(name, dnIsHost() and "has authority" or "network client"))
+                    end)
+                end) then n = n + 1 end
+            end
+        end)
+    end)
+    log("DN: watching " .. n .. " SD_GameInstance spawn functions")
+end
+
 -- every machine: look after its own pawn, tell the player what's going on
 local function dnLocalTick()
     local pc = dnLocalPC()
@@ -2667,7 +2712,9 @@ end)
 
 LoopAsync(250, function()
     ExecuteInGameThread(function()
+        pcall(dnHookSpawns)
         if not worldSettled() then return end
+        if not dnIsHost() then pcall(dnGhostSweep) end
         if dnIsHost() then
             local ok, err = pcall(dnHostTick)
             if not ok then log("DN host error: " .. tostring(err)) end
@@ -3242,6 +3289,7 @@ do
                 alog(("DT: client DOWN at %ds (phase %s), health=%s"):format(z.t, z.ph, tostring(safe(function() return cp.MedicalComponent.Health end, "?"))))
                 toHost()
                 z.pt = z.t
+                z.since = nil
                 if z.ph == "down1" then
                     z.ph = "revive"
                     pcall(function() hp:Crouch(false) end)
@@ -3250,6 +3298,15 @@ do
                 end
             elseif z.t % 8 == 2 then
                 toZombie()
+                alog(("DT: (%s) client -> next to a zombie"):format(z.ph))
+            end
+            -- zombies don't always notice; the test is about downing, not the AI
+            z.since = z.since or z.t
+            if not down and z.t - z.since >= 20 then
+                local ok = pcall(function()
+                    StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(cp, 25.0, nil, nil, nil)
+                end)
+                if (z.t - z.since) % 5 == 0 then alog("DT: no zombie hit yet - test damages the client itself -> " .. tostring(ok)) end
             end
         elseif z.ph == "revive" then
             if not safe(function() return hp.bIsCrouched end, false) then pcall(function() hp:Crouch(false) end) end
