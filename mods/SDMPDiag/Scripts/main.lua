@@ -2442,6 +2442,20 @@ local function dnNotify(txt, pawn)
     if not ok and not DN.nErr then DN.nErr = true; log("DN: notification failed (" .. txt .. ")") end
 end
 
+-- is anyone other than p alive and on their feet to come and revive them?
+local function dnHasReviver(p)
+    local k = safe(function() return p:GetAddress() end, 0)
+    for _, o in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(o) and safe(function() return o:GetAddress() end, 0) ~= k
+           and safe(function() return o:GetLocalRole() end, 0) ~= 0
+           and not safe(function() return o["PlayerDead?"] end, false) and not DN.isDown(o)
+           and safe(function() return o.Controller end, nil) ~= nil and dnValid(safe(function() return o.Controller end, nil)) then
+            return true
+        end
+    end
+    return false
+end
+
 local function dnEnter(p)
     local key = safe(function() return p:GetAddress() end, nil)
     if not key or DN.down[key] then return end
@@ -2510,7 +2524,7 @@ local function dnHostTick()
         -- loads, so leave anything younger than 10s alone
         local age = safe(function() return p:GetGameTimeSinceCreation() end, 0) or 0
         local h = dnHealth(p)
-        if age >= 10 and h and h <= 2 and not DN.isDown(p) then dnEnter(p) end
+        if age >= 10 and h and h <= 2 and not DN.isDown(p) and dnHasReviver(p) then dnEnter(p) end
     end
     for key, d in pairs(DN.down) do
         local p = d.p
@@ -2533,6 +2547,9 @@ local function dnHostTick()
                         reviver = o; break
                     end
                 end
+            end
+            if not reviver and not dnHasReviver(p) and d.t > 2 then
+                d.t = 2   -- partner's dead or down too: nobody's coming
             end
             if reviver then
                 d.rev = d.rev + 0.25 / DN.REVIVE
@@ -2632,6 +2649,8 @@ end
 -- through that same multicast. Body Part = None skips the game's body-part
 -- swapping and just sets the mesh.
 local CS = { known = {}, due = {}, err = false }
+local CS_SLOTS = { "Torso", "Biceps", "LowerThighs", "Clothing_Feet", "Clothing_Legs", "Clothing_Torso", "head",
+                   "Clothing_Gloves", "Arms", "Feet", "LowerLegs", "Legs", "Hands", "Clothing_Armor" }
 local function clothingResend(why)
     local smc = StaticFindObject("/Script/Engine.SkeletalMeshComponent")
     if not dnValid(smc) then return end
@@ -2703,6 +2722,46 @@ local function clothingSync()
     end
     if run then clothingResend("player joined") end
 end
+-- client side: what clothing calls arrive, and what each slot ends up holding
+local function csClientWatch()
+    if CS.hooked then return end
+    local cls = StaticFindObject("/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C")
+    if not dnValid(cls) then return end
+    CS.hooked = true
+    CS.rx = 0
+    pcall(function()
+        RegisterHook("/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:MC_AttachClothing", function(ctx, comp, mesh)
+            CS.rx = CS.rx + 1
+            if CS.rx <= 60 then
+                local c = safe(function() return comp:get() end, nil)
+                local m = safe(function() return mesh:get() end, nil)
+                local cn = dnValid(c) and safe(function() return c:GetFName():ToString() end, "?") or "nil"
+                local mn = dnValid(m) and safe(function() return m:GetFName():ToString() end, "?") or "NONE"
+                -- what the component holds after the call ran
+                local now = dnValid(c) and safe(function() local a = c:GetSkeletalMeshAsset(); return dnValid(a) and a:GetFName():ToString() or "none" end, "?") or "?"
+                log(("CS rx: %s <- %s (now %s)"):format(cn, mn, now))
+            end
+        end)
+    end)
+    log("CS: client watching MC_AttachClothing")
+end
+CS.dumpSlots = function(tag)
+    CS.names = CS.names or CS_SLOTS
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) then
+            local parts = {}
+            for _, n in ipairs(CS.names or {}) do
+                local c = safe(function() return p[n] end, nil)
+                local m = dnValid(c) and safe(function() return c:GetSkeletalMeshAsset() end, nil)
+                local vis = dnValid(c) and safe(function() return c:IsVisible() end, "?")
+                parts[#parts + 1] = n .. "=" .. (dnValid(m) and safe(function() return m:GetFName():ToString() end, "?") or "none") .. (vis == false and "(hidden)" or "")
+            end
+            log(("CS slots %s %X role=%s: %s"):format(tag, safe(function() return p:GetAddress() end, 0),
+                tostring(safe(function() return p:GetLocalRole() end, "?")), table.concat(parts, " ")))
+        end
+    end
+end
+
 RegisterConsoleCommandHandler("sdmp_clothes", function()
     ExecuteInGameThread(function() pcall(clothingResend, "console") end)
     return true
@@ -2788,6 +2847,7 @@ pcall(function()
         end
         local h = dnHealth(a)
         if h and h - d <= 0 then
+            if not dnHasReviver(a) then return end   -- nobody left to revive you: normal death
             pcall(function() dmg:set(0.0) end)
             dnEnter(a)
         end
@@ -2798,7 +2858,7 @@ LoopAsync(250, function()
     ExecuteInGameThread(function()
         pcall(dnHookSpawns)
         if not worldSettled() then return end
-        if not dnIsHost() then pcall(dnGhostSweep) end
+        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch) end
         if dnIsHost() then
             pcall(clothingSync)
             local ok, err = pcall(dnHostTick)
@@ -3826,6 +3886,7 @@ do
         elseif A.step == "zwait" then
             A.t = A.t + 1
             if A.test == "downed" and A.t % 6 == 0 then DN.census("client t=" .. A.t) end
+            if A.t == 20 or A.t == 40 then pcall(CS.dumpSlots, "client t=" .. A.t) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0
