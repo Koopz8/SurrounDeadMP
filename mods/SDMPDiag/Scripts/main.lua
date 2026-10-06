@@ -5,7 +5,18 @@
 
 local UEHelpers = require("UEHelpers")
 
-local function log(s) print("[SDMP] " .. tostring(s) .. "\n") end
+-- Both test instances write the same UE4SS.log, and the second one to start
+-- wipes it, so each instance also keeps its own sdmp_<role>.log next to the mod
+-- (opened per line so it survives a crash).
+local LOGF = { path = nil }
+local function log(s)
+    local line = "[SDMP] " .. tostring(s)
+    print(line .. "\n")
+    if LOGF.path then
+        local f = io.open(LOGF.path, "a")
+        if f then f:write(os.date("%H:%M:%S "), line, "\n"); f:close() end
+    end
+end
 
 local ROLE = { [0]="None", [1]="SimulatedProxy", [2]="AutonomousProxy", [3]="Authority" }
 
@@ -2132,8 +2143,21 @@ log("SDMPDiag: sdmp_snaptrace logs what moved the pawn on each snap frame.")
 -- a client somewhere off the host's screen plays a frozen montage, no notify
 -- fires, and the trace never runs. Fix: on the host, any zombie within ~50 m of
 -- a remote player always ticks its animation; put it back once nobody's near.
+-- Per-tick gameplay code stays away from the world while it's being swapped
+-- (listen travel, joining): pawns and PlayerStates are torn down mid-read and
+-- even IsValid() on a freed object can read garbage and crash the game.
+local WS = { addr = nil, since = 0 }
+local function worldSettled()
+    local w = UEHelpers.GetWorld()
+    local a = (w and safe(function() return w:IsValid() end, false)) and safe(function() return w:GetAddress() end, nil) or nil
+    local now = os.time()
+    if a ~= WS.addr then WS.addr, WS.since = a, now end
+    return a ~= nil and (now - WS.since) >= 4
+end
+
 local ZF = { touched = {}, logged = 0 }
 local function zombieAnimFix()
+    if not worldSettled() then return end
     local world = UEHelpers.GetWorld()
     if not (world and safe(function() return world:IsValid() end, false)) then return end
     local gm = safe(function() return world.AuthorityGameMode end, nil)
@@ -2206,6 +2230,7 @@ end)
 -- player (ApplyDamage with 0 does nothing; the blood puff still shows).
 local ZA = { next = {}, tick = 0, plays = 0, logged = 0, sndErr = false }
 local function zombieSwingMirror()
+    if not worldSettled() then return end
     local world = UEHelpers.GetWorld()
     if not (world and safe(function() return world:IsValid() end, false)) then return end
     local gm = safe(function() return world.AuthorityGameMode end, nil)
@@ -2264,7 +2289,18 @@ local function zombieSwingMirror()
                         if d2 < 220 * 220 and math.abs(p.Z - zl.Z) < 200 then close = true; break end
                     end
                     local v = close and safe(function() return z:GetVelocity() end, nil)
-                    if close and v and (v.X * v.X + v.Y * v.Y) < 300 * 300 then
+                    -- only a zombie that's stopped, and isn't mid-swing already
+                    local anim = close and safe(function() return z.Mesh:GetAnimInstance() end, nil)
+                    if anim and not safe(function() return anim:IsValid() end, false) then anim = nil end
+                    local busy = anim and safe(function() return anim:IsAnyMontagePlaying() end, false)
+                    if close and v and not busy and (v.X * v.X + v.Y * v.Y) < 60 * 60 then
+                        -- the client's copy is moved by replication; root motion from a
+                        -- locally played montage fights it and looks jittery
+                        if anim and not ZA.rm then ZA.rm = {} end
+                        if anim and not ZA.rm[key] then
+                            ZA.rm[key] = true
+                            pcall(function() anim.RootMotionMode = 1 end)   -- IgnoreRootMotion
+                        end
                         local arr = safe(function() return z.AttackMontage end, nil)
                         local n = arr and safe(function() return arr:GetArrayNum() end, 0) or 0
                         if n == 0 and not ZA.nErr then ZA.nErr = true; log("ZA: zombie has no AttackMontage entries on this machine") end
@@ -2302,6 +2338,7 @@ local function zombieSwingMirror()
         end
     end
     for k in pairs(ZA.next) do if not seen[k] then ZA.next[k] = nil end end
+    if ZA.rm then for k in pairs(ZA.rm) do if not seen[k] then ZA.rm[k] = nil end end end
     if report and st.nz > 0 then
         log(("ZA status: players=%d zombies=%d nearest=%.0f dz=%.0f speed=%.0f dead=%s swings=%d"):format(
             #players, st.nz, st.best, st.bdz, st.bspd, tostring(st.bdead), ZA.plays))
@@ -2358,13 +2395,27 @@ local function dnCoop()   -- host with at least one remote player
     end
     return false
 end
-local function dnHealth(p) return safe(function() return p.MedicalComponent.Health end, nil) end
+local function dnValid(o) return o ~= nil and safe(function() return o:IsValid() end, false) end
+local function dnCMC(p)
+    local c = safe(function() return p.CharacterMovement end, nil)
+    if c ~= nil and safe(function() return c:IsValid() end, false) then return c end
+    return nil
+end
+local function dnHealth(p)
+    local mc = safe(function() return p.MedicalComponent end, nil)
+    if not dnValid(mc) then return nil end
+    return safe(function() return mc.Health end, nil)
+end
 local function dnSetHealth(p, h)
-    pcall(function() p.MedicalComponent.Health = h end)
+    local mc = safe(function() return p.MedicalComponent end, nil)
+    if not dnValid(mc) then return end
+    pcall(function() mc.Health = h end)
     pcall(function() p:SendHealthToClient(h) end)
 end
 local function dnState(p)  -- read the replicated state off any pawn
-    local sc = safe(function() return p.PlayerState.Score end, 0) or 0
+    local ps = safe(function() return p.PlayerState end, nil)
+    if not dnValid(ps) then return "up", 0 end
+    local sc = safe(function() return ps.Score end, 0) or 0
     if sc >= 1000 then return "reviving", sc - 1000 end
     if sc >= 100 then return "down", sc - 100 end
     return "up", 0
@@ -2394,18 +2445,18 @@ end
 local function dnEnter(p)
     local key = safe(function() return p:GetAddress() end, nil)
     if not key or DN.down[key] then return end
-    local cmc = safe(function() return p.CharacterMovement end, nil)
+    local cmc = dnCMC(p)
     DN.down[key] = { p = p, t = DN.BLEED, rev = 0,
-        walk = safe(function() return cmc.MaxWalkSpeed end, nil),
-        crouch = safe(function() return cmc.MaxWalkSpeedCrouched end, nil),
-        jump = safe(function() return cmc.JumpZVelocity end, nil) }
+        walk = cmc and safe(function() return cmc.MaxWalkSpeed end, nil),
+        crouch = cmc and safe(function() return cmc.MaxWalkSpeedCrouched end, nil),
+        jump = cmc and safe(function() return cmc.JumpZVelocity end, nil) }
     dnSetHealth(p, DN.DOWN_HP)
     dnPublish(p, 100 + DN.BLEED)
     log(("DN: %s is DOWN (%ds to bleed out)"):format(className(p), DN.BLEED))
 end
 
 local function dnRestoreMove(p, d)
-    local cmc = safe(function() return p.CharacterMovement end, nil)
+    local cmc = dnCMC(p)
     if not cmc then return end
     if d.walk then pcall(function() cmc.MaxWalkSpeed = d.walk end) end
     if d.crouch then pcall(function() cmc.MaxWalkSpeedCrouched = d.crouch end) end
@@ -2464,7 +2515,7 @@ local function dnHostTick()
             DN.down[key] = nil
         else
             if (dnHealth(p) or 0) ~= DN.DOWN_HP then dnSetHealth(p, DN.DOWN_HP) end
-            local cmc = safe(function() return p.CharacterMovement end, nil)
+            local cmc = dnCMC(p)
             if cmc then
                 pcall(function() cmc.MaxWalkSpeed = 70 end)
                 pcall(function() cmc.MaxWalkSpeedCrouched = 70 end)
@@ -2511,12 +2562,12 @@ local function dnLocalTick()
     if className(me) ~= "BP_PlayerCharacter_C" then return end
     DN.msgT = DN.msgT + 0.25
     local st, n = dnState(me)
-    local cmc = safe(function() return me.CharacterMovement end, nil)
+    local cmc = dnCMC(me)
     if st ~= "up" then
         if not DN.me then
-            DN.me = { walk = safe(function() return cmc.MaxWalkSpeed end, nil),
-                      crouch = safe(function() return cmc.MaxWalkSpeedCrouched end, nil),
-                      jump = safe(function() return cmc.JumpZVelocity end, nil) }
+            DN.me = { walk = cmc and safe(function() return cmc.MaxWalkSpeed end, nil),
+                      crouch = cmc and safe(function() return cmc.MaxWalkSpeedCrouched end, nil),
+                      jump = cmc and safe(function() return cmc.JumpZVelocity end, nil) }
             log("DN: local player is down")
             DN.lastMsg = -99
         end
@@ -2565,7 +2616,7 @@ end
 -- lethal hits become downed (host only, co-op only)
 pcall(function()
     RegisterHook("/Script/Engine.GameplayStatics:ApplyDamage", function(ctx, damaged, dmg)
-        if not dnIsHost() then return end
+        if not worldSettled() or not dnIsHost() then return end
         local a = safe(function() return damaged:get() end, nil)
         if not (a and safe(function() return a:IsValid() end, false)) then return end
         if className(a) ~= "BP_PlayerCharacter_C" then return end
@@ -2591,6 +2642,7 @@ end)
 
 LoopAsync(250, function()
     ExecuteInGameThread(function()
+        if not worldSettled() then return end
         if dnIsHost() then
             local ok, err = pcall(dnHostTick)
             if not ok then log("DN host error: " .. tostring(err)) end
@@ -3758,6 +3810,10 @@ do
     local function boot()
         local cl = cmdline()
         A.role = cl:match("%-sdmprole=(%a+)")
+        if A.role then
+            LOGF.path = modDir() .. "\\sdmp_" .. A.role .. ".log"
+            pcall(function() local f = io.open(LOGF.path, "w"); if f then f:close() end end)
+        end
         A.auto = cl:find("%-sdmpauto") ~= nil
         A.quit = cl:find("%-sdmpquit") ~= nil
         A.test = cl:match("%-sdmptest=(%a+)")
