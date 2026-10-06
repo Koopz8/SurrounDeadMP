@@ -2569,6 +2569,7 @@ pcall(function()
         local a = safe(function() return damaged:get() end, nil)
         if not (a and safe(function() return a:IsValid() end, false)) then return end
         if className(a) ~= "BP_PlayerCharacter_C" then return end
+        if safe(function() return a.bCanBeDamaged end, true) == false then return end   -- god mode
         local key = safe(function() return a:GetAddress() end, nil)
         if not key or DN.allowKill[key] then return end
         if not dnCoop() then return end
