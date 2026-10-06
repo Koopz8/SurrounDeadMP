@@ -2624,6 +2624,64 @@ local function dnHookSpawns()
     log("DN: watching " .. n .. " SD_GameInstance spawn functions")
 end
 
+-- Late joiners see everyone naked. Clothing goes Svr_AttachClothing ->
+-- MC_AttachClothing(component, mesh, ...), a multicast that sets the mesh on
+-- every machine - but the host dresses while loading its save, before anyone
+-- has joined, so nobody else ever got those calls. When a player joins, the host
+-- replays the current mesh of every skeletal mesh component on every player
+-- through that same multicast. Body Part = None skips the game's body-part
+-- swapping and just sets the mesh.
+local CS = { known = {}, due = {}, err = false }
+local function clothingResend(why)
+    local smc = StaticFindObject("/Script/Engine.SkeletalMeshComponent")
+    if not dnValid(smc) then return end
+    local sent, pawns = 0, 0
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) and not safe(function() return p["PlayerDead?"] end, false) then
+            pawns = pawns + 1
+            local main = safe(function() return p.Mesh:GetAddress() end, 0)
+            local comps = safe(function() return p:K2_GetComponentsByClass(smc) end, nil)
+            local list = {}
+            if comps then pcall(function() comps:ForEach(function(_, e) list[#list + 1] = e:get() end) end) end
+            for _, c in ipairs(list) do
+                if dnValid(c) and safe(function() return c:GetAddress() end, 0) ~= main then
+                    local mesh = safe(function() return c:GetSkeletalMeshAsset() end, nil)
+                    if mesh ~= nil and not dnValid(mesh) then mesh = nil end
+                    local ok, err = pcall(function() p:MC_AttachClothing(c, mesh, {}, true, FName("None"), false) end)
+                    if ok then sent = sent + 1
+                    elseif not CS.err then CS.err = true; log("CS: MC_AttachClothing failed: " .. tostring(err)) end
+                end
+            end
+        end
+    end
+    log(("CS: resent %d clothing/body meshes on %d players (%s)"):format(sent, pawns, why))
+end
+local function clothingSync()
+    local now = os.time()
+    for _, c in ipairs(listControllers()) do
+        if safe(function() return c:IsLocalController() end, true) == false then
+            local p = safe(function() return c.Pawn end, nil)
+            if dnValid(p) then
+                local k = safe(function() return p:GetAddress() end, nil)
+                if k and not CS.known[k] then
+                    CS.known[k] = true
+                    CS.due[#CS.due + 1] = now + 5
+                    CS.due[#CS.due + 1] = now + 15
+                end
+            end
+        end
+    end
+    local run = false
+    for i = #CS.due, 1, -1 do
+        if now >= CS.due[i] then table.remove(CS.due, i); run = true end
+    end
+    if run then clothingResend("player joined") end
+end
+RegisterConsoleCommandHandler("sdmp_clothes", function()
+    ExecuteInGameThread(function() pcall(clothingResend, "console") end)
+    return true
+end)
+
 -- every machine: look after its own pawn, tell the player what's going on
 local function dnLocalTick()
     local pc = dnLocalPC()
@@ -2716,6 +2774,7 @@ LoopAsync(250, function()
         if not worldSettled() then return end
         if not dnIsHost() then pcall(dnGhostSweep) end
         if dnIsHost() then
+            pcall(clothingSync)
             local ok, err = pcall(dnHostTick)
             if not ok then log("DN host error: " .. tostring(err)) end
         end
