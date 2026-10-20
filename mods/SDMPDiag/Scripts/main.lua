@@ -2571,8 +2571,13 @@ local function dnBleedOut(key, d)
     end)
     DN.allowKill[key] = nil
     if not ok then log("DN: kill failed: " .. tostring(err)) end
-    -- the game's death unpossesses GetPlayerController(0) = the host
-    DN.repossess = { pc = pc, pawn = hostPawn, n = 0 }
+    -- the game's death unpossesses GetPlayerController(0) = the host. Only put
+    -- the host back when it was a JOINER who died - when the host itself bleeds
+    -- out, the host losing that (dead) body is exactly right.
+    local remote = safe(function() return p:IsLocallyControlled() end, true) == false
+    if remote and hostPawn and safe(function() return hostPawn:GetAddress() end, 0) ~= key then
+        DN.repossess = { pc = pc, pawn = hostPawn, n = 0 }
+    end
 end
 
 local function dnHostTick()
@@ -2604,7 +2609,8 @@ local function dnHostTick()
         -- loads, so leave anything younger than 10s alone
         local age = safe(function() return p:GetGameTimeSinceCreation() end, 0) or 0
         local h = dnHealth(p)
-        if age >= 10 and h and h <= 2 and not DN.isDown(p) and dnHasReviver(p) then dnEnter(p) end
+        local ctl = safe(function() return p.Controller end, nil)
+        if age >= 10 and h and h <= 2 and dnValid(ctl) and not DN.isDown(p) and dnHasReviver(p) then dnEnter(p) end
     end
     for key, d in pairs(DN.down) do
         local p = d.p
@@ -3014,6 +3020,134 @@ CS.skyCensus = function(tag)
         end
     end
 end
+-- Safer probe: only plain float / double / bool / int properties, checked by
+-- property type BEFORE reading (reading structs blindly crashed a joiner).
+CS.weatherCensus = function(tag)
+    local okTypes = { FloatProperty = true, DoubleProperty = true, BoolProperty = true, IntProperty = true }
+    for _, a in ipairs(safe(function() return FindAllOf("Ultra_Dynamic_Weather_C") end, nil) or {}) do
+        if dnValid(a) then
+            local vals = {}
+            local cls = safe(function() return a:GetClass() end, nil)
+            pcall(function()
+                cls:ForEachProperty(function(prop)
+                    local pt = safe(function() return prop:GetClass():GetFName():ToString() end, "")
+                    if okTypes[pt] then
+                        local n = safe(function() return prop:GetFName():ToString() end, nil)
+                        if n then
+                            local v = safe(function() return a[n] end, nil)
+                            if type(v) == "number" then
+                                if v ~= 0 then vals[#vals + 1] = ("%s=%.3f"):format(n, v) end
+                            elseif type(v) == "boolean" then
+                                if v then vals[#vals + 1] = n end
+                            end
+                        end
+                    end
+                end)
+            end)
+            table.sort(vals)
+            log(("WEATHER %s role=%s: %s"):format(tag, tostring(safe(function() return a:GetLocalRole() end, "?")), table.concat(vals, " | ")))
+        end
+    end
+end
+-- The joiner keeps the main menu's sky/weather actors alive (MainMenu level,
+-- parked at 9999,9999,9999 and set to a storm). Anything that looks up the sky
+-- or weather has to skip those.
+local function inPlayWorld(a)
+    local fn = safe(function() return a:GetFullName() end, "") or ""
+    return not fn:find("/MainMenu", 1, true)
+end
+CS.inPlayWorld = inPlayWorld
+local function playWeather()
+    for _, a in ipairs(safe(function() return FindAllOf("Ultra_Dynamic_Weather_C") end, nil) or {}) do
+        if dnValid(a) and inPlayWorld(a) then return a end
+    end
+    return nil
+end
+CS.playWeather = playWeather
+-- Probe: drive a real weather change on the host (UDW's own Change Weather
+-- with a stormy preset) and see whether the joiner's sky follows.
+CS.wxForce = function()
+    local w = playWeather()
+    if not w then log("WXT host: no weather actor"); return end
+    local names = {}
+    pcall(function()
+        w:GetClass():ForEachFunction(function(fn)
+            local n = safe(function() return fn:GetFName():ToString() end, "")
+            if n:find("Change") or n:find("Set ") or n:find("Rep") then names[#names + 1] = n end
+        end)
+    end)
+    log("WXT fns: " .. table.concat(names, ", "))
+    local presets, pick = {}, nil
+    for _, o in ipairs(safe(function() return FindAllOf("UDS_Weather_Settings_C") end, nil) or {}) do
+        local n = safe(function() return o:GetFName():ToString() end, "?")
+        presets[#presets + 1] = n
+        if n == "Rain_Thunderstorm" then pick = o end
+    end
+    if not pick then
+        for _, o in ipairs(safe(function() return FindAllOf("UDS_Weather_Settings_C") end, nil) or {}) do
+            local n = safe(function() return o:GetFName():ToString() end, "?")
+            if n:find("Rain") then pick = o; break end
+        end
+    end
+    log("WXT presets: " .. table.concat(presets, ", "))
+    if not pick then log("WXT host: no stormy preset loaded"); return end
+    local ok, err = pcall(function() w["Change Weather"](w, pick, 4.0) end)
+    log(("WXT host: Change Weather(%s) -> %s %s"):format(safe(function() return pick:GetFName():ToString() end, "?"), tostring(ok), tostring(err or "")))
+end
+-- Which weather actor does each sky listen to? (ObjectProperty reads only.)
+CS.skyLink = function(tag)
+    for _, sky in ipairs(safe(function() return FindAllOf("Ultra_Dynamic_Sky_C") end, nil) or {}) do
+        if dnValid(sky) then
+            local links = {}
+            pcall(function()
+                sky:GetClass():ForEachProperty(function(prop)
+                    local pt = safe(function() return prop:GetClass():GetFName():ToString() end, "")
+                    if pt == "ObjectProperty" then
+                        local n = safe(function() return prop:GetFName():ToString() end, "")
+                        local o = safe(function() return sky[n] end, nil)
+                        if dnValid(o) and className(o):find("Weather") then
+                            local fn = safe(function() return o:GetFullName() end, "?")
+                            links[#links + 1] = n .. "->" .. (fn:find("/MainMenu", 1, true) and "MAINMENU" or "play") .. ":" .. className(o)
+                        end
+                    end
+                end)
+            end)
+            local sfn = safe(function() return sky:GetFullName() end, "?")
+            log(("SKYLINK %s sky(%s): %s"):format(tag, sfn:find("/MainMenu", 1, true) and "MAINMENU" or "play", table.concat(links, ", ")))
+        end
+    end
+end
+-- Compact: which weather actors exist, where they came from, key values only.
+CS.weatherBrief = function(tag)
+    local keys = { "Cloud Coverage", "Rain", "Snow", "Fog", "Dust", "Wind Intensity", "Thunder/Lightning", "Material Wetness" }
+    for _, a in ipairs(safe(function() return FindAllOf("Ultra_Dynamic_Weather_C") end, nil) or {}) do
+        if dnValid(a) then
+            local parts = {}
+            for _, k in ipairs(keys) do
+                local v = safe(function() return a[k] end, nil)
+                if type(v) == "number" then parts[#parts + 1] = ("%s=%.2f"):format(k, v) end
+            end
+            local l = safe(function() return a:K2_GetActorLocation() end, nil)
+            local owner = safe(function() return a:GetOwner() end, nil)
+            log(("WX %s %s cls=%s role=%s rep=%s owner=%s at %s full=%s: %s"):format(tag,
+                safe(function() return a:GetFName():ToString() end, "?"), className(a),
+                tostring(safe(function() return a:GetLocalRole() end, "?")), tostring(safe(function() return a.bReplicates end, "?")),
+                dnValid(owner) and className(owner) or "none",
+                l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?",
+                safe(function() return a:GetFullName() end, "?"):sub(1, 140),
+                table.concat(parts, " ")))
+        end
+    end
+end
+-- host console: roll a thunderstorm to check the joiner follows
+RegisterConsoleCommandHandler("sdmp_storm", function()
+    ExecuteInGameThread(function() pcall(CS.wxForce) end)
+    return true
+end)
+RegisterConsoleCommandHandler("sdmp_weather", function()
+    ExecuteInGameThread(function() pcall(CS.weatherCensus, "console") end)
+    return true
+end)
 RegisterConsoleCommandHandler("sdmp_sky", function()
     ExecuteInGameThread(function() pcall(CS.skyCensus, "console") end)
     return true
@@ -3142,7 +3276,7 @@ end
 local TOD = { t = 0, last = nil, logged = 0 }
 local function todSky()
     for _, a in ipairs(safe(function() return FindAllOf("Ultra_Dynamic_Sky_C") end, nil) or {}) do
-        if dnValid(a) then return a end
+        if dnValid(a) and CS.inPlayWorld(a) then return a end
     end
     return nil
 end
@@ -3249,6 +3383,7 @@ pcall(function()
         if not (a and safe(function() return a:IsValid() end, false)) then return end
         if className(a) ~= "BP_PlayerCharacter_C" then return end
         if safe(function() return a.bCanBeDamaged end, true) == false then return end   -- god mode
+        if safe(function() return a["PlayerDead?"] end, false) == true then return end
         local key = safe(function() return a:GetAddress() end, nil)
         if not key or DN.allowKill[key] then return end
         if not dnCoop() then return end
@@ -4088,7 +4223,8 @@ do
                     end
                     if A.play then
                         pcall(dnNotify, "A player joined", myPawn())
-                        gameDelay(20000, function() pcall(CS.gearCensus, "host"); pcall(CS.widgetCensus, "host") end)
+                        gameDelay(20000, function() pcall(CS.gearCensus, "host"); pcall(CS.widgetCensus, "host"); pcall(CS.weatherBrief, "host") end)
+                        gameDelay(50000, function() pcall(CS.weatherBrief, "host+50"); pcall(CS.skyLink, "host+50") end)
                     end
                     -- (config dumps done - nothing differed)
                 end
@@ -4123,6 +4259,17 @@ do
                         local np = safe(function() return c.Pawn end, nil)
                         alog(("respawned joiner: RestartPlayer -> %s, pawn=%s"):format(ok and "ok" or tostring(err),
                             (np and safe(function() return np:IsValid() end, false)) and className(np) or "none"))
+                        -- a fresh body sits at 0 health until a save loads into it (none
+                        -- will for a joiner), and its PlayerState still says "down"
+                        if np and safe(function() return np:IsValid() end, false) then
+                            pcall(function()
+                                local mc = np.MedicalComponent
+                                local mx = safe(function() return mc.MaxHealth end, 100) or 100
+                                mc.Health = mx
+                                np:SendHealthToClient(mx)
+                            end)
+                            pcall(dnPublish, np, 0)
+                        end
                         if A.handled then A.handled[key] = nil end   -- move the new body next to the host
                         if A.seen then A.seen[key] = 0 end
                     end
@@ -4399,7 +4546,8 @@ do
         elseif A.step == "playing" then
             -- nothing to drive; just notice if we lose the host
             A.t = A.t + 1
-            if A.t == 20 then pcall(CS.gearCensus, "client"); pcall(CS.widgetCensus, "client") end
+            if A.t == 20 then pcall(CS.gearCensus, "client"); pcall(CS.widgetCensus, "client"); pcall(CS.weatherBrief, "client") end
+            if A.t == 60 or A.t == 90 then pcall(CS.weatherBrief, "client+" .. A.t); pcall(CS.skyLink, "client+" .. A.t) end
             if not myPawn() then
                 A.lost = (A.lost or 0) + 1
                 if A.lost == 15 then alog("no pawn for 15s - disconnected?") end
