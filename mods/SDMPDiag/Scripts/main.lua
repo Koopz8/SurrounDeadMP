@@ -284,13 +284,13 @@ RegisterConsoleCommandHandler("sdmp_drivers", function()
     ExecuteInGameThread(dumpNetDriverDefs)
     return true
 end)
-RegisterConsoleCommandHandler("sdmp_host", function()
+RegisterConsoleCommandHandler("sdmp_host_raw", function()   -- old manual step; sdmp_host now does the whole thing
     ExecuteInGameThread(hostListen)
     return true
 end)
 RegisterKeyBind(Key.F9, function() ExecuteInGameThread(dumpNetDriverDefs) end)
 
-log("SDMPDiag: F9 / sdmp_drivers to dump net driver defs, sdmp_host to listen.")
+log("SDMPDiag: F9 / sdmp_drivers to dump net driver defs.")
 
 -- The Engine.ini route doesn't survive: the game re-serializes user config on
 -- exit and drops any section it doesn't track, so the override was gone by the
@@ -3532,7 +3532,9 @@ do
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
-            fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0"); fwrite("sdmp_htrace.txt", "0")
+            if not A.play then
+                fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0"); fwrite("sdmp_htrace.txt", "0")
+            end
             -- No need to get past "press any key": the listen travel reloads
             -- the map and the menu comes back up without it.
             if not UEHelpers.GetPlayerController() then return end
@@ -3555,6 +3557,7 @@ do
             end
         elseif A.step == "continue" then
             if myPawn() then A.step = "ingame"; return end
+            if A.play then return end   -- the host picks Continue / Load themselves
             if A.t % 10 == 0 then pressContinue() end
             A.t = A.t + 1
             if A.t > 60 then alog("FAIL: no host pawn 60s after Continue"); A.step = "dead" end
@@ -3582,13 +3585,18 @@ do
                     end
                 end
             end)
-            -- test runs shouldn't end with the host dead in a ditch
-            console("god")
-            -- unpacked movement RPCs both sides, so the client log can tell
-            -- ClientAckGoodMove (fine) from ClientAdjustPosition (correction)
-            console("net.UsePackedMovementRPCs 0")
-            fwrite("sdmp_ready.txt", "1")
-            alog("host is in game and listening - client may join")
+            if A.play then
+                alog("hosting - players can join with sdmp_join <this PC's IP>")
+                pcall(dnNotify, "Co-op: you're hosting. Friends join with sdmp_join <your IP> (UDP port 7777)", myPawn())
+            else
+                -- test runs shouldn't end with the host dead in a ditch
+                console("god")
+                -- unpacked movement RPCs both sides, so the client log can tell
+                -- ClientAckGoodMove (fine) from ClientAdjustPosition (correction)
+                console("net.UsePackedMovementRPCs 0")
+                fwrite("sdmp_ready.txt", "1")
+                alog("host is in game and listening - client may join")
+            end
             A.step, A.t = "serving", 0
         elseif A.step == "serving" then
             -- Spawn joiners - but only through the engine route, and only once
@@ -3653,9 +3661,10 @@ do
                     end
                     if A.test == "zombie" or A.test == "downed" then
                         A.ztest = { p = p, t = 0 }
-                    else
+                    elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
                     end
+                    if A.play then pcall(dnNotify, "A player joined", myPawn()) end
                     -- (config dumps done - nothing differed)
                 end
             end
@@ -3666,6 +3675,7 @@ do
                     A.mon("host-copy", rp)
                 end
             end
+            if A.play then return end   -- the rest is test-run plumbing
             if (fread("sdmp_htrace.txt") or "") == "go" then
                 fwrite("sdmp_htrace.txt", "0")
                 -- A.hostTrace()  (off: keep test runs light)
@@ -3717,7 +3727,7 @@ do
     local function clientTick()
         if A.step == "init" then
             if not UEHelpers.GetPlayerController() then return end
-            if not (fread("sdmp_ready.txt") or ""):find("1") then
+            if not A.play and not (fread("sdmp_ready.txt") or ""):find("1") then
                 A.t = A.t + 1
                 if A.t % 10 == 1 then alog("waiting for host to be ready") end
                 if A.t > 240 then alog("FAIL: host never became ready"); A.step = "dead" end
@@ -3768,9 +3778,17 @@ do
                and (ROLE[safe(function() return p.Role end, -1)] or "") == "AutonomousProxy" then
                 A.step, A.t = "joined", 0; return
             end
-            if A.t % 45 == 0 then console("open 127.0.0.1:7777") end
+            if A.t % 45 == 0 then
+                local addr = A.joinAddr or "127.0.0.1"
+                if not addr:find(":") then addr = addr .. ":7777" end
+                alog("connecting to " .. addr)
+                console("open " .. addr)
+            end
             A.t = A.t + 1
-            if A.t > 120 then alog("FAIL: never got a pawn after 2 min"); A.step = "dead" end
+            if A.t > 120 then
+                alog("FAIL: never got a pawn after 2 min"); A.step = "dead"
+                if A.play then pcall(dnNotify, "Couldn't join - check the IP and that the host's UDP port 7777 is open", UEHelpers.GetPlayerController()) end
+            end
         elseif A.step == "joined" then
             A.tron = false
             local p = myPawn()
@@ -3785,6 +3803,12 @@ do
             end
             fixInput2()
             buildUI()
+            if A.play then
+                alog("joined - playing")
+                ExecuteWithDelay(2000, function() ExecuteInGameThread(function() pcall(dnNotify, "Joined the host's game", myPawn()) end) end)
+                A.step, A.t = "playing", 0
+                return
+            end
             if A.test == "zombie" or A.test == "downed" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
@@ -3914,6 +3938,15 @@ do
                 startRun(); A.step = "running"
             elseif A.t > 20 then
                 alog("FAIL: host never confirmed " .. tostring(A.want)); fwrite("sdmp_done.txt", "1"); A.step, A.t = "finished", 0
+            end
+        elseif A.step == "playing" then
+            -- nothing to drive; just notice if we lose the host
+            A.t = A.t + 1
+            if not myPawn() then
+                A.lost = (A.lost or 0) + 1
+                if A.lost == 15 then alog("no pawn for 15s - disconnected?") end
+            else
+                A.lost = 0
             end
         elseif A.step == "zwait" then
             A.t = A.t + 1
@@ -4081,6 +4114,17 @@ do
         A.auto = cl:find("%-sdmpauto") ~= nil
         A.quit = cl:find("%-sdmpquit") ~= nil
         A.test = cl:match("%-sdmptest=(%a+)")
+        -- co-op straight from the command line (shortcuts, playtest.bat)
+        if cl:find("%-sdmplowgfx") then console("scalability 0"); console("r.ScreenPercentage 50") end
+        local pm = cl:match("%-sdmpplay=(%S+)")
+        if pm and not A.role then
+            if pm == "host" then A.startPlay("host", nil)
+            else
+                local addr = pm:match("^join:(.+)$")
+                if addr then A.startPlay("client", addr) end
+            end
+            return
+        end
         if not A.role then return end
         alog(("boot: auto=%s quit=%s dir=%s"):format(tostring(A.auto), tostring(A.quit), modDir()))
         if not A.auto then return end
@@ -4091,15 +4135,55 @@ do
         -- always-on BeginPlay/NewObject hooks are the prime suspect for the
         -- UE4SS access violation the client hit right after joining
         -- if A.role == "client" then A.trace() end
+        A.startLoop()
+    end
+
+    A.startLoop = function()
+        if A.looping then return end
+        A.looping = true
         LoopAsync(1000, function()
             ExecuteInGameThread(function()
                 local ok, err = pcall(A.role == "host" and hostTick or clientTick)
                 if not ok then alog("tick error in step " .. A.step .. ": " .. tostring(err)) end
             end)
             if A.step == "dead" and A.quit then A.step = "quit"; ExecuteInGameThread(function() console("quit") end) end
-            return A.step == "dead" or A.step == "quit"
+            local stop = A.step == "dead" or A.step == "quit"
+            if stop then A.looping = false end
+            return stop
         end)
     end
+
+    -- ------------------------------------------------------------- play
+    -- The same steps as the test runs, minus the test parts, started from the
+    -- main menu console:
+    --   host:   sdmp_host            then Continue / Load your save as usual
+    --   joiner: sdmp_join <ip>       (or ip:port; default port 7777)
+    local function startPlay(role, addr)
+        A.startPlayCalled = true
+        if A.looping then log("SDMP: co-op is already running (" .. tostring(A.role) .. ")"); return end
+        A.role, A.play, A.auto, A.quit, A.test = role, true, false, false, nil
+        A.joinAddr = addr
+        A.step, A.t, A.boot, A.lt = "init", 0, 0, 0
+        A.handled, A.seen, A.dpSet = {}, {}, false
+        LOGF.path = modDir() .. "\\sdmp_" .. role .. ".log"
+        pcall(function() local f = io.open(LOGF.path, "w"); if f then f:close() end end)
+        alog(role == "host" and "co-op: hosting" or ("co-op: joining " .. tostring(addr)))
+        A.startLoop()
+    end
+    A.startPlay = startPlay
+    RegisterConsoleCommandHandler("sdmp_host", function()
+        ExecuteInGameThread(function() startPlay("host", nil) end)
+        return true
+    end)
+    RegisterConsoleCommandHandler("sdmp_join", function(cmd, params)
+        local addr = params and params[1]
+        if not addr or addr == "" then
+            log("SDMP: usage: sdmp_join <host IP>   e.g. sdmp_join 203.0.113.5")
+            return true
+        end
+        ExecuteInGameThread(function() startPlay("client", addr) end)
+        return true
+    end)
 
     -- the command line is readable once the engine is up; give it a moment
     ExecuteWithDelay(3000, function() ExecuteInGameThread(boot) end)
