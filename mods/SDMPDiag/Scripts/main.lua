@@ -2887,7 +2887,8 @@ end)
 
 LoopAsync(250, function()
     ExecuteInGameThread(function()
-        pcall(dnHookSpawns)
+        -- (spawn-function hooks retired: they found Survival_SpawnPlayer, and running
+        -- code from GI hooks during the Entry hop is a crash risk)
         if not worldSettled() then return end
         if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch) end
         if dnIsHost() then
@@ -3532,7 +3533,7 @@ do
     -- ---------------------------------------------------------------- host
     local function hostTick()
         if A.step == "init" then
-            if not A.play then
+            if not A.play or A.pt then
                 fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0"); fwrite("sdmp_htrace.txt", "0")
             end
             -- No need to get past "press any key": the listen travel reloads
@@ -3557,7 +3558,7 @@ do
             end
         elseif A.step == "continue" then
             if myPawn() then A.step = "ingame"; return end
-            if A.play then return end   -- the host picks Continue / Load themselves
+            if A.play and not A.pt then return end   -- the host picks Continue / Load themselves
             if A.t % 10 == 0 then pressContinue() end
             A.t = A.t + 1
             if A.t > 60 then alog("FAIL: no host pawn 60s after Continue"); A.step = "dead" end
@@ -3588,6 +3589,7 @@ do
             if A.play then
                 alog("hosting - players can join with sdmp_join <this PC's IP>")
                 pcall(dnNotify, "Co-op: you're hosting. Friends join with sdmp_join <your IP> (UDP port 7777)", myPawn())
+                if A.pt then fwrite("sdmp_ready.txt", "1") end
             else
                 -- test runs shouldn't end with the host dead in a ditch
                 console("god")
@@ -3727,7 +3729,7 @@ do
     local function clientTick()
         if A.step == "init" then
             if not UEHelpers.GetPlayerController() then return end
-            if not A.play and not (fread("sdmp_ready.txt") or ""):find("1") then
+            if (not A.play or A.pt) and not (fread("sdmp_ready.txt") or ""):find("1") then
                 A.t = A.t + 1
                 if A.t % 10 == 1 then alog("waiting for host to be ready") end
                 if A.t > 240 then alog("FAIL: host never became ready"); A.step = "dead" end
@@ -4116,6 +4118,7 @@ do
         A.test = cl:match("%-sdmptest=(%a+)")
         -- co-op straight from the command line (shortcuts, playtest.bat)
         if cl:find("%-sdmplowgfx") then console("scalability 0"); console("r.ScreenPercentage 50") end
+        A.pt = cl:find("%-sdmpplaytest") ~= nil   -- one-PC play test: host auto-Continues, joiner waits for it
         local pm = cl:match("%-sdmpplay=(%S+)")
         if pm and not A.role then
             if pm == "host" then A.startPlay("host", nil)
