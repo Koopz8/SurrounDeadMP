@@ -3,3 +3,5 @@ research/pak_filelist.txt
 tools/*.zip
 *.pak
 *.pdb
+dist/
+research/stage/

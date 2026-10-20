@@ -1,16 +1,24 @@
---[[ SurrounDead MP — diagnostics
-     Read-only. Dumps what we need to know before writing a line of mod code.
-     F7 in game, or console: sdmp_diag
+--[[ SurrounDead Co-op (SurrounDeadMP)
+     Two-player co-op for SurrounDead over UE4SS. Main menu: F7 hosts, F8 joins
+     the IP in config.txt. Test tooling lives in tools/ (test.bat, playtest.bat).
 ]]
+local SDMP_VERSION = "0.1.0-beta"
 
 local UEHelpers = require("UEHelpers")
 
 -- Both test instances write the same UE4SS.log, and the second one to start
 -- wipes it, so each instance also keeps its own sdmp_<role>.log next to the mod
 -- (opened per line so it survives a crash).
-local LOGF = { path = nil }
+local LOGF = { path = nil, verbose = false }
+-- chatty per-second diagnostics only go out in test runs or with debug=true
+local QUIET = { "^SDMPDiag:", "^ZA status", "^CENSUS", "^NP%[", "^NP:", "^CS slots", "^GEAR", "^WX ", "^SKYLINK",
+                "^DN: BP_PlayerCharacter_C down ", "^CS rx", "^WEATHER" }
 local function log(s)
-    local line = "[SDMP] " .. tostring(s)
+    s = tostring(s)
+    if not LOGF.verbose then
+        for _, q in ipairs(QUIET) do if s:find(q) then return end end
+    end
+    local line = "[SDMP] " .. s
     print(line .. "\n")
     if LOGF.path then
         local f = io.open(LOGF.path, "a")
@@ -214,14 +222,14 @@ local function runDiag()
     log("===========================================================")
 end
 
-RegisterKeyBind(Key.F7, function() ExecuteInGameThread(runDiag) end)
+-- (F7 is the co-op "host" key now; the diag dump is sdmp_diag only)
 
 RegisterConsoleCommandHandler("sdmp_diag", function()
     ExecuteInGameThread(runDiag)
     return true
 end)
 
-log("SDMPDiag loaded. F7 or `sdmp_diag` to dump.")
+log("SurrounDead Co-op " .. SDMP_VERSION .. " loaded. Main menu: F7 = host, F8 = join (see config.txt).")
 
 -- One line of net state. F8, or `sdmp_net`. For checking whether a listen
 -- server actually came up, or whether a connect landed, without the full dump.
@@ -251,13 +259,12 @@ local function netStatus()
         local a = FindAllOf("Actor"); return a and #a or 0 end, 0)))
 end
 
-RegisterKeyBind(Key.F8, function() ExecuteInGameThread(netStatus) end)
 RegisterConsoleCommandHandler("sdmp_net", function()
     ExecuteInGameThread(netStatus)
     return true
 end)
 
-log("SDMPDiag: F8 / sdmp_net for quick net status.")
+log("SDMPDiag: sdmp_net for quick net status.")
 
 -- Shipping builds compile logging out, so -log gives us nothing and a failed
 -- ?listen is silent. Read the engine's own net driver table instead: if the
@@ -318,9 +325,8 @@ RegisterConsoleCommandHandler("sdmp_host_raw", function()   -- old manual step; 
     ExecuteInGameThread(hostListen)
     return true
 end)
-RegisterKeyBind(Key.F9, function() ExecuteInGameThread(dumpNetDriverDefs) end)
 
-log("SDMPDiag: F9 / sdmp_drivers to dump net driver defs.")
+log("SDMPDiag: sdmp_drivers to dump net driver defs.")
 
 -- The Engine.ini route doesn't survive: the game re-serializes user config on
 -- exit and drops any section it doesn't track, so the override was gone by the
@@ -930,7 +936,8 @@ local function buildUI()
 
     for _, name in ipairs(UI_BUILD) do
         if safe(function() return pawn[name] end, nil) ~= nil then
-            local ok, err = pcall(function() pawn[name](pawn) end)
+            -- ShowCompassWidget takes Show? (bool)
+            local ok, err = pcall(function() if name == "ShowCompassWidget" then pawn[name](pawn, true) else pawn[name](pawn) end end)
             log("UI: " .. name .. " -> " .. (ok and "called" or ("threw: " .. tostring(err))))
         else
             log("UI: no such function " .. name)
@@ -940,11 +947,21 @@ local function buildUI()
     -- visibility is a separate flag from existence
     pcall(function() pawn:SetUIVisibility(true) end)
 
-    -- nudge each bar so they draw with real values rather than empty
+    -- nudge each bar so they draw with real values rather than empty; each
+    -- update takes the new value
+    local VAL = {
+        Client_UpdateHealthUI = { "MedicalComponent", "Health" },
+        Client_UpdateStaminaUI = { "StaminaComponent", "CurrentStamina" },
+        Client_UpdateHungerUI = { "HungerThirstComponent", "CurrentHunger" },
+        Client_UpdateThirstUI = { "HungerThirstComponent", "CurrentThirst" },
+        Client_UpdateRadiationUI = { "RadiationComponent", "CurrentRadiation" },
+    }
     for _, name in ipairs(UI_UPDATE) do
-        if safe(function() return pawn[name] end, nil) ~= nil then
-            local ok = pcall(function() pawn[name](pawn) end)
-            log("UI: " .. name .. " -> " .. tostring(ok))
+        local src = VAL[name]
+        local v = src and safe(function() return pawn[src[1]][src[2]] end, nil)
+        if type(v) == "number" and safe(function() return pawn[name] end, nil) ~= nil then
+            local ok = pcall(function() pawn[name](pawn, v) end)
+            log(("UI: %s(%.0f) -> %s"):format(name, v, tostring(ok)))
         end
     end
 
@@ -2413,7 +2430,7 @@ end)
 -- controller, so a client dying used to take the host's character away. We
 -- re-possess the host's pawn straight after.
 -- ===========================================================================
-local DN = { BLEED = 60, REVIVE = 5, DOWN_HP = 5, UP_HP = 30, RANGE = 200,
+local DN = { BLEED = 60, REVIVE = 5, DOWN_HP = 5, UP_HP = 30, RANGE = 260,
              down = {}, allowKill = {}, me = nil, lastMsg = 0, msgT = 0, nErr = false }
 
 local function dnLocalPC()
@@ -2482,6 +2499,18 @@ local function dnNotify(txt, pawn)
     if not ok and not DN.nErr then DN.nErr = true; log("DN: notification failed (" .. txt .. ")") end
 end
 
+-- Crouched by any measure: the flag, the movement component's view, or a
+-- crouch that's been asked for but not applied yet (server copy of a remote
+-- player lags a move or two behind their input).
+DN.isCrouching = function(o)
+    if safe(function() return o.bIsCrouched end, false) then return true, "flag" end
+    local cmc = safe(function() return o.CharacterMovement end, nil)
+    if dnValid(cmc) then
+        if safe(function() return cmc:IsCrouching() end, false) then return true, "cmc" end
+        if safe(function() return cmc.bWantsToCrouch end, false) then return true, "wants" end
+    end
+    return false, "no"
+end
 -- is anyone other than p alive and on their feet to come and revive them?
 local function dnHasReviver(p)
     local k = safe(function() return p:GetAddress() end, 0)
@@ -2625,23 +2654,41 @@ local function dnHostTick()
                 pcall(function() cmc.JumpZVelocity = 0 end)
             end
             local pl = safe(function() return p:K2_GetActorLocation() end, nil)
-            local reviver = nil
+            local reviver, near, nearD, nearC = nil, nil, 1e9, nil
             for _, o in ipairs(players) do
-                if o:GetAddress() ~= key and not DN.isDown(o) and safe(function() return o.bIsCrouched end, false) then
+                if o:GetAddress() ~= key and not DN.isDown(o) then
                     local ol = safe(function() return o:K2_GetActorLocation() end, nil)
-                    if pl and ol and (ol.X - pl.X)^2 + (ol.Y - pl.Y)^2 + (ol.Z - pl.Z)^2 < DN.RANGE * DN.RANGE then
-                        reviver = o; break
+                    if pl and ol then
+                        local d2 = math.sqrt((ol.X - pl.X)^2 + (ol.Y - pl.Y)^2)
+                        local dz = math.abs(ol.Z - pl.Z)
+                        local cr, why = DN.isCrouching(o)
+                        if not cr then
+                            local v = safe(function() return o:GetVelocity() end, nil)
+                            local sp = v and math.sqrt(v.X * v.X + v.Y * v.Y) or 999
+                            if sp < 40 then cr, why = true, "still" else why = ("moving %.0f"):format(sp) end
+                        end
+                        if d2 < nearD then near, nearD, nearC = o, d2, why end
+                        if cr and d2 < DN.RANGE and dz < 200 then reviver = o; break end
                     end
                 end
+            end
+            -- every 2s while down, say why a revive is or isn't happening
+            d.diag = (d.diag or 0) + 1
+            if d.diag % 8 == 1 then
+                log(("DN: %s down %.0fs left, rev %d%%, nearest partner %s at %.0f (crouch: %s)"):format(
+                    className(p), d.t, math.floor(d.rev * 100), near and className(near) or "none", nearD, tostring(nearC)))
             end
             if not reviver and not dnHasReviver(p) and d.t > 2 then
                 d.t = 2   -- partner's dead or down too: nobody's coming
             end
             if reviver then
+                d.miss = 0
                 d.rev = d.rev + 0.25 / DN.REVIVE
             else
-                d.rev = 0
-                d.t = d.t - 0.25
+                -- a second of grace so a flicker in crouch/range doesn't wipe progress
+                d.miss = (d.miss or 0) + 1
+                if d.miss > 4 then d.rev = 0 end
+                if d.rev == 0 then d.t = d.t - 0.25 end
             end
             if d.rev >= 1 then
                 DN.down[key] = nil
@@ -3344,7 +3391,7 @@ local function dnLocalTick()
             if st == "reviving" then
                 dnNotify(("Being revived... %d%%"):format(n), me)
             else
-                dnNotify(("You're down! Bleeding out in %ds - your partner can crouch next to you to revive"):format(n), me)
+                dnNotify(("You're down! Bleeding out in %ds - your partner can stand or crouch next to you to revive"):format(n), me)
             end
         end
         return
@@ -3363,7 +3410,7 @@ local function dnLocalTick()
                 local ost, on = dnState(o)
                 if ost == "down" then
                     DN.lastMsg = DN.msgT
-                    dnNotify(("Your partner is down! Crouch next to them to revive (%ds)"):format(on), me)
+                    dnNotify(("Your partner is down! Stay right next to them to revive (%ds)"):format(on), me)
                     break
                 elseif ost == "reviving" then
                     DN.lastMsg = DN.msgT
@@ -3375,36 +3422,77 @@ local function dnLocalTick()
     end
 end
 
--- lethal hits become downed (host only, co-op only)
-pcall(function()
-    RegisterHook("/Script/Engine.GameplayStatics:ApplyDamage", function(ctx, damaged, dmg)
-        if not worldSettled() or not dnIsHost() then return end
-        local a = safe(function() return damaged:get() end, nil)
-        if not (a and safe(function() return a:IsValid() end, false)) then return end
-        if className(a) ~= "BP_PlayerCharacter_C" then return end
-        if safe(function() return a.bCanBeDamaged end, true) == false then return end   -- god mode
-        if safe(function() return a["PlayerDead?"] end, false) == true then return end
-        local key = safe(function() return a:GetAddress() end, nil)
-        if not key or DN.allowKill[key] then return end
-        if not dnCoop() then return end
-        local d = safe(function() return dmg:get() end, 0) or 0
-        if d <= 0 then return end
-        local dd = DN.down[key]
-        if dd then
-            pcall(function() dmg:set(0.0) end)
-            dd.t = dd.t - 2
+-- Lethal hits become downed (host only, co-op only), and players can't hurt
+-- each other unless friendly fire is switched on (sdmp_friendlyfire).
+-- Weapons go through ApplyPointDamage / ApplyRadialDamage as well as plain
+-- ApplyDamage, so all three are watched.
+DN.friendlyFire = false
+local function dnFromPlayer(victim, inst, causer)
+    local vk = safe(function() return victim:GetAddress() end, 0)
+    local c = inst and safe(function() return inst:get() end, nil)
+    if dnValid(c) and className(c):find("PlayerController") then
+        local cp = safe(function() return c.Pawn end, nil)
+        if dnValid(cp) and cp:GetAddress() ~= vk then return true end
+    end
+    local a = causer and safe(function() return causer:get() end, nil)
+    for _ = 1, 3 do   -- the causer, its owner, its owner's owner (gun -> player)
+        if not dnValid(a) then break end
+        if className(a) == "BP_PlayerCharacter_C" then return a:GetAddress() ~= vk end
+        a = safe(function() return a:GetOwner() end, nil)
+    end
+    return false
+end
+local function dnOnDamage(damaged, dmg, inst, causer)
+    if not worldSettled() or not dnIsHost() then return end
+    local a = safe(function() return damaged:get() end, nil)
+    if not (a and safe(function() return a:IsValid() end, false)) then return end
+    if className(a) ~= "BP_PlayerCharacter_C" then return end
+    if safe(function() return a.bCanBeDamaged end, true) == false then return end   -- god mode
+    if safe(function() return a["PlayerDead?"] end, false) == true then return end
+    local key = safe(function() return a:GetAddress() end, nil)
+    if not key or DN.allowKill[key] then return end
+    if not dnCoop() then return end
+    local d = safe(function() return dmg:get() end, 0) or 0
+    if d <= 0 then return end
+    if not DN.friendlyFire and dnFromPlayer(a, inst, causer) then
+        pcall(function() dmg:set(0.0) end)
+        if not DN.ffSaid then DN.ffSaid = true; log("DN: blocked a player-on-player hit (friendly fire is off)") end
+        return
+    end
+    local dd = DN.down[key]
+    if dd then
+        pcall(function() dmg:set(0.0) end)
+        if (dd.rev or 0) == 0 then dd.t = dd.t - 2 end   -- hits don't count while being revived
+        return
+    end
+    local h = dnHealth(a)
+    if h and h - d <= 0 then
+        if not dnHasReviver(a) then   -- nobody left to revive you: normal death
+            if safe(function() return a:IsLocallyControlled() end, true) == false then pcall(DN.guardHostSkills, "joiner killed") end
             return
         end
-        local h = dnHealth(a)
-        if h and h - d <= 0 then
-            if not dnHasReviver(a) then   -- nobody left to revive you: normal death
-                if safe(function() return a:IsLocallyControlled() end, true) == false then pcall(DN.guardHostSkills, "joiner killed") end
-                return
-            end
-            pcall(function() dmg:set(0.0) end)
-            dnEnter(a)
-        end
+        pcall(function() dmg:set(0.0) end)
+        dnEnter(a)
+    end
+end
+pcall(function()
+    RegisterHook("/Script/Engine.GameplayStatics:ApplyDamage", function(ctx, damaged, dmg, inst, causer)
+        dnOnDamage(damaged, dmg, inst, causer)
     end)
+end)
+pcall(function()
+    RegisterHook("/Script/Engine.GameplayStatics:ApplyPointDamage", function(ctx, damaged, dmg, dir, hit, inst, causer)
+        dnOnDamage(damaged, dmg, inst, causer)
+    end)
+end)
+RegisterConsoleCommandHandler("sdmp_friendlyfire", function()
+    DN.friendlyFire = not DN.friendlyFire
+    log("friendly fire is now " .. (DN.friendlyFire and "ON" or "OFF"))
+    ExecuteInGameThread(function()
+        local pc = dnLocalPC()
+        pcall(dnNotify, "Friendly fire " .. (DN.friendlyFire and "ON" or "OFF"), pc and safe(function() return pc.Pawn end, nil))
+    end)
+    return true
 end)
 
 gameLoop(250, function()
@@ -3420,6 +3508,19 @@ gameLoop(250, function()
             if not ok then log("DN host error: " .. tostring(err)) end
         end
         pcall(pressAnyKeySweep)
+        local PJm = CS.PJ
+        if PJm then
+            PJm.tk = (PJm.tk or 0) + 1
+            if PJm.tk % 4 == 0 then
+                if dnIsHost() then pcall(PJm.hostTick) else pcall(PJm.clientTick) end
+            end
+        end
+        local DRm = CS.DR
+        if DRm then
+            DRm.ht = (DRm.ht or 0) + 1
+            if DRm.ht % 20 == 1 then pcall(DRm.hook) end
+            if dnIsHost() then pcall(DRm.hostTick) end
+        end
         local ok, err = pcall(dnLocalTick)
         if not ok and not DN.lErr then DN.lErr = true; log("DN local error: " .. tostring(err)) end
     end
@@ -3430,6 +3531,486 @@ RegisterConsoleCommandHandler("sdmp_down", function()   -- debug: down yourself 
     end)
     return true
 end)
+
+-- Doors. A lot of the game's doors only run on the machine that pressed E
+-- (BP_LockedDoor and friends: a local timeline, nothing sent anywhere), so a
+-- door the joiner opens stays shut on the host - and the host's collision
+-- keeps rubber-banding the joiner back - and the host's doors never move for
+-- the joiner. Two halves:
+--   host -> joiner: the host makes doors near a joiner replicate, actor and
+--     components, so the door leaf's transform follows the host's.
+--   joiner -> host: when a door toggles on the joiner, it's forwarded through
+--     the game's own reliable SERVER_ForwardInteract (Jig) and the host runs
+--     the same toggle on its copy.
+local DR = {
+    classes = { "BP_LockedDoor_C", "BP_KeycardDoor_C", "BP_KeycardDoor_Child_C", "BP_KeypadDoor_C",
+                "BP_HangarDoor_C", "BP_BarrierGate_C", "BP_ContainerDoors_C", "BP_WarehouseDoors_C",
+                "BP_LaboratorySlidingDoor_C", "BP_LaboratorySecureDoors_C", "BP_LaboratoryEntranceDoors_C",
+                "Buildable_WoodenDoor_C", "Buildable_WoodenDoor2_C", "Buildable_BarricadedMetalDoor_C",
+                "Buildable_BunkerDoor_C", "Buildable_GarageDoor_C", "Buildable_WoodenGate_C",
+                "Buildable_WoodenWallDoor_C", "Buildable_WoodenWallDoor2_C" },
+    path = {
+        BP_LockedDoor_C = "/Game/Blueprints/Other/Doors/BP_LockedDoor",
+        BP_KeycardDoor_C = "/Game/Blueprints/Other/Doors/BP_KeycardDoor",
+        BP_KeycardDoor_Child_C = "/Game/Blueprints/Other/Doors/BP_KeycardDoor_Child",
+        BP_KeypadDoor_C = "/Game/Blueprints/Other/Doors/Keypad/BP_KeypadDoor",
+        BP_HangarDoor_C = "/Game/Blueprints/Other/Doors/BP_HangarDoor",
+        BP_BarrierGate_C = "/Game/Blueprints/Other/Doors/BP_BarrierGate",
+        BP_ContainerDoors_C = "/Game/Blueprints/Other/Doors/BP_ContainerDoors",
+        BP_WarehouseDoors_C = "/Game/Blueprints/Other/Doors/BP_WarehouseDoors",
+        BP_LaboratorySlidingDoor_C = "/Game/Blueprints/Laboratory/Blueprints/Doors/BP_LaboratorySlidingDoor",
+        BP_LaboratorySecureDoors_C = "/Game/Blueprints/Laboratory/Blueprints/Doors/BP_LaboratorySecureDoors",
+        BP_LaboratoryEntranceDoors_C = "/Game/Blueprints/Laboratory/Blueprints/Doors/BP_LaboratoryEntranceDoors",
+        Buildable_WoodenDoor_C = "/Game/Blueprints/BuildingSystem/Actors/Doors/Buildable_WoodenDoor",
+        Buildable_WoodenDoor2_C = "/Game/Blueprints/BuildingSystem/Actors/Doors/Buildable_WoodenDoor2",
+        Buildable_BarricadedMetalDoor_C = "/Game/Blueprints/BuildingSystem/Actors/Doors/Buildable_BarricadedMetalDoor",
+        Buildable_BunkerDoor_C = "/Game/Blueprints/BuildingSystem/Actors/Doors/Buildable_BunkerDoor",
+        Buildable_GarageDoor_C = "/Game/Blueprints/BuildingSystem/Actors/Doors/Buildable_GarageDoor",
+        Buildable_WoodenGate_C = "/Game/Blueprints/BuildingSystem/Actors/Doors/Buildable_WoodenGate",
+        Buildable_WoodenWallDoor_C = "/Game/Blueprints/BuildingSystem/Actors/Modular/Wood/Wall/Buildable_WoodenWallDoor",
+        Buildable_WoodenWallDoor2_C = "/Game/Blueprints/BuildingSystem/Actors/Modular/Wood/Wall/Buildable_WoodenWallDoor2",
+    },
+    hookedCls = {},
+    -- these already go through the server and multicast (MC_OpenDoor /
+    -- MC_OnInteractBuildable); they only need to replicate
+    native = { BP_WarehouseDoors_C = true, BP_BarrierGate_C = true, BP_ContainerDoors_C = true,
+               BP_HangarDoor_C = true, BP_KeycardDoor_C = true, BP_KeycardDoor_Child_C = true,
+               BP_KeypadDoor_C = true,
+               Buildable_WoodenDoor_C = true, Buildable_WoodenDoor2_C = true, Buildable_BarricadedMetalDoor_C = true,
+               Buildable_BunkerDoor_C = true, Buildable_GarageDoor_C = true, Buildable_WoodenGate_C = true,
+               Buildable_WoodenWallDoor_C = true, Buildable_WoodenWallDoor2_C = true },
+    rep = {}, t = 0, hooked = false, fwd = 0, rx = 0,
+    stateFlags = { "Closed?", "IsClosed", "Closed", "IsOpen?", "Open?", "IsOpen", "DoorOpen?" },
+}
+CS.DR = DR
+local function drAll()
+    local out = {}
+    for _, cn in ipairs(DR.classes) do
+        for _, a in ipairs(safe(function() return FindAllOf(cn) end, nil) or {}) do
+            if dnValid(a) and CS.inPlayWorld(a) then out[#out + 1] = a end
+        end
+    end
+    return out
+end
+DR.all = drAll
+-- open/closed as the door itself sees it (nil if we can't tell)
+local function drIsOpen(a)
+    for _, f in ipairs(DR.stateFlags) do
+        local v = safe(function() return a[f] end, nil)
+        if type(v) == "boolean" then
+            if f:find("Close") then return not v else return v end
+        end
+    end
+    return nil
+end
+DR.isOpen = drIsOpen
+local function drMakeReplicated(a)
+    local k = a:GetAddress()
+    if DR.rep[k] then return end
+    pcall(function() a:SetReplicates(true) end)
+    pcall(function() a.NetUpdateFrequency = 10.0 end)
+    local comps = safe(function() return a:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.SceneComponent")) end, nil) or {}
+    local n = 0
+    for i = 1, #comps do
+        local c = safe(function() return comps[i]:get() end, nil) or comps[i]
+        if dnValid(c) then pcall(function() c:SetIsReplicated(true) end); n = n + 1 end
+    end
+    pcall(function() a:ForceNetUpdate() end)
+    DR.rep[k] = true
+    DR.nrep = (DR.nrep or 0) + 1
+    if DR.nrep <= 5 then log(("DR: %s now replicates (%d components)"):format(className(a), n)) end
+end
+DR.makeRep = drMakeReplicated
+-- host: doors within 60 m of any joiner replicate
+local function drHostTick()
+    DR.t = DR.t + 1
+    if DR.t % 8 ~= 0 then return end   -- every 2s
+    if not dnCoop() then return end
+    local remotes = {}
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) and not safe(function() return p:IsLocallyControlled() end, true) then
+            local l = safe(function() return p:K2_GetActorLocation() end, nil)
+            if l then remotes[#remotes + 1] = l end
+        end
+    end
+    if #remotes == 0 then return end
+    for _, a in ipairs(drAll()) do
+        if not DR.rep[a:GetAddress()] then
+            local l = safe(function() return a:K2_GetActorLocation() end, nil)
+            if l then
+                for _, r in ipairs(remotes) do
+                    if (l.X - r.X)^2 + (l.Y - r.Y)^2 < 6000 * 6000 then drMakeReplicated(a); break end
+                end
+            end
+        end
+    end
+end
+DR.hostTick = drHostTick
+local function drTag(open)
+    return { TagName = FName(open and "Jig.InteractOptions.Option1" or "Jig.InteractOptions.Option2") }
+end
+-- joiner: forward a local toggle to the host
+local function drForward(a)
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    local jig = dnValid(me) and safe(function() return me.BP_JigMultiplayer end, nil)
+    if not dnValid(jig) then log("DR: can't forward, no Jig component"); return false end
+    local ok, err = pcall(function() jig:SERVER_ForwardInteract(a, drTag(true), {}) end)
+    DR.fwd = DR.fwd + 1
+    if DR.fwd <= 10 then log(("DR: asked the host to toggle %s -> %s %s"):format(className(a), tostring(ok), tostring(err or ""))) end
+    return ok
+end
+DR.forward = drForward
+local function drHook()
+    for _, cn in ipairs(DR.classes) do
+        if not DR.native[cn] and not DR.hookedCls[cn] then
+            local base = DR.path[cn] .. "." .. cn
+            -- only once the class is actually loaded
+            local cls = safe(function() return StaticFindObject(base) end, nil)
+            if cls and safe(function() return cls:IsValid() end, false) then
+                DR.tries = DR.tries or {}
+                DR.tries[cn] = (DR.tries[cn] or 0) + 1
+                local got, errs = {}, {}
+                -- joiner side: a door toggled here -> ask the host to toggle its copy
+                local ok1, e1 = pcall(function()
+                    RegisterHook(base .. ":Event_Door", function(ctx)
+                        if dnIsHost() or DR.applying then return end
+                        local a = safe(function() return ctx:get() end, nil)
+                        if dnValid(a) then pcall(drForward, a) end
+                    end)
+                end)
+                if ok1 then got[#got + 1] = "Event_Door" else errs[#errs + 1] = tostring(e1) end
+                -- host side: a forwarded toggle arrives
+                local ok2, e2 = pcall(function()
+                    RegisterHook(base .. ":OnServerExecuteInteract", function(ctx, option, by, payload)
+                        if not dnIsHost() then return end
+                        local a = safe(function() return ctx:get() end, nil)
+                        local who = safe(function() return by:get() end, nil)
+                        if not (dnValid(a) and dnValid(who)) then return end
+                        if safe(function() return who:IsLocallyControlled() end, true) then return end
+                        DR.rx = DR.rx + 1
+                        if DR.rx <= 10 then log(("DR: host got a toggle for %s from a joiner (host had open=%s)"):format(className(a), tostring(drIsOpen(a)))) end
+                        drMakeReplicated(a)
+                        DR.toggle(a, who)
+                        -- once both animations are done, push the host's pose again so a
+                        -- joiner whose copy went the other way snaps to the truth
+                        gameDelay(2500, function() pcall(DR.nudge, a) end)
+                    end)
+                end)
+                if ok2 then got[#got + 1] = "OnServerExecuteInteract" else errs[#errs + 1] = tostring(e2) end
+                if #got == 2 or DR.tries[cn] >= 5 then DR.hookedCls[cn] = true end
+                if #got == 2 or DR.tries[cn] == 1 or DR.tries[cn] >= 5 then
+                    log(("DR: hooked %s: %s%s"):format(cn, #got > 0 and table.concat(got, ", ") or "nothing",
+                        #errs > 0 and (" (err: " .. errs[1]:sub(1, 120) .. ")") or ""))
+                end
+            end
+        end
+    end
+end
+DR.hook = drHook
+-- run a door's own open/close (some take the interacting pawn, some nothing)
+-- wiggle every replicated part by a hair and back, so the host's current
+-- pose is sent again even though it hasn't really changed
+DR.nudge = function(a)
+    local comps = safe(function() return a:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.SceneComponent")) end, nil) or {}
+    local saved = {}
+    for i = 1, #comps do
+        local c = safe(function() return comps[i]:get() end, nil) or comps[i]
+        local r = dnValid(c) and safe(function() return c.RelativeRotation end, nil)
+        if r then
+            saved[#saved + 1] = { c = c, r = { Pitch = r.Pitch, Yaw = r.Yaw, Roll = r.Roll } }
+            pcall(function() c:K2_SetRelativeRotation({ Pitch = r.Pitch, Yaw = r.Yaw + 0.05, Roll = r.Roll }, false, {}, false) end)
+        end
+    end
+    pcall(function() a:ForceNetUpdate() end)
+    gameDelay(400, function()
+        for _, s2 in ipairs(saved) do
+            pcall(function() s2.c:K2_SetRelativeRotation(s2.r, false, {}, false) end)
+        end
+        pcall(function() a:ForceNetUpdate() end)
+    end)
+end
+DR.toggle = function(a, who)
+    DR.applying = true
+    local ok = pcall(function() a:Event_Door(who) end)
+    if not ok then ok = pcall(function() a:Event_Door() end) end
+    DR.applying = false
+    return ok
+end
+-- a short fingerprint of where a door's parts are (to see it move)
+DR.pose = function(a)
+    local comps = safe(function() return a:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.StaticMeshComponent")) end, nil) or {}
+    local parts = {}
+    for i = 1, math.min(#comps, 3) do
+        local c = safe(function() return comps[i]:get() end, nil) or comps[i]
+        if dnValid(c) then
+            local r = safe(function() return c.RelativeRotation end, nil)
+            local l = safe(function() return c.RelativeLocation end, nil)
+            parts[#parts + 1] = ("%s yaw=%.0f x=%.0f y=%.0f z=%.0f"):format(safe(function() return c:GetFName():ToString() end, "?"),
+                r and r.Yaw or 0, l and l.X or 0, l and l.Y or 0, l and l.Z or 0)
+        end
+    end
+    return table.concat(parts, " | ")
+end
+DR.nearest = function(loc, wantEvent, only)
+    local best, bd = nil, 1e18
+    for _, a in ipairs(drAll()) do
+        local cn = className(a)
+        if (not wantEvent or not DR.native[cn]) and (not only or cn == only) then
+            local l = safe(function() return a:K2_GetActorLocation() end, nil)
+            if l and loc then
+                local d = (l.X - loc.X)^2 + (l.Y - loc.Y)^2 + (l.Z - loc.Z)^2
+                if d < bd then best, bd = a, d end
+            end
+        end
+    end
+    return best, best and math.sqrt(bd) or -1
+end
+
+-- Probe helpers for the joiner-save work: function signatures and struct
+-- layouts, read from the reflection data at runtime.
+local PR = {}
+CS.PR = PR
+PR.sig = function(path)
+    local fn = safe(function() return StaticFindObject(path) end, nil)
+    if not (fn and safe(function() return fn:IsValid() end, false)) then return "missing" end
+    local parts = {}
+    pcall(function()
+        fn:ForEachProperty(function(p)
+            if #parts < 14 then
+                parts[#parts + 1] = safe(function() return p:GetFName():ToString() end, "?") .. ":" ..
+                    safe(function() return p:GetClass():GetFName():ToString() end, "?")
+            end
+        end)
+    end)
+    return table.concat(parts, ", ")
+end
+PR.structOf = function(obj, propName)
+    local out = {}
+    pcall(function()
+        obj:GetClass():ForEachProperty(function(p)
+            if safe(function() return p:GetFName():ToString() end, "") == propName then
+                local inner = safe(function() return p:GetInner() end, nil)
+                local sp = inner or p
+                local st = safe(function() return sp:GetStruct() end, nil)
+                if st then
+                    st:ForEachProperty(function(f)
+                        out[#out + 1] = safe(function() return f:GetFName():ToString() end, "?") .. ":" ..
+                            safe(function() return f:GetClass():GetFName():ToString() end, "?")
+                    end)
+                end
+            end
+        end)
+    end)
+    return table.concat(out, ", ")
+end
+
+-- Joiner saves. A joiner used to start naked every session. The host now
+-- keeps each joiner's inventory with the game's own Jig save functions (one
+-- save slot per container, "SDMP_<id>_<n>") plus a small text file of their
+-- stats, and puts it back when they join again. A joiner is recognised by a
+-- name it sets itself on connect ("SDMP-<computer>-<user>") since the plain
+-- IP connection gives every session a random name.
+--   * saved every 30s while they're alive and loaded
+--   * a joiner who died starts fresh (their next save overwrites the old one)
+-- STATUS: experimental and OFF by default (joiner_saves=true in config.txt).
+-- Loading a save into a fresh body doesn't stick yet: the restored items are
+-- dropped again a few seconds later (they point at item actors that belonged
+-- to the old body) and repeated loads pile up duplicate containers. Saving is
+-- harmless; loading needs the game's own item-actor respawn path worked out.
+local PJ = { st = {}, t = 0, said = {}, enabled = false }
+CS.PJ = PJ
+local function pjDir()
+    local src = debug.getinfo(1, "S").source or ""
+    return src:match("^@(.*)[/\\]Scripts[/\\]main%.lua$") or "ue4ss/Mods/SDMPDiag"
+end
+local function pjSlug(id) return (id:gsub("[^%w%-_]", "_")) end
+PJ.myId = function()
+    local c = os.getenv("COMPUTERNAME") or "pc"
+    local u = os.getenv("USERNAME") or "user"
+    return "SDMP-" .. pjSlug(c .. "-" .. u):sub(1, 40) .. "@" .. SDMP_VERSION
+end
+-- "SDMP-<machine>-<user>@<version>" -> id, version
+PJ.idOf = function(p)
+    local ps = safe(function() return p.PlayerState end, nil)
+    local n = dnValid(ps) and safe(function() return ps:GetPlayerName():ToString() end, nil) or nil
+    if n and n:sub(1, 5) == "SDMP-" then
+        local id, ver = n:match("^(.-)@(.+)$")
+        return pjSlug(id or n), ver
+    end
+    return nil
+end
+local function pjMetaPath(id) return pjDir() .. "\\sdmp_save_" .. id .. ".txt" end
+PJ.readMeta = function(id)
+    local f = io.open(pjMetaPath(id), "r"); if not f then return nil end
+    local m = {}
+    for line in f:lines() do
+        local k, v = line:match("^([%w_]+)=(.*)$")
+        if k then m[k] = tonumber(v) or v end
+    end
+    f:close()
+    return m
+end
+local function pjWriteMeta(id, m)
+    local f = io.open(pjMetaPath(id), "w"); if not f then return false end
+    for k, v in pairs(m) do f:write(k .. "=" .. tostring(v) .. "\n") end
+    f:close()
+    return true
+end
+local PJ_STATS = {
+    { "MedicalComponent", "Health" }, { "HungerThirstComponent", "CurrentHunger" },
+    { "HungerThirstComponent", "CurrentThirst" }, { "StaminaComponent", "CurrentStamina" },
+    { "LevellingComponent", "CurrentLevel" }, { "LevellingComponent", "CurrentXP" },
+    { "RadiationComponent", "CurrentRadiation" },
+}
+PJ.itemCount = function(p)
+    local jig = safe(function() return p.BP_JigMultiplayer end, nil)
+    local mc = dnValid(jig) and safe(function() return jig.MainJigContainers end, nil)
+    if not mc then return -1, 0 end
+    local n = 0
+    for i = 1, #mc do
+        local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+        n = n + (items and #items or 0)
+    end
+    return n, #mc
+end
+PJ.save = function(p, id)
+    local jig = safe(function() return p.BP_JigMultiplayer end, nil)
+    if not dnValid(jig) then return false end
+    local mc = safe(function() return jig.MainJigContainers end, nil)
+    local n = mc and #mc or 0
+    if n == 0 then return false end
+    local ok = 0
+    for i = 0, n - 1 do
+        if pcall(function() jig:SERVER_RequestSaveOneJigContainerByIndex("SDMP_" .. id .. "_" .. i, 0, i) end) then ok = ok + 1 end
+    end
+    local m = { containers = n, items = (PJ.itemCount(p)), saved = os.time() }
+    local at = {}
+    for i = 1, n do
+        local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+        if items and #items > 0 then at[#at + 1] = (i - 1) .. "x" .. #items end
+    end
+    m.itemsAt = table.concat(at, ",")
+    for _, sdef in ipairs(PJ_STATS) do
+        local v = safe(function() return p[sdef[1]][sdef[2]] end, nil)
+        if type(v) == "number" then m[sdef[1] .. "_" .. sdef[2]] = v end
+    end
+    pjWriteMeta(id, m)
+    return ok == n, n, m.items
+end
+PJ.load = function(p, id)
+    local m = PJ.readMeta(id)
+    local jig = safe(function() return p.BP_JigMultiplayer end, nil)
+    if not (m and dnValid(jig)) then return false end
+    local n = tonumber(m.containers) or 0
+    local ok = 0
+    local before = PJ.itemCount(p)
+    local GS = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    for i = 0, n - 1 do
+        local slot = "SDMP_" .. id .. "_" .. i
+        if (m.itemsAt or ""):find("^" .. i .. "x") or (m.itemsAt or ""):find("," .. i .. "x") then
+            local exists = safe(function() return GS:DoesSaveGameExist(slot, 0) end, "?")
+            local sg = safe(function() return GS:LoadGameFromSlot(slot, 0) end, nil)
+            local jc = sg and safe(function() return sg.JigContainers end, nil)
+            local cnt = 0
+            if jc then for k = 1, #jc do local it = safe(function() return jc[k]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil); cnt = cnt + (it and #it or 0) end end
+            log(("PJ: slot %s exists=%s containers=%s items=%d"):format(slot, tostring(exists), tostring(jc and #jc), cnt))
+        end
+        if pcall(function() jig:SERVER_RequestLoadReplaceOneContainerByIndex(slot, 0, i) end) then ok = ok + 1 end
+    end
+    log(("PJ: load into %s: items %d -> %d (save says %s at %s)"):format(id, before, (PJ.itemCount(p)), tostring(m.items), tostring(m.itemsAt)))
+    for _, sdef in ipairs(PJ_STATS) do
+        local v = tonumber(m[sdef[1] .. "_" .. sdef[2]])
+        if v then pcall(function() p[sdef[1]][sdef[2]] = v end) end
+    end
+    local h = tonumber(m.MedicalComponent_Health)
+    if h and h > 0 then pcall(function() p:SendHealthToClient(h) end) end
+    return ok == n, n
+end
+-- host, once a second
+PJ.hostTick = function()
+    if not dnCoop() then return end
+    local now = os.clock()
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) and not safe(function() return p:IsLocallyControlled() end, true)
+           and dnValid(safe(function() return p.Controller end, nil)) then
+            local id, ver = PJ.idOf(p)
+            if id then
+                local st = PJ.st[id] or {}
+                PJ.st[id] = st
+                if ver ~= SDMP_VERSION and not st.verWarned then
+                    st.verWarned = true
+                    log(("PJ: %s is on mod version %s, host has %s"):format(id, tostring(ver), SDMP_VERSION))
+                    pcall(dnNotify, ("A player joined with co-op mod %s - you have %s. Both of you need the same version."):format(tostring(ver), SDMP_VERSION), dnLocalPC() and dnLocalPC().Pawn)
+                end
+                if not PJ.enabled then goto continue end
+                local addr = p:GetAddress()
+                local dead = safe(function() return p["PlayerDead?"] end, false)
+                if dead then
+                    st.died = true
+                elseif st.pawn ~= addr then
+                    -- a new body for this joiner: a reconnect gets its things back,
+                    -- a respawn after death starts over
+                    st.pawn, st.ready, st.lastSave = addr, false, now
+                    if st.died and not PJ.testReconnect then
+                        st.died = false; st.ready = true
+                        log("PJ: " .. id .. " respawned after dying - starting fresh")
+                    elseif PJ.readMeta(id) then
+                        st.died = false
+                        st.loadAt = now + 8   -- let the game set the new body's inventory up first
+                        st.tries = 0
+                    else
+                        st.ready = true
+                        log("PJ: " .. id .. " has no save yet")
+                    end
+                elseif st.loadAt and now >= st.loadAt then
+                    local m = PJ.readMeta(id) or {}
+                    local _, nc = PJ.itemCount(p)
+                    if nc < (tonumber(m.containers) or 1) and now < st.loadAt + 20 then goto continue end   -- inventory not built yet
+                    st.loadAt = nil
+                    local ok, n = PJ.load(p, id)
+                    log(("PJ: loaded %s's save (%s containers) -> %s"):format(id, tostring(n), tostring(ok)))
+                    st.readyAt = now + 4
+                    st.want = tonumber(m.items)
+                elseif st.readyAt and now >= st.readyAt then
+                    local have = PJ.itemCount(p)
+                    st.tries = (st.tries or 0) + 1
+                    if st.want and have < st.want and st.tries < 3 then
+                        log(("PJ: %s has %d of %d items after loading - trying again"):format(id, have, st.want))
+                        st.loadAt, st.readyAt = now + 2, nil
+                    else
+                        st.readyAt, st.ready = nil, true
+                        log(("PJ: %s now has %d items (save had %s)"):format(id, have, tostring(st.want)))
+                        if have > 0 then pcall(dnNotify, "Welcome back - your things were restored", p) end
+                    end
+                elseif st.ready and not DN.isDown(p) and now - (st.lastSave or 0) >= 30 then
+                    st.lastSave = now
+                    local ok, n, items = PJ.save(p, id)
+                    if not PJ.said[id] or PJ.said[id] ~= items then
+                        PJ.said[id] = items
+                        log(("PJ: saved %s (%s containers, %s items) -> %s"):format(id, tostring(n), tostring(items), tostring(ok)))
+                    end
+                end
+            end
+        end
+        ::continue::
+    end
+end
+-- joiner: tell the host who we are (repeat until the name sticks)
+PJ.clientTick = function()
+    PJ.t = PJ.t + 1
+    if PJ.t % 5 ~= 0 then return end
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    if not dnValid(me) then return end
+    local want = PJ.myId()
+    local ps = safe(function() return pc.PlayerState end, nil)
+    local cur = dnValid(ps) and safe(function() return ps:GetPlayerName():ToString() end, "") or ""
+    if cur ~= want then
+        local ok = pcall(function() pc:ServerChangeName(want) end)
+        if not PJ.named then PJ.named = true; log("PJ: told the host my id " .. want .. " -> " .. tostring(ok)) end
+    end
+end
 
 -- Auto mode. Driving two game windows by hand (or by remote control) is slow
 -- and flaky: the console ignores pasted text, the game grabs the mouse, and
@@ -3956,6 +4537,164 @@ do
     -- Downed test: zombies put the client down, the host crouches next to it
     -- to revive; then down again and left to bleed out (shortened to 20s),
     -- checking the host keeps its own character afterwards.
+    -- Door test: host and joiner stand at the nearest local-only door. Host
+    -- toggles it (joiner should see it move), then the joiner toggles it
+    -- (host should get the forward and follow).
+    A.doorTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local hp, cp = myPawn(), z.p
+        if z.t == 3 then
+            local counts = {}
+            for _, a in ipairs(DR.all()) do local cn = className(a); counts[cn] = (counts[cn] or 0) + 1 end
+            local parts = {}
+            for k, v in pairs(counts) do parts[#parts + 1] = k .. "=" .. v end
+            alog("DOOR census: " .. (#parts > 0 and table.concat(parts, " ") or "none loaded"))
+            local hl = safe(function() return hp:K2_GetActorLocation() end, nil)
+            z.door, z.dd = DR.nearest(hl, true, "BP_LockedDoor_C")
+            if not z.door then alog("DOOR: FAIL no door found"); z.res = "nodoor"; z.t = 1000; return end
+            alog(("DOOR: target %s %.0f away, open=%s pose: %s"):format(className(z.door), z.dd, tostring(DR.isOpen(z.door)), DR.pose(z.door)))
+        elseif z.t == 5 then
+            local dl = safe(function() return z.door:K2_GetActorLocation() end, nil)
+            local fwd = safe(function() return z.door:GetActorForwardVector() end, { X = 1, Y = 0, Z = 0 })
+            if dl then
+                local dest = { X = dl.X + fwd.X * 250, Y = dl.Y + fwd.Y * 250, Z = dl.Z + 100 }
+                pcall(function() hp:K2_TeleportTo(dest, hp:K2_GetActorRotation()) end)
+                pcall(function() cp:K2_TeleportTo({ X = dest.X + 80, Y = dest.Y + 80, Z = dest.Z }, cp:K2_GetActorRotation()) end)
+                alog("DOOR: host + joiner moved to the door")
+            end
+        elseif z.t == 10 then
+            DR.makeRep(z.door)
+        elseif z.t == 14 then
+            z.before = DR.pose(z.door)
+            local ok = DR.toggle(z.door, hp)
+            alog(("DOOR: host toggles it -> %s"):format(tostring(ok)))
+        elseif z.t == 18 then
+            alog(("DOOR: host after its toggle open=%s pose: %s"):format(tostring(DR.isOpen(z.door)), DR.pose(z.door)))
+            fwrite("sdmp_phase.txt", "door1")
+        elseif z.t == 30 then
+            alog(("DOOR: host after joiner's toggle open=%s pose: %s (forwards received=%d)"):format(tostring(DR.isOpen(z.door)), DR.pose(z.door), DR.rx))
+            z.res = DR.rx > 0 and "forward-ok" or "no-forward"
+        elseif z.t == 34 then
+            alog("DOOR RESULT: " .. tostring(z.res))
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    A.doorClient = function()
+        local ph = fread("sdmp_phase.txt") or ""
+        if ph:find("door1") and not A.dc1 then
+            A.dc1 = true
+            local me = myPawn()
+            local d = DR.nearest(safe(function() return me:K2_GetActorLocation() end, nil), true, "BP_LockedDoor_C")
+            if not d then alog("DOOR(client): no door near me"); return end
+            alog(("DOOR(client): sees %s open=%s pose: %s role=%s"):format(className(d), tostring(DR.isOpen(d)), DR.pose(d),
+                tostring(safe(function() return d:GetLocalRole() end, "?"))))
+            gameDelay(3000, function()
+                local ok = pcall(function() d:Event_Door() end)   -- as if the joiner pressed E
+                if not ok then ok = pcall(function() d:Event_Door(me) end) end
+                alog("DOOR(client): toggled it locally -> " .. tostring(ok))
+                gameDelay(6000, function()
+                    alog(("DOOR(client): 6s after own toggle open=%s pose: %s"):format(tostring(DR.isOpen(d)), DR.pose(d)))
+                end)
+            end)
+        end
+    end
+    -- Joiner-save probe: what the inventory looks like and what the Jig
+    -- save/load/add functions want.
+    A.persistTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        PJ.enabled = true
+        local cp = z.p
+        if z.t == 6 then
+            local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+            for _, f in ipairs({ "AddNewItemSomewhere", "JigTryAddItemSomewhere", "GetContainerItems", "Save One Jig ContainerByIndex",
+                                 "ReplaceLoadJigComponentByIndex", "SERVER_RequestLoadReplaceOneContainerByIndex",
+                                 "SERVER_RequestSaveOneJigContainerByIndex", "SaveMultipleJigContainersByIndexes", "GetTotalCountOfItem" }) do
+                alog("PJ sig " .. f .. ": " .. PR.sig(J .. f))
+            end
+            local jig = safe(function() return cp.BP_JigMultiplayer end, nil)
+            local hp = myPawn()
+            local hjig = safe(function() return hp.BP_JigMultiplayer end, nil)
+            alog("PJ MainJigContainers struct: " .. PR.structOf(jig, "MainJigContainers"))
+            local mc = safe(function() return jig.MainJigContainers end, nil)
+            local hmc = safe(function() return hjig.MainJigContainers end, nil)
+            alog(("PJ joiner containers=%s host containers=%s"):format(tostring(mc and #mc), tostring(hmc and #hmc)))
+            local ps = safe(function() return cp.PlayerState end, nil)
+            alog("PJ joiner PlayerName=" .. tostring(safe(function() return ps:GetPlayerName():ToString() end, "?")))
+            -- one level down: the item struct inside a container
+            pcall(function()
+                local c1 = hmc[1]
+                local names = {}
+                for _, k in ipairs({ "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B", "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332" }) do
+                    local v = safe(function() return c1[k] end, nil)
+                    names[#names + 1] = k:sub(1, 20) .. "=" .. (type(v) == "userdata" and (safe(function() return tostring(#v) end, "obj")) or tostring(v))
+                end
+                alog("PJ host container[1]: " .. table.concat(names, " "))
+            end)
+        elseif z.t >= 8 and z.t < 30 and not z.id then
+            z.id = PJ.idOf(cp)
+            if not z.id then return end
+            z.gaveAt = z.t
+            local da = safe(function() return StaticFindObject("/Game/Inventory/Items/DataAssets/Weapons/Melee/2Handed/DA_Crowbar.DA_Crowbar") end, nil)
+            local jig = safe(function() return cp.BP_JigMultiplayer end, nil)
+            local before = PJ.itemCount(cp)
+            local tries = {
+                function() jig:AddNewItemSomewhere(da, 1, da, 0, false, false, false, nil, nil) end,
+                function() jig:AddNewItemSomewhere(da, 1, da, 0, false) end,
+                function() jig:JigTryAddItemSomewhere(jig, da, 1, false, nil) end,
+                function() jig:JigTryAddItemSomewhere(jig, da, 1) end,
+            }
+            local ok, err
+            for ti, f in ipairs(tries) do
+                ok, err = pcall(f)
+                alog(("PJ give try %d -> %s %s"):format(ti, tostring(ok), tostring(err or ""):sub(-110)))
+                if ok then break end
+            end
+            alog(("PJ id=%s crowbar=%s give -> %s %s; items %d -> %d"):format(tostring(z.id), tostring(da ~= nil and da:IsValid()),
+                tostring(ok), tostring(err or ""):sub(1, 150), before, (PJ.itemCount(cp))))
+        elseif z.id and not z.savedAt and z.t >= z.gaveAt + 2 then
+            z.savedAt = z.t
+            if not z.id then alog("PJ: FAIL joiner never sent its id"); z.t = 200; return end
+            local ok, n, items = PJ.save(cp, z.id)
+            z.saved = items
+            alog(("PJ: test save -> %s (%s containers, %s items)"):format(tostring(ok), tostring(n), tostring(items)))
+        elseif z.savedAt and z.t == z.savedAt + 2 then
+            -- stand-in for leaving and coming back: kill the joiner, it respawns
+            -- in a fresh empty body, and the save should be loaded into that
+            PJ.testReconnect = true
+            DN.allowKill[cp:GetAddress()] = true
+            pcall(function() cp.bCanBeDamaged = true end)
+            pcall(function() StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(cp, 1000.0, nil, nil, nil) end)
+            alog("PJ: joiner killed to get a fresh body")
+        elseif z.savedAt and z.t > z.savedAt + 3 and z.t < 90 and not z.done then
+            for _, p in ipairs(FindAllOf("BP_PlayerCharacter_C") or {}) do
+                if dnValid(p) and p:GetAddress() ~= cp:GetAddress() and not safe(function() return p:IsLocallyControlled() end, true)
+                   and dnValid(safe(function() return p.Controller end, nil)) then
+                    local st = PJ.st[z.id] or {}
+                    if st.ready and st.pawn == p:GetAddress() then
+                        local n = PJ.itemCount(p)
+                        alog(("PJ RESULT: saved %s items, fresh body now has %d -> %s"):format(tostring(z.saved), n, n == z.saved and "PASS" or "FAIL"))
+                        pcall(CS.dumpSlots, "host after load")
+                        z.done = true; z.endAt = z.t + 6
+                    end
+                end
+            end
+        elseif (z.done and z.t >= z.endAt) or z.t >= 90 then
+            if not z.done then alog("PJ RESULT: FAIL no reload within 90s" .. (z.id and "" or " (no id from joiner)")) end
+            alog("PJ done")
+            PJ.testReconnect = false
+            fwrite("sdmp_done.txt", "1")
+            z.t = 1000
+        end
+    end
+    -- crouch the way the player's key does: the server RPC, not Crouch()
+    A.realCrouch = function(p, on)
+        local fn = on and "Svr_Crouch" or "Svr_UnCrouch"
+        local ok = pcall(function() p[fn](p) end)
+        if not ok then pcall(function() if on then p:Crouch(false) else p:UnCrouch(false) end end) end
+        return ok
+    end
     A.dTick = function()
         local z = A.ztest
         z.t = z.t + 1
@@ -3984,15 +4723,30 @@ do
             if l then pcall(function() cp:K2_TeleportTo({ X = l.X + 120, Y = l.Y, Z = l.Z + 30 }, cp:K2_GetActorRotation()) end) end
         end
         local down = z.ph ~= "end" and DN.isDown(cp)
+        if z.t == 6 then   -- friendly fire: the host hits the joiner, it should bounce off
+            local before = safe(function() return cp.MedicalComponent.Health end, -1)
+            local hpc = dnLocalPC()
+            pcall(function()
+                StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(cp, 40.0, hpc, hp, nil)
+            end)
+            local after = safe(function() return cp.MedicalComponent.Health end, -1)
+            z.ffBlocked = (before == after)
+            alog(("DT: host hits joiner for 40: health %s -> %s (friendly fire blocked=%s)"):format(tostring(before), tostring(after), tostring(z.ffBlocked)))
+        end
         if z.ph == "down1" or z.ph == "down2" then
             if down then
                 alog(("DT: client DOWN at %ds (phase %s), health=%s"):format(z.t, z.ph, tostring(safe(function() return cp.MedicalComponent.Health end, "?"))))
-                toHost()
+                if z.ph == "down1" then toHost() else
+                    -- bleed-out run: keep the host well away, standing next to a
+                    -- downed partner revives them now
+                    local l = safe(function() return hp:K2_GetActorLocation() end, nil)
+                    if l then pcall(function() cp:K2_TeleportTo({ X = l.X + 1500, Y = l.Y, Z = l.Z + 30 }, cp:K2_GetActorRotation()) end) end
+                end
                 z.pt = z.t
                 z.since = nil
                 if z.ph == "down1" then
                     z.ph = "revive"
-                    pcall(function() hp:Crouch(false) end)
+                    alog("DT: host just stands next to the joiner (no crouch) to revive")
                 else
                     z.ph = "bleed"
                 end
@@ -4009,19 +4763,48 @@ do
                 if (z.t - z.since) % 5 == 0 then alog("DT: no zombie hit yet - test damages the client itself -> " .. tostring(ok)) end
             end
         elseif z.ph == "revive" then
-            if not safe(function() return hp.bIsCrouched end, false) then pcall(function() hp:Crouch(false) end) end
             if not down then
                 alog(("DT: client REVIVED after %ds, health=%s"):format(z.t - z.pt,
                     tostring(safe(function() return cp.MedicalComponent.Health end, "?"))))
                 z.revived = true
-                pcall(function() hp:UnCrouch(false) end)
-                DN.BLEED = 20
-                z.ph, z.pt = "down2", z.t
+                A.realCrouch(hp, false)
+                z.ph, z.pt = "hostdown", z.t
             elseif z.t - z.pt > 20 then
                 alog("DT: FAIL revive didn't finish in 20s")
-                pcall(function() hp:UnCrouch(false) end)
-                DN.BLEED = 20
-                z.ph, z.pt = "down2", z.t
+                A.realCrouch(hp, false)
+                z.ph, z.pt = "hostdown", z.t
+            end
+        elseif z.ph == "hostdown" then
+            -- the other way round: the HOST goes down and the joiner revives
+            -- it with its own crouch key (client side watches for this)
+            local hdown = DN.isDown(hp)
+            if z.t - z.pt == 3 then
+                toHost()
+                pcall(function() hp.bCanBeDamaged = true end)
+                pcall(function() cp.bCanBeDamaged = false end)   -- zombies mustn't kill the reviver mid-test
+                local ok = pcall(function()
+                    StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(hp, 1000.0, nil, nil, nil)
+                end)
+                alog(("DT: hitting the host for 1000 -> %s, host down=%s"):format(tostring(ok), tostring(DN.isDown(hp))))
+            elseif z.t - z.pt > 3 then
+                if hdown then z.hostWasDown = true end
+                if z.hostWasDown and not hdown then
+                    alog(("DT: HOST REVIVED by the joiner after %ds, health=%s"):format(z.t - z.pt - 3,
+                        tostring(safe(function() return hp.MedicalComponent.Health end, "?"))))
+                    z.hostRevived = true
+                end
+                if z.hostRevived or z.t - z.pt > 30 then
+                    if not z.hostRevived then alog("DT: FAIL host wasn't revived in 27s (was down=" .. tostring(z.hostWasDown) .. ")") end
+                    if DN.isDown(hp) then   -- don't leave the host to bleed out
+                        local k = hp:GetAddress(); local d = DN.down[k]
+                        DN.down[k] = nil; if d then dnRestoreMove(hp, d) end
+                        dnSetHealth(hp, DN.UP_HP); dnPublish(hp, 0)
+                    end
+                    pcall(function() hp.bCanBeDamaged = false end)
+                    pcall(function() cp.bCanBeDamaged = true end)
+                    DN.BLEED = 20
+                    z.ph, z.pt = "down2", z.t
+                end
             end
         elseif z.ph == "bleed" then
             if not down then
@@ -4060,28 +4843,79 @@ do
                             end
                             alog(("DT: client RESPAWNED %ds after death, %.0f from host, health=%s"):format(z.t - z.pt, dist,
                                 tostring(safe(function() return np.MedicalComponent.Health end, "?"))))
-                            z.ph, z.pt = "end", z.t
+                            z.ph, z.pt = "hostdeath", z.t
                         end
                     end
                 end
             end
             if z.ph == "respawn" and z.t - z.pt > 30 then alog("DT: FAIL no respawn next to the host within 30s"); z.ph, z.pt = "end", z.t end
         end
+        if z.ph == "hostdeath" then
+            -- the host dies for real (nobody can revive it) and uses the game's
+            -- own Respawn: it must come back in a new body, joiner untouched
+            local dt = z.t - z.pt
+            if dt == 2 then
+                z.oldHost = hp:GetAddress()
+                pcall(function() hp.bCanBeDamaged = true end)
+                DN.allowKill[z.oldHost] = true
+                pcall(function() StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(hp, 1000.0, nil, nil, nil) end)
+                alog("DT: killing the host for real")
+            elseif dt == 14 then
+                local pc = dnLocalPC()
+                local cur = pc and safe(function() return pc.Pawn end, nil)
+                local live = dnValid(cur) and not safe(function() return cur["PlayerDead?"] end, false) and cur:GetAddress() ~= z.oldHost
+                z.hostNotAutoRestarted = not live
+                alog(("DT: 12s after host death: host body %s (should still be dead, waiting on its Respawn button)"):format(live and "ALREADY REPLACED" or "dead/none"))
+                local gi = safe(function() return UEHelpers.GetGameInstance() end, nil)
+                local ok, err = pcall(function() gi:Survival_Respawn(false) end)
+                alog("DT: host presses Respawn (Survival_Respawn) -> " .. tostring(ok) .. " " .. tostring(err or ""):sub(1, 120))
+            elseif dt == 22 then
+                local pc = dnLocalPC()
+                local cur = pc and safe(function() return pc.Pawn end, nil)
+                z.hostRespawned = dnValid(cur) and cur:GetAddress() ~= z.oldHost and not safe(function() return cur["PlayerDead?"] end, false)
+                local jok = false
+                for _, c in ipairs(FindAllOf("PlayerController") or {}) do
+                    if c:IsValid() and safe(function() return c:IsLocalController() end, true) == false then
+                        local jp = safe(function() return c.Pawn end, nil)
+                        jok = dnValid(jp) and not safe(function() return jp["PlayerDead?"] end, false)
+                    end
+                end
+                z.joinerOkAfterHostDeath = jok
+                alog(("DT: host respawned=%s, joiner still fine=%s"):format(tostring(z.hostRespawned), tostring(jok)))
+                if z.hostRespawned then pcall(function() cur.bCanBeDamaged = false end) end
+                z.ph, z.pt = "end", z.t
+            end
+        end
         if z.ph == "end" and z.t - z.pt == 4 then DN.census("host +4s") end
         if (z.ph == "end" and z.t - z.pt >= 8) or z.t > 240 then
             if not z.reported then
                 z.reported = true
                 if not A.quit then console("god"); alog("DT: host god mode toggled back off") end
-                alog(("DT RESULT: revived=%s bledOut=%s hostKeptCharacter=%s respawnedNextToHost=%s (t=%ds)"):format(
-                    tostring(z.revived or false), tostring(z.bled or false), tostring(z.hostOk), tostring(z.respawned or false), z.t))
+                alog(("DT RESULT: hostDeath=%s ffBlocked=%s revived=%s hostRevivedByJoiner=%s bledOut=%s hostKeptCharacter=%s respawnedNextToHost=%s (t=%ds)"):format(
+                    tostring(z.hostNotAutoRestarted and z.hostRespawned and z.joinerOkAfterHostDeath and "ok" or "FAIL"),
+                    tostring(z.ffBlocked), tostring(z.revived or false), tostring(z.hostRevived or false), tostring(z.bled or false), tostring(z.hostOk), tostring(z.respawned or false), z.t))
                 DN.BLEED = 60
                 fwrite("sdmp_done.txt", "1")
             end
         end
     end
 
+    -- where it's safe to put a joiner: next to a live host, or the last place
+    -- a live host stood
+    A.hostSpot = function()
+        local hp = myPawn()
+        if hp and not safe(function() return hp["PlayerDead?"] end, false) then
+            local l = safe(function() return hp:K2_GetActorLocation() end, nil)
+            if l and math.abs(l.Z) < 200000 and math.abs(l.X) + math.abs(l.Y) > 1000 then
+                A.lastSpot = { X = l.X, Y = l.Y, Z = l.Z }
+                A.lastRot = safe(function() return hp:K2_GetActorRotation() end, { Pitch = 0, Yaw = 0, Roll = 0 })
+            end
+        end
+        return A.lastSpot, A.lastRot or { Pitch = 0, Yaw = 0, Roll = 0 }
+    end
     -- ---------------------------------------------------------------- host
     local function hostTick()
+        pcall(A.hostSpot)
         if A.step == "init" then
             if not A.play or A.pt then
                 fwrite("sdmp_ready.txt", "0"); fwrite("sdmp_done.txt", "0"); fwrite("sdmp_phase.txt", "0"); fwrite("sdmp_htrace.txt", "0")
@@ -4137,9 +4971,9 @@ do
                 end
             end)
             if A.play then
-                alog("hosting - players can join with sdmp_join <this PC's IP>")
+                alog("hosting - friends join with F8 (your IP as join_ip in their config.txt)")
                 pcall(CS.clearPressAnyKey)
-                pcall(dnNotify, "Co-op: you're hosting. Friends join with sdmp_join <your IP> (UDP port 7777)", myPawn())
+                pcall(dnNotify, "Co-op: you're hosting. Friends put your IP in their config.txt and press F8 (UDP port 7777)", myPawn())
                 if A.pt then fwrite("sdmp_ready.txt", "1") end
             else
                 -- test runs shouldn't end with the host dead in a ditch
@@ -4178,6 +5012,10 @@ do
             for _, c in ipairs(listControllers()) do
                 local key = safe(function() return c:GetAddress() end, nil)
                 local p = safe(function() return c.Pawn end, nil)
+                -- never the host's own controller: a dead host is pawnless too, and
+                -- restarting it here put the host in a fresh body behind its own
+                -- death screen (whose Respawn buttons then did nothing)
+                if safe(function() return c:IsLocalController() end, true) then key = nil end
                 if key and not (p and p:IsValid()) then
                     A.seen[key] = (A.seen[key] or 0) + 1
                     local n = A.seen[key]
@@ -4208,15 +5046,17 @@ do
                     -- (players should spawn together for beta anyway), and for
                     -- test runs make them immune server-side; the client's own
                     -- "god" only covers its local copy.
-                    local hp = myPawn()
-                    local hl = hp and safe(function() return hp:K2_GetActorLocation() end, nil)
+                    -- (only to a sane spot: if the host is dead/respawning its body
+                    -- can sit at the origin, and a joiner sent there falls forever)
+                    local hl, rot = A.hostSpot()
                     if hl then
                         local dest = { X = hl.X + 250.0, Y = hl.Y + 150.0, Z = hl.Z + 50.0 }
-                        local rot = safe(function() return hp:K2_GetActorRotation() end, { Pitch = 0, Yaw = 0, Roll = 0 })
                         local ok = safe(function() return p:K2_TeleportTo(dest, rot) end, false)
                         alog(("moved joiner next to host -> %s"):format(tostring(ok)))
+                    else
+                        alog("no safe spot by the host yet - joiner stays where it spawned")
                     end
-                    if (A.test == "zombie" or A.test == "downed") and not A.ztest then
+                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -4300,7 +5140,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then (A.test == "downed" and A.dTick or A.zTick)() end
+            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
@@ -4413,7 +5253,7 @@ do
                 A.step, A.t = "playing", 0
                 return
             end
-            if A.test == "zombie" or A.test == "downed" then
+            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -4557,7 +5397,23 @@ do
         elseif A.step == "zwait" then
             A.t = A.t + 1
             if A.test == "downed" and A.t % 6 == 0 then DN.census("client t=" .. A.t) end
+            if A.test == "downed" then
+                local me = myPawn()
+                local ml = me and safe(function() return me:K2_GetActorLocation() end, nil)
+                local want = false
+                for _, o in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+                    if dnValid(o) and me and o:GetAddress() ~= me:GetAddress() and dnState(o) ~= "up" then
+                        local ol = safe(function() return o:K2_GetActorLocation() end, nil)
+                        if ml and ol and math.sqrt((ol.X - ml.X)^2 + (ol.Y - ml.Y)^2) < 400 then want = true end
+                    end
+                end
+                if want and not A.cRev then alog("DT(client): partner down next to me - crouching via Svr_Crouch -> " .. tostring(A.realCrouch(me, true))) end
+                if want and A.t % 3 == 0 and not DN.isCrouching(me) then A.realCrouch(me, true) end
+                if not want and A.cRev then alog("DT(client): partner back up - uncrouch"); A.realCrouch(me, false) end
+                A.cRev = want
+            end
             if A.t == 20 or A.t == 40 then pcall(CS.dumpSlots, "client t=" .. A.t) end
+            if A.test == "door" then pcall(A.doorClient) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0
@@ -4718,6 +5574,7 @@ do
             pcall(function() local f = io.open(LOGF.path, "w"); if f then f:close() end end)
         end
         A.auto = cl:find("%-sdmpauto") ~= nil
+        if A.auto or A.role then LOGF.verbose = true end
         A.quit = cl:find("%-sdmpquit") ~= nil
         A.test = cl:match("%-sdmptest=(%a+)")
         -- co-op straight from the command line (shortcuts, playtest.bat)
@@ -4787,6 +5644,75 @@ do
             return true
         end
         ExecuteInGameThread(function() startPlay("client", addr) end)
+        return true
+    end)
+
+    -- Settings file next to the mod (made with defaults the first time):
+    --   join_ip         who F8 joins
+    --   friendly_fire   players can hurt each other (default off)
+    --   bleed_out_seconds / revive_seconds
+    local CFG_DEFAULT = [[
+# SurrounDead Co-op settings. Lines starting with # are ignored.
+#
+# In the main menu: F7 = host a game, F8 = join the game at join_ip.
+# The host needs UDP port 7777 forwarded on their router (or use a LAN /
+# virtual LAN like Radmin VPN, ZeroTier or Tailscale and put that IP here).
+
+# IP address of the friend you're joining (add :port if they changed it)
+join_ip=127.0.0.1
+
+# can players hurt each other?
+friendly_fire=false
+
+# seconds a downed player has before bleeding out, and how long a revive takes
+bleed_out_seconds=60
+revive_seconds=5
+
+# extra logging for bug reports (sdmp_host.log / sdmp_client.log)
+debug=false
+]]
+    A.cfg = { join_ip = "127.0.0.1", friendly_fire = "false", bleed_out_seconds = "60", revive_seconds = "5" }
+    local function loadCfg()
+        local txt = fread("config.txt")
+        if not txt then fwrite("config.txt", CFG_DEFAULT); txt = CFG_DEFAULT end
+        for line in txt:gmatch("[^\r\n]+") do
+            local k, v = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+            if k and not line:match("^%s*#") then A.cfg[k] = v end
+        end
+        DN.friendlyFire = (A.cfg.friendly_fire or ""):lower() == "true"
+        if (A.cfg.debug or ""):lower() == "true" then LOGF.verbose = true end
+        PJ.enabled = (A.cfg.joiner_saves or ""):lower() == "true"
+        DN.BLEED = tonumber(A.cfg.bleed_out_seconds) or 60
+        DN.REVIVE = tonumber(A.cfg.revive_seconds) or 5
+        log(("settings: join_ip=%s friendly_fire=%s bleed_out=%ds revive=%ds"):format(
+            tostring(A.cfg.join_ip), tostring(DN.friendlyFire), DN.BLEED, DN.REVIVE))
+    end
+    pcall(loadCfg)
+    A.loadCfg = loadCfg
+    local function inMenu()
+        local pc = dnLocalPC()
+        return not dnValid(pc and safe(function() return pc.Pawn end, nil))
+    end
+    RegisterKeyBind(Key.F7, function()
+        ExecuteInGameThread(function()
+            if A.looping then log("SDMP: co-op is already running"); return end
+            if not inMenu() then log("SDMP: F7 hosts from the main menu"); return end
+            pcall(loadCfg)
+            startPlay("host", nil)
+        end)
+    end)
+    RegisterKeyBind(Key.F8, function()
+        ExecuteInGameThread(function()
+            if A.looping then log("SDMP: co-op is already running"); return end
+            if not inMenu() then log("SDMP: F8 joins from the main menu"); return end
+            pcall(loadCfg)
+            local ip = A.cfg.join_ip
+            if not ip or ip == "" then log("SDMP: set join_ip in config.txt first"); return end
+            startPlay("client", ip)
+        end)
+    end)
+    RegisterConsoleCommandHandler("sdmp_reload", function()
+        ExecuteInGameThread(function() pcall(loadCfg) end)
         return true
     end)
 

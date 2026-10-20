@@ -7,6 +7,7 @@ REM
 REM Pass "stay" to keep both windows open afterwards:  test.bat stay
 REM Pass "zombie" for the zombie-damage test:          test.bat zombie
 REM Pass "downed" for the downed / revive test:         test.bat downed
+REM Pass "door" for the door sync test:                 test.bat door
 REM (either order, e.g. test.bat zombie stay)
 
 set GAME=C:\Program Files (x86)\Steam\steamapps\common\SurrounDead\SurrounDead\Binaries\Win64
@@ -19,6 +20,19 @@ if /I "%1"=="zombie" set TEST=-sdmptest=zombie
 if /I "%2"=="zombie" set TEST=-sdmptest=zombie
 if /I "%1"=="downed" set TEST=-sdmptest=downed
 if /I "%2"=="downed" set TEST=-sdmptest=downed
+if /I "%1"=="door" set TEST=-sdmptest=door
+if /I "%2"=="door" set TEST=-sdmptest=door
+if /I "%1"=="persist" set TEST=-sdmptest=persist
+if /I "%2"=="persist" set TEST=-sdmptest=persist
+
+REM no test named: the old scripted-movement run is retired (it crashed the
+REM client), so just say what to run
+if "%TEST%"=="" (
+  echo Usage: test.bat zombie^|downed^|door^|persist [stay]
+  echo Or double-click zombietest / downedtest / doortest / persisttest / playtest.
+  pause
+  exit /b 1
+)
 
 REM clear the handoff files from the last run
 echo 0> "%GAME%\ue4ss\Mods\SDMPDiag\sdmp_ready.txt"
