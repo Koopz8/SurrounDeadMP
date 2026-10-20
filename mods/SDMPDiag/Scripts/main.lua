@@ -2731,8 +2731,38 @@ local function clothingDrain()
     end
     if #CS.queue == 0 then log("CS: clothing resend sent") end
 end
+-- Equipped gear (cap, mask, backpack, weapons, flashlight) are item actors the
+-- game attaches to the character, spawned with replication OFF - single-player
+-- never needed them on the network, so nobody else ever sees them. While
+-- co-op is running the host turns replication on for anything attached to a
+-- player; Unreal then sends the actor along with its attachment.
+CS.gearDone = CS.gearDone or {}
+local function gearReplicate()
+    local n = 0
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) then
+            local list = {}
+            pcall(function() p.Children:ForEach(function(_, e) list[#list + 1] = e:get() end) end)
+            for _, a in ipairs(list) do
+                if dnValid(a) then
+                    local k = safe(function() return a:GetAddress() end, 0)
+                    if not CS.gearDone[k] and safe(function() return a.bReplicates end, true) == false
+                       and dnValid(safe(function() return a:GetAttachParentActor() end, nil))
+                       and className(a):find("Pickup") then
+                        CS.gearDone[k] = true
+                        local ok = pcall(function() a:SetReplicates(true) end)
+                        n = n + 1
+                        if n <= 12 then log(("GEAR: replicating %s on %X -> %s"):format(className(a), safe(function() return p:GetAddress() end, 0), tostring(ok))) end
+                    end
+                end
+            end
+        end
+    end
+end
 local function clothingSync()
     clothingDrain()
+    CS.gt = (CS.gt or 0) + 1
+    if CS.gt % 8 == 0 and dnCoop() then pcall(gearReplicate) end   -- every 2s
     local now = os.time()
     for _, c in ipairs(listControllers()) do
         if safe(function() return c:IsLocalController() end, true) == false then
@@ -2792,6 +2822,35 @@ CS.dumpSlots = function(tag)
         end
     end
 end
+
+-- What's hanging off each player (equipped cap, backpack, weapons are actors
+-- the game SetOwner()s to the character, so they show up in Children).
+CS.gearCensus = function(tag)
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) then
+            local items = {}
+            pcall(function()
+                p.Children:ForEach(function(_, e)
+                    local a = e:get()
+                    if dnValid(a) then
+                        local par = safe(function() return a:GetAttachParentActor() end, nil)
+                        items[#items + 1] = ("%s[rep=%s hidden=%s attached=%s]"):format(className(a),
+                            tostring(safe(function() return a.bReplicates end, "?")),
+                            tostring(safe(function() return a.bHidden end, "?")),
+                            tostring(dnValid(par)))
+                    end
+                end)
+            end)
+            log(("GEAR %s %X role=%s: %s"):format(tag, safe(function() return p:GetAddress() end, 0),
+                tostring(safe(function() return p:GetLocalRole() end, "?")),
+                #items > 0 and table.concat(items, ", ") or "nothing"))
+        end
+    end
+end
+RegisterConsoleCommandHandler("sdmp_gear", function()
+    ExecuteInGameThread(function() pcall(CS.gearCensus, "console") end)
+    return true
+end)
 
 RegisterConsoleCommandHandler("sdmp_clothes", function()
     ExecuteInGameThread(function() pcall(clothingResend, "console") end)
@@ -3666,7 +3725,10 @@ do
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
                     end
-                    if A.play then pcall(dnNotify, "A player joined", myPawn()) end
+                    if A.play then
+                        pcall(dnNotify, "A player joined", myPawn())
+                        ExecuteWithDelay(20000, function() ExecuteInGameThread(function() pcall(CS.gearCensus, "host") end) end)
+                    end
                     -- (config dumps done - nothing differed)
                 end
             end
@@ -3944,6 +4006,7 @@ do
         elseif A.step == "playing" then
             -- nothing to drive; just notice if we lose the host
             A.t = A.t + 1
+            if A.t == 20 then pcall(CS.gearCensus, "client") end
             if not myPawn() then
                 A.lost = (A.lost or 0) + 1
                 if A.lost == 15 then alog("no pawn for 15s - disconnected?") end
