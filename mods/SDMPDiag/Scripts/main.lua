@@ -2516,6 +2516,45 @@ local function dnRestoreMove(p, d)
     if d.jump then pcall(function() cmc.JumpZVelocity = d.jump end) end
 end
 
+-- The death sequence calls GetPlayerController(0)...ResetPassiveSkills() - on
+-- the host that resets the HOST's passive skills whenever a joiner dies.
+-- Snapshot them just before a joiner's death and put them back after.
+local function dnHostSkills()
+    local pc = dnLocalPC()
+    DN.psCls = DN.psCls or StaticFindObject("/Game/Blueprints/Components/PassiveSkillsComponent.PassiveSkillsComponent_C")
+    if not (dnValid(pc) and dnValid(DN.psCls)) then return nil end
+    local comp = safe(function() return pc:GetComponentByClass(DN.psCls) end, nil)
+    return dnValid(comp) and comp or nil
+end
+DN.guardHostSkills = function(why)
+    local comp = dnHostSkills()
+    if not comp then return end
+    local vals = {}
+    pcall(function()
+        DN.psCls:ForEachProperty(function(prop)
+            local n = safe(function() return prop:GetFName():ToString() end, nil)
+            if n then
+                local v = safe(function() return comp[n] end, nil)
+                if type(v) == "number" or type(v) == "boolean" then vals[n] = v end
+            end
+        end)
+    end)
+    local function restore(tag)
+        local c = dnHostSkills()
+        if not c then return end
+        local changed = 0
+        for n, v in pairs(vals) do
+            if safe(function() return c[n] end, v) ~= v then
+                pcall(function() c[n] = v end)
+                changed = changed + 1
+            end
+        end
+        if changed > 0 then log(("DN: put back %d of the host's passive skill values (%s, %s)"):format(changed, why, tag)) end
+    end
+    gameDelay(300, function() restore("0.3s") end)
+    gameDelay(2000, function() restore("2s") end)
+end
+
 local function dnBleedOut(key, d)
     local p = d.p
     DN.down[key] = nil
@@ -2524,6 +2563,7 @@ local function dnBleedOut(key, d)
     local pc = dnLocalPC()
     local hostPawn = pc and safe(function() return pc.Pawn end, nil)
     log("DN: " .. className(p) .. " bled out")
+    if safe(function() return p:IsLocallyControlled() end, true) == false then pcall(DN.guardHostSkills, "joiner bled out") end
     DN.allowKill[key] = true
     local ok, err = pcall(function()
         StaticFindObject("/Script/Engine.Default__GameplayStatics"):ApplyDamage(p, 1000.0, nil, nil, nil)
@@ -3026,6 +3066,40 @@ local function gearVisualsSweep()
     end
 end
 
+-- Joiner side of dying. The game shows a Respawn screen whose buttons run the
+-- single-player respawn on the host (takes the host's body, wipes its stats),
+-- so joiners never get to click it: take it down, say what's happening, and
+-- when the host hands us a fresh body, set input and HUD up again.
+local RS = { pawn = nil, msgAt = -99, t = 0 }
+local function joinerRespawnSweep()
+    RS.t = RS.t + 0.25
+    for _, cls in ipairs({ "RespawnScreen_C", "ScreenPermadeath_C" }) do
+        for _, w in ipairs(safe(function() return FindAllOf(cls) end, nil) or {}) do
+            if dnValid(w) and safe(function() return w:IsInViewport() end, false) then
+                pcall(function() w:RemoveFromParent() end)
+                log("RS: hid the " .. cls .. " (the host respawns joiners)")
+            end
+        end
+    end
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    if not dnValid(me) or className(me) ~= "BP_PlayerCharacter_C" then return end
+    local addr = safe(function() return me:GetAddress() end, nil)
+    local dead = safe(function() return me["PlayerDead?"] end, false) == true
+    if dead and RS.t - RS.msgAt >= 5 then
+        RS.msgAt = RS.t
+        dnNotify("You died - respawning next to your partner shortly", me)
+    end
+    if RS.pawn and addr and addr ~= RS.pawn and not dead then
+        log("RS: respawned into a new body - fixing input and HUD")
+        pcall(function() pc.bShowMouseCursor = false end)
+        pcall(fixInput2)
+        pcall(buildUI)
+        gameDelay(1500, function() pcall(dnNotify, "You're back - next to your partner", me) end)
+    end
+    if addr then RS.pawn = addr end
+end
+
 -- every machine: look after its own pawn, tell the player what's going on
 local function dnLocalTick()
     local pc = dnLocalPC()
@@ -3106,7 +3180,10 @@ pcall(function()
         end
         local h = dnHealth(a)
         if h and h - d <= 0 then
-            if not dnHasReviver(a) then return end   -- nobody left to revive you: normal death
+            if not dnHasReviver(a) then   -- nobody left to revive you: normal death
+                if safe(function() return a:IsLocallyControlled() end, true) == false then pcall(DN.guardHostSkills, "joiner killed") end
+                return
+            end
             pcall(function() dmg:set(0.0) end)
             dnEnter(a)
         end
@@ -3118,7 +3195,7 @@ gameLoop(250, function()
         -- (spawn-function hooks retired: they found Survival_SpawnPlayer, and running
         -- code from GI hooks during the Entry hop is a crash risk)
         if not worldSettled() then return end
-        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch); pcall(gearVisualsSweep) end
+        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch); pcall(gearVisualsSweep); pcall(joinerRespawnSweep) end
         if dnIsHost() then
             pcall(clothingSync)
             local ok, err = pcall(dnHostTick)
@@ -3739,19 +3816,46 @@ do
                     z.t - z.pt, tostring(safe(function() return cp["PlayerDead?"] end, "?")), tostring(hostOk)))
                 z.bled, z.hostOk = true, hostOk
                 DN.census("host after bleed-out")
-                z.ph, z.pt = "end", z.t
+                z.oldAddr = safe(function() return cp:GetAddress() end, 0)
+                z.ph, z.pt = "respawn", z.t
             elseif z.t - z.pt > 45 then
                 alog("DT: FAIL no bleed-out after 45s")
                 z.ph, z.pt = "end", z.t
             end
         end
+        if z.ph == "respawn" then
+            for _, c in ipairs(FindAllOf("PlayerController") or {}) do
+                if c:IsValid() and safe(function() return c:IsLocalController() end, true) == false then
+                    local np = safe(function() return c.Pawn end, nil)
+                    if np and safe(function() return np:IsValid() end, false) and safe(function() return np:GetAddress() end, 0) ~= z.oldAddr
+                       and not safe(function() return np["PlayerDead?"] end, false) then
+                        local a, b = safe(function() return np:K2_GetActorLocation() end, nil), safe(function() return hp:K2_GetActorLocation() end, nil)
+                        local dist = (a and b) and math.sqrt((a.X - b.X)^2 + (a.Y - b.Y)^2) or -1
+                        if dist >= 0 and dist < 1000 then
+                            z.respawned = true
+                            -- check the host still has its own body now (the re-possess after
+                            -- the joiner's death lands a tick after the death itself)
+                            for _, lc in ipairs(FindAllOf("PlayerController") or {}) do
+                                if lc:IsValid() and safe(function() return lc:IsLocalController() end, false) then
+                                    z.hostOk = safe(function() return lc.Pawn:GetAddress() == hp:GetAddress() end, false)
+                                end
+                            end
+                            alog(("DT: client RESPAWNED %ds after death, %.0f from host, health=%s"):format(z.t - z.pt, dist,
+                                tostring(safe(function() return np.MedicalComponent.Health end, "?"))))
+                            z.ph, z.pt = "end", z.t
+                        end
+                    end
+                end
+            end
+            if z.ph == "respawn" and z.t - z.pt > 30 then alog("DT: FAIL no respawn next to the host within 30s"); z.ph, z.pt = "end", z.t end
+        end
         if z.ph == "end" and z.t - z.pt == 4 then DN.census("host +4s") end
-        if (z.ph == "end" and z.t - z.pt >= 6) or z.t > 220 then
+        if (z.ph == "end" and z.t - z.pt >= 8) or z.t > 240 then
             if not z.reported then
                 z.reported = true
                 if not A.quit then console("god"); alog("DT: host god mode toggled back off") end
-                alog(("DT RESULT: revived=%s bledOut=%s hostKeptCharacter=%s (t=%ds)"):format(
-                    tostring(z.revived or false), tostring(z.bled or false), tostring(z.hostOk), z.t))
+                alog(("DT RESULT: revived=%s bledOut=%s hostKeptCharacter=%s respawnedNextToHost=%s (t=%ds)"):format(
+                    tostring(z.revived or false), tostring(z.bled or false), tostring(z.hostOk), tostring(z.respawned or false), z.t))
                 DN.BLEED = 60
                 fwrite("sdmp_done.txt", "1")
             end
@@ -3862,6 +3966,10 @@ do
                     if n >= 8 and n % 5 == 3 and n <= 60 then
                         local ok, err = pcall(function() c:ServerRestartPlayer() end)
                         local p2 = safe(function() return c.Pawn end, nil)
+                        if not (p2 and safe(function() return p2:IsValid() end, false)) and gm and safe(function() return gm:IsValid() end, false) then
+                            pcall(function() gm:RestartPlayer(c) end)
+                            p2 = safe(function() return c.Pawn end, nil)
+                        end
                         alog(("joiner pawnless %ds: ServerRestartPlayer -> %s, pawn=%s"):format(
                             n, ok and "ok" or tostring(err), (p2 and p2:IsValid()) and className(p2) or "none"))
                         if p2 and p2:IsValid() then netPerf() end
@@ -3890,7 +3998,7 @@ do
                         local ok = safe(function() return p:K2_TeleportTo(dest, rot) end, false)
                         alog(("moved joiner next to host -> %s"):format(tostring(ok)))
                     end
-                    if A.test == "zombie" or A.test == "downed" then
+                    if (A.test == "zombie" or A.test == "downed") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -3907,6 +4015,36 @@ do
                 if rp and safe(function() return rp:IsValid() end, false)
                    and safe(function() return c:IsLocalController() end, true) == false then
                     A.mon("host-copy", rp)
+                end
+            end
+            -- Respawning a dead joiner. The game's own respawn (the joiner's
+            -- Respawn button -> Svr_RequestRespawn -> GameInstance
+            -- Survival_Respawn) is single-player code: it has PLAYER 0 - the
+            -- host - possess the new body and wipes the host's stats. Joiners
+            -- hide that screen instead, and the host respawns them here: free
+            -- the controller from the corpse, GameMode RestartPlayer, and the
+            -- join handling above moves the new body next to the host.
+            A.dead = A.dead or {}
+            for _, c in ipairs(listControllers()) do
+                local key = safe(function() return c:GetAddress() end, nil)
+                local rp = safe(function() return c.Pawn end, nil)
+                if key and safe(function() return c:IsLocalController() end, true) == false
+                   and rp and safe(function() return rp:IsValid() end, false)
+                   and safe(function() return rp["PlayerDead?"] end, false) == true then
+                    A.dead[key] = (A.dead[key] or 0) + 1
+                    if A.dead[key] == 1 then alog("joiner died - respawning them in 10s") end
+                    if A.dead[key] >= 10 then
+                        A.dead[key] = nil
+                        pcall(function() c:UnPossess() end)
+                        local ok, err = pcall(function() gm:RestartPlayer(c) end)
+                        local np = safe(function() return c.Pawn end, nil)
+                        alog(("respawned joiner: RestartPlayer -> %s, pawn=%s"):format(ok and "ok" or tostring(err),
+                            (np and safe(function() return np:IsValid() end, false)) and className(np) or "none"))
+                        if A.handled then A.handled[key] = nil end   -- move the new body next to the host
+                        if A.seen then A.seen[key] = 0 end
+                    end
+                elseif key then
+                    A.dead[key] = nil
                 end
             end
             if A.play then return end   -- the rest is test-run plumbing
