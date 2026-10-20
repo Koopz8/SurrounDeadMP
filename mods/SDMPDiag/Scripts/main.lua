@@ -2455,6 +2455,7 @@ local function dnState(p)  -- read the replicated state off any pawn
     local ps = safe(function() return p.PlayerState end, nil)
     if not dnValid(ps) then return "up", 0 end
     local sc = safe(function() return ps.Score end, 0) or 0
+    if sc >= 10000 then return "up", 0 end   -- host carrying time of day (see TOD)
     if sc >= 1000 then return "reviving", sc - 1000 end
     if sc >= 100 then return "down", sc - 100 end
     return "up", 0
@@ -2985,6 +2986,38 @@ RegisterConsoleCommandHandler("sdmp_widgets", function()
     ExecuteInGameThread(function() pcall(CS.widgetCensus, "console") end)
     return true
 end)
+-- Sky / weather state (hunting time-of-day sync: host at night, joiner by day)
+CS.skyCensus = function(tag)
+    for _, cn in ipairs({ "Ultra_Dynamic_Sky_C", "Ultra_Dynamic_Weather_C" }) do
+        for _, a in ipairs(safe(function() return FindAllOf(cn) end, nil) or {}) do
+            if dnValid(a) then
+                local vals = {}
+                local cls = safe(function() return a:GetClass() end, nil)
+                pcall(function()
+                    cls:ForEachProperty(function(prop)
+                        local n = safe(function() return prop:GetFName():ToString() end, "")
+                        local ln = n:lower()
+                        if ln:find("time") or ln:find("rep") or ln:find("network") or ln:find("multiplayer")
+                           or ln:find("server") or ln:find("authority") or ln:find("day") or ln:find("simulat")
+                           or ln:find("weather") or ln:find("speed") or ln:find("cycle") then
+                            local v = safe(function() return a[n] end, nil)
+                            if type(v) == "number" then vals[#vals + 1] = ("%s=%.3f"):format(n, v)
+                            elseif type(v) == "boolean" then vals[#vals + 1] = n .. "=" .. tostring(v)
+                            elseif type(v) == "userdata" and dnValid(v) then vals[#vals + 1] = n .. "=" .. className(v) end
+                        end
+                    end)
+                end)
+                table.sort(vals)
+                log(("SKY %s %s rep=%s role=%s: %s"):format(tag, cn, tostring(safe(function() return a.bReplicates end, "?")),
+                    tostring(safe(function() return a:GetLocalRole() end, "?")), table.concat(vals, " ")))
+            end
+        end
+    end
+end
+RegisterConsoleCommandHandler("sdmp_sky", function()
+    ExecuteInGameThread(function() pcall(CS.skyCensus, "console") end)
+    return true
+end)
 RegisterConsoleCommandHandler("sdmp_gear", function()
     ExecuteInGameThread(function() pcall(CS.gearCensus, "console") end)
     return true
@@ -3100,6 +3133,55 @@ local function joinerRespawnSweep()
     if addr then RS.pawn = addr end
 end
 
+-- Time of day. Each machine runs its own Ultra Dynamic Sky; the plugin's own
+-- replication never reaches joiners (the joiner's sky is a local copy, its
+-- "Replicated Time of Day" sits at the default 900), so the host was at night
+-- while the joiner had daylight. The host publishes its clock through its
+-- PlayerState.Score (always relevant, already our downed channel): 10000 +
+-- time of day (0-2400) while it isn't down. Joiners set their sky to it.
+local TOD = { t = 0, last = nil, logged = 0 }
+local function todSky()
+    for _, a in ipairs(safe(function() return FindAllOf("Ultra_Dynamic_Sky_C") end, nil) or {}) do
+        if dnValid(a) then return a end
+    end
+    return nil
+end
+local function todHostTick()
+    TOD.t = TOD.t + 1
+    if TOD.t % 4 ~= 0 then return end   -- once a second
+    if not dnCoop() then return end
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    if not dnValid(me) or DN.isDown(me) then return end
+    local sky = todSky()
+    local tod = sky and safe(function() return sky["Time of Day"] end, nil)
+    if type(tod) == "number" then dnPublish(me, 10000 + math.floor(tod * 10 + 0.5) / 10) end
+end
+local function todClientTick()
+    TOD.t = TOD.t + 1
+    if TOD.t % 4 ~= 0 then return end
+    local tod
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        local ps = dnValid(p) and safe(function() return p.PlayerState end, nil)
+        local sc = dnValid(ps) and safe(function() return ps.Score end, 0) or 0
+        if sc >= 10000 then tod = sc - 10000; break end
+    end
+    if not tod then return end
+    local sky = todSky()
+    if not sky then return end
+    local mine = safe(function() return sky["Time of Day"] end, nil)
+    if type(mine) ~= "number" then return end
+    local diff = math.abs(mine - tod)
+    if diff > 2400 - diff then diff = 2400 - diff end   -- wrap at midnight
+    if diff > 5 then
+        pcall(function() sky["Time of Day"] = tod end)
+        TOD.logged = TOD.logged + 1
+        if TOD.logged <= 3 or diff > 100 then
+            log(("TOD: sky %.0f -> host's %.0f"):format(mine, tod))
+        end
+    end
+end
+
 -- every machine: look after its own pawn, tell the player what's going on
 local function dnLocalTick()
     local pc = dnLocalPC()
@@ -3195,9 +3277,10 @@ gameLoop(250, function()
         -- (spawn-function hooks retired: they found Survival_SpawnPlayer, and running
         -- code from GI hooks during the Entry hop is a crash risk)
         if not worldSettled() then return end
-        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch); pcall(gearVisualsSweep); pcall(joinerRespawnSweep) end
+        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch); pcall(gearVisualsSweep); pcall(joinerRespawnSweep); pcall(todClientTick) end
         if dnIsHost() then
             pcall(clothingSync)
+            pcall(todHostTick)
             local ok, err = pcall(dnHostTick)
             if not ok then log("DN host error: " .. tostring(err)) end
         end
