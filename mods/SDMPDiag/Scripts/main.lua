@@ -26,6 +26,36 @@ local function safe(fn, fallback)
     return fallback
 end
 
+-- Timers that run ON THE GAME THREAD. LoopAsync runs its callback on a worker
+-- thread in the same Lua state the game thread is using for hooks; with
+-- several of those loops going, the state got corrupted ("FindAllOf cannot be
+-- called with 0 parameters") and the host crashed every ~8 minutes. The
+-- installed UE4SS build has the delayed-action API, so use it; fall back to
+-- the old way only if it's missing.
+local HAS_GT_TIMERS = type(LoopInGameThreadWithDelay) == "function" and type(CancelDelayedAction) == "function"
+local function gameLoop(ms, fn)   -- fn returns true to stop
+    if HAS_GT_TIMERS then
+        local h
+        h = LoopInGameThreadWithDelay(ms, function()
+            local ok, stop = pcall(fn)
+            if not ok then print("[SDMP] loop error: " .. tostring(stop) .. "\n") end
+            if ok and stop == true and h then CancelDelayedAction(h) end
+        end)
+        return h
+    end
+    LoopAsync(ms, function()
+        ExecuteInGameThread(function() pcall(fn) end)
+        return false
+    end)
+end
+print("[SDMP] timers: " .. (HAS_GT_TIMERS and "game thread (LoopInGameThreadWithDelay)" or "LoopAsync fallback") .. "\n")
+local function gameDelay(ms, fn)
+    if type(ExecuteInGameThreadWithDelay) == "function" then
+        return ExecuteInGameThreadWithDelay(ms, function() pcall(fn) end)
+    end
+    ExecuteWithDelay(ms, function() ExecuteInGameThread(function() pcall(fn) end) end)
+end
+
 local function className(obj)
     -- a null UObject wrapper isn't nil in Lua, and touching it is a native
     -- crash pcall can't catch, so check IsValid before anything else
@@ -2166,7 +2196,8 @@ local function zombieAnimFix()
     for _, c in ipairs(listControllers()) do
         if safe(function() return c:IsLocalController() end, true) == false then
             local p = safe(function() return c.Pawn end, nil)
-            if p and safe(function() return p:IsValid() end, false) then
+            if p and safe(function() return p:IsValid() end, false)
+               and (safe(function() return p:GetGameTimeSinceCreation() end, 0) or 0) >= 5 then
                 local l = safe(function() return p:K2_GetActorLocation() end, nil)
                 if l then remote[#remote + 1] = { X = l.X, Y = l.Y, Z = l.Z } end
             end
@@ -2212,12 +2243,9 @@ local function zombieAnimFix()
         if not seen[k] then ZF.touched[k] = nil end   -- dead or despawned
     end
 end
-LoopAsync(1000, function()
-    ExecuteInGameThread(function()
-        local ok, err = pcall(zombieAnimFix)
-        if not ok then log("ZF error: " .. tostring(err)) end
-    end)
-    return false
+gameLoop(1000, function()
+    local ok, err = pcall(zombieAnimFix)
+    if not ok then log("ZF error: " .. tostring(err)) end
 end)
 
 -- The attack montage only ever plays on the host (PlayAnimMontage isn't
@@ -2228,6 +2256,20 @@ end)
 -- because the montage's notifies run the hit traces and the hit code has no
 -- authority check - a client swing would otherwise hurt the local copy of the
 -- player (ApplyDamage with 0 does nothing; the blood puff still shows).
+-- Player characters old enough to touch from per-tick code. A character a
+-- moment old (a joiner being spawned and possessed) is where the host has
+-- crashed inside Lua callbacks, so leave it alone for a few seconds.
+local function livePlayers(minAge)
+    local out = {}
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if p and safe(function() return p:IsValid() end, false)
+           and (safe(function() return p:GetGameTimeSinceCreation() end, 0) or 0) >= (minAge or 5) then
+            out[#out + 1] = p
+        end
+    end
+    return out
+end
+
 local ZA = { next = {}, tick = 0, plays = 0, logged = 0, sndErr = false }
 local function zombieSwingMirror()
     if not worldSettled() then return end
@@ -2245,7 +2287,7 @@ local function zombieSwingMirror()
         return
     end
     local players = {}
-    for _, pc in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+    for _, pc in ipairs(livePlayers(5)) do
         if safe(function() return pc:IsValid() end, false) then
             local l = safe(function() return pc:K2_GetActorLocation() end, nil)
             if l then players[#players + 1] = { X = l.X, Y = l.Y, Z = l.Z } end
@@ -2346,12 +2388,9 @@ local function zombieSwingMirror()
         log(("ZA status: players=%d, no BP_MasterZombie_C found"):format(#players))
     end
 end
-LoopAsync(250, function()
-    ExecuteInGameThread(function()
-        local ok, err = pcall(zombieSwingMirror)
-        if not ok then log("ZA error: " .. tostring(err)) end
-    end)
-    return false
+gameLoop(250, function()
+    local ok, err = pcall(zombieSwingMirror)
+    if not ok then log("ZA error: " .. tostring(err)) end
 end)
 
 -- ===========================================================================
@@ -2513,7 +2552,7 @@ local function dnHostTick()
     end
     if not dnCoop() then return end
     local players = {}
-    for _, pc in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+    for _, pc in ipairs(livePlayers(5)) do
         if safe(function() return pc:IsValid() end, false) and not safe(function() return pc["PlayerDead?"] end, false) then
             players[#players + 1] = pc
         end
@@ -2655,7 +2694,7 @@ local function clothingResend(why)
     local smc = StaticFindObject("/Script/Engine.SkeletalMeshComponent")
     if not dnValid(smc) then return end
     local sent, pawns = 0, 0
-    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+    for _, p in ipairs(livePlayers(3)) do
         if dnValid(p) and not safe(function() return p["PlayerDead?"] end, false) then
             pawns = pawns + 1
             local main = safe(function() return p.Mesh:GetAddress() end, 0)
@@ -2739,7 +2778,7 @@ end
 CS.gearDone = CS.gearDone or {}
 local function gearReplicate()
     local n = 0
-    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+    for _, p in ipairs(livePlayers(10)) do
         if dnValid(p) then
             local list = {}
             pcall(function() p.Children:ForEach(function(_, e) list[#list + 1] = e:get() end) end)
@@ -2751,8 +2790,18 @@ local function gearReplicate()
                        and className(a):find("Pickup") then
                         CS.gearDone[k] = true
                         local ok = pcall(function() a:SetReplicates(true) end)
+                        -- attach offsets (the bat's -90 pitch) only travel reliably
+                        -- with movement replication on
+                        pcall(function() a:SetReplicateMovement(true) end)
+                        pcall(function() a:ForceNetUpdate() end)
                         n = n + 1
-                        if n <= 12 then log(("GEAR: replicating %s on %X -> %s"):format(className(a), safe(function() return p:GetAddress() end, 0), tostring(ok))) end
+                        if n <= 12 then
+                            local root = safe(function() return a.RootComponent end, nil)
+                            local r = dnValid(root) and (safe(function() return root:GetRelativeRotation() end, nil) or safe(function() return root.RelativeRotation end, nil))
+                            log(("GEAR: replicating %s on %X -> %s (rel rot %s, physics %s)"):format(className(a), safe(function() return p:GetAddress() end, 0), tostring(ok),
+                                r and ("%.0f,%.0f,%.0f"):format(r.Pitch, r.Yaw, r.Roll) or "?",
+                                tostring(dnValid(root) and safe(function() return root:IsSimulatingPhysics() end, "?"))))
+                        end
                     end
                 end
             end
@@ -2841,12 +2890,61 @@ CS.gearCensus = function(tag)
                     end
                 end)
             end)
+            -- transforms of the attached items, to compare host vs joiner
+            pcall(function()
+                p.Children:ForEach(function(_, e)
+                    local a = e:get()
+                    if dnValid(a) and className(a):find("Pickup") and dnValid(safe(function() return a:GetAttachParentActor() end, nil)) then
+                        local function tr(c)
+                            local l = safe(function() return c.RelativeLocation end, nil)
+                            local r = safe(function() return c.RelativeRotation end, nil)
+                            return ("loc(%.0f,%.0f,%.0f) rot(%.0f,%.0f,%.0f)"):format(l and l.X or 0, l and l.Y or 0, l and l.Z or 0,
+                                r and r.Pitch or 0, r and r.Yaw or 0, r and r.Roll or 0)
+                        end
+                        local root = safe(function() return a.RootComponent end, nil)
+                        local parts = { "root " .. (dnValid(root) and (safe(function() return root:GetFName():ToString() end, "?") .. " " .. tr(root) .. " socket=" .. tostring(safe(function() return root:GetAttachSocketName():ToString() end, "?"))) or "?") }
+                        pcall(function()
+                            root.AttachChildren:ForEach(function(_, ce)
+                                local c = ce:get()
+                                if dnValid(c) then parts[#parts + 1] = safe(function() return c:GetFName():ToString() end, "?") .. " " .. tr(c) end
+                            end)
+                        end)
+                        log(("GEARX %s %s: %s"):format(tag, className(a), table.concat(parts, " | ")))
+                    end
+                end)
+            end)
             log(("GEAR %s %X role=%s: %s"):format(tag, safe(function() return p:GetAddress() end, 0),
                 tostring(safe(function() return p:GetLocalRole() end, "?")),
                 #items > 0 and table.concat(items, ", ") or "nothing"))
         end
     end
 end
+-- widgets on screen (hunting the "PRESS ANY KEY" that never goes away)
+CS.widgetCensus = function(tag)
+    local names = {}
+    for _, w in ipairs(safe(function() return FindAllOf("UserWidget") end, nil) or {}) do
+        if dnValid(w) and safe(function() return w:IsInViewport() end, false) then
+            names[#names + 1] = className(w) .. (safe(function() return w:IsVisible() end, true) and "" or "(hidden)")
+        end
+    end
+    log(("WIDGETS %s: %s"):format(tag, #names > 0 and table.concat(names, ", ") or "none"))
+end
+-- The main menu's "PRESS ANY KEY" (PressAnyKeyWidget_C) stays up after a
+-- joiner loads in (they never press a key on that screen) and after the
+-- auto-Continue on a play-test host.
+CS.clearPressAnyKey = function()
+    local n = 0
+    for _, w in ipairs(safe(function() return FindAllOf("PressAnyKeyWidget_C") end, nil) or {}) do
+        if dnValid(w) and safe(function() return w:IsInViewport() end, false) then
+            if pcall(function() w:RemoveFromParent() end) then n = n + 1 end
+        end
+    end
+    if n > 0 then log("UI: removed " .. n .. " PRESS ANY KEY widget(s)") end
+end
+RegisterConsoleCommandHandler("sdmp_widgets", function()
+    ExecuteInGameThread(function() pcall(CS.widgetCensus, "console") end)
+    return true
+end)
 RegisterConsoleCommandHandler("sdmp_gear", function()
     ExecuteInGameThread(function() pcall(CS.gearCensus, "console") end)
     return true
@@ -2856,6 +2954,77 @@ RegisterConsoleCommandHandler("sdmp_clothes", function()
     ExecuteInGameThread(function() pcall(clothingResend, "console") end)
     return true
 end)
+
+-- The main menu's "PRESS ANY KEY" prompt survives into the game after a
+-- listen travel / join. Once we have a player character, take it down.
+local PAK = { t = 0, n = 0 }
+local function pressAnyKeySweep()
+    PAK.t = PAK.t + 1
+    if PAK.t % 8 ~= 0 then return end   -- every 2s
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    if not (dnValid(me) and className(me) == "BP_PlayerCharacter_C") then return end
+    for _, w in ipairs(safe(function() return FindAllOf("PressAnyKeyWidget_C") end, nil) or {}) do
+        if dnValid(w) and safe(function() return w:IsInViewport() end, false) then
+            local ok = pcall(function() w:RemoveFromParent() end)
+            PAK.n = PAK.n + 1
+            if PAK.n <= 3 then log("UI: removed leftover PRESS ANY KEY prompt -> " .. tostring(ok)) end
+        end
+    end
+end
+
+-- Joiner side: gear worn by OTHER players arrives as fresh copies of pickup
+-- actors, which start out like a dropped item (physics/collision on). That
+-- twists them off their attach point (the bat sticking out sideways) and
+-- would let you "pick up" someone's equipped cap. Make them pure visuals.
+local GV = { done = {}, t = 0, n = 0 }
+local function gearVisualsSweep()
+    GV.t = GV.t + 1
+    if GV.t % 8 ~= 0 then return end
+    for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+        if dnValid(p) and safe(function() return p:IsLocallyControlled() end, true) == false then
+            local list = {}
+            pcall(function() p.Children:ForEach(function(_, e) list[#list + 1] = e:get() end) end)
+            for _, a in ipairs(list) do
+                if dnValid(a) and className(a):find("Pickup") then
+                    local k = safe(function() return a:GetAddress() end, 0)
+                    if not GV.done[k] then
+                        GV.done[k] = true
+                        local root = safe(function() return a.RootComponent end, nil)
+                        if dnValid(root) then pcall(function() root:SetSimulatePhysics(false) end) end
+                        pcall(function() a:SetActorEnableCollision(false) end)
+                        -- the attach offset never replicates (socket does, offset
+                        -- doesn't), so apply it ourselves the way the game does on
+                        -- equip: the item's data asset holds EquippedTransform
+                        local how = "no data"
+                        pcall(function()
+                            GV.pcCls = GV.pcCls or StaticFindObject("/Game/JigSInventory/Jigsaw/Pickup/BP_JigPickupComponent.BP_JigPickupComponent_C")
+                            local comp = dnValid(GV.pcCls) and a:GetComponentByClass(GV.pcCls) or nil
+                            local da = dnValid(comp) and safe(function() return comp.ItemDataAsset end, nil) or nil
+                            if not dnValid(da) and dnValid(comp) then da = safe(function() return comp.CurrentInfo.ItemInfo end, nil) end
+                            if dnValid(da) then
+                                local xf = da.EquippedTransform
+                                local ok = pcall(function() a:K2_SetActorRelativeTransform(xf, false, {}, false) end)
+                                how = safe(function() return da:GetFName():ToString() end, "?") .. " -> " .. tostring(ok)
+                            elseif dnValid(comp) then
+                                how = "component but no data asset"
+                            else
+                                how = "no pickup component"
+                            end
+                        end)
+                        GV.n = GV.n + 1
+                        if GV.n <= 10 then
+                            local r = safe(function() return root:GetRelativeRotation() end, nil) or safe(function() return root.RelativeRotation end, nil)
+                            local r2 = safe(function() return root.RelativeRotation end, nil)
+                            log(("GEAR: %s on another player made visual-only, offset from %s (rel rot now %s)"):format(className(a), how,
+                                r2 and ("%.0f,%.0f,%.0f"):format(r2.Pitch, r2.Yaw, r2.Roll) or "?"))
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
 
 -- every machine: look after its own pawn, tell the player what's going on
 local function dnLocalTick()
@@ -2944,21 +3113,21 @@ pcall(function()
     end)
 end)
 
-LoopAsync(250, function()
-    ExecuteInGameThread(function()
+gameLoop(250, function()
+    do
         -- (spawn-function hooks retired: they found Survival_SpawnPlayer, and running
         -- code from GI hooks during the Entry hop is a crash risk)
         if not worldSettled() then return end
-        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch) end
+        if not dnIsHost() then pcall(dnGhostSweep); pcall(csClientWatch); pcall(gearVisualsSweep) end
         if dnIsHost() then
             pcall(clothingSync)
             local ok, err = pcall(dnHostTick)
             if not ok then log("DN host error: " .. tostring(err)) end
         end
+        pcall(pressAnyKeySweep)
         local ok, err = pcall(dnLocalTick)
         if not ok and not DN.lErr then DN.lErr = true; log("DN local error: " .. tostring(err)) end
-    end)
-    return false
+    end
 end)
 RegisterConsoleCommandHandler("sdmp_down", function()   -- debug: down yourself / everyone on host
     ExecuteInGameThread(function()
@@ -3647,6 +3816,7 @@ do
             end)
             if A.play then
                 alog("hosting - players can join with sdmp_join <this PC's IP>")
+                pcall(CS.clearPressAnyKey)
                 pcall(dnNotify, "Co-op: you're hosting. Friends join with sdmp_join <your IP> (UDP port 7777)", myPawn())
                 if A.pt then fwrite("sdmp_ready.txt", "1") end
             else
@@ -3727,7 +3897,7 @@ do
                     end
                     if A.play then
                         pcall(dnNotify, "A player joined", myPawn())
-                        ExecuteWithDelay(20000, function() ExecuteInGameThread(function() pcall(CS.gearCensus, "host") end) end)
+                        gameDelay(20000, function() pcall(CS.gearCensus, "host"); pcall(CS.widgetCensus, "host") end)
                     end
                     -- (config dumps done - nothing differed)
                 end
@@ -3869,7 +4039,9 @@ do
             buildUI()
             if A.play then
                 alog("joined - playing")
-                ExecuteWithDelay(2000, function() ExecuteInGameThread(function() pcall(dnNotify, "Joined the host's game", myPawn()) end) end)
+                pcall(CS.clearPressAnyKey)
+                gameDelay(3000, function() pcall(CS.clearPressAnyKey) end)
+                gameDelay(2000, function() pcall(dnNotify, "Joined the host's game", myPawn()) end)
                 A.step, A.t = "playing", 0
                 return
             end
@@ -4006,7 +4178,7 @@ do
         elseif A.step == "playing" then
             -- nothing to drive; just notice if we lose the host
             A.t = A.t + 1
-            if A.t == 20 then pcall(CS.gearCensus, "client") end
+            if A.t == 20 then pcall(CS.gearCensus, "client"); pcall(CS.widgetCensus, "client") end
             if not myPawn() then
                 A.lost = (A.lost or 0) + 1
                 if A.lost == 15 then alog("no pawn for 15s - disconnected?") end
@@ -4207,12 +4379,10 @@ do
     A.startLoop = function()
         if A.looping then return end
         A.looping = true
-        LoopAsync(1000, function()
-            ExecuteInGameThread(function()
-                local ok, err = pcall(A.role == "host" and hostTick or clientTick)
-                if not ok then alog("tick error in step " .. A.step .. ": " .. tostring(err)) end
-            end)
-            if A.step == "dead" and A.quit then A.step = "quit"; ExecuteInGameThread(function() console("quit") end) end
+        gameLoop(1000, function()
+            local ok, err = pcall(A.role == "host" and hostTick or clientTick)
+            if not ok then alog("tick error in step " .. A.step .. ": " .. tostring(err)) end
+            if A.step == "dead" and A.quit then A.step = "quit"; console("quit") end
             local stop = A.step == "dead" or A.step == "quit"
             if stop then A.looping = false end
             return stop
@@ -4252,7 +4422,7 @@ do
     end)
 
     -- the command line is readable once the engine is up; give it a moment
-    ExecuteWithDelay(3000, function() ExecuteInGameThread(boot) end)
+    gameDelay(3000, boot)
 end
 
 log("SDMPDiag: auto mode - launch with -sdmprole=host|client -sdmpauto (tools/test.bat).")
