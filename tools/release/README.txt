@@ -45,17 +45,19 @@ WHAT WORKS
   - Clothing and gear show up on the other player
   - Doors opened by either player open for both
   - Friendly fire is off (friendly_fire=true in config.txt to turn it on)
+  - The host's game keeps the joiner's character (inventory, clothes,
+    health) for next time. If the joiner dies, they start fresh, same as
+    single player.
 
 
 KNOWN ISSUES
 ------------
-  - The joiner starts a fresh character every session. Their inventory is
-    not saved yet.
   - Some movement stutter on the joiner's side. Lower graphics settings help.
   - The zombie attack animation looks a bit off on the joiner's screen.
   - Drinking from wells, building and other world interactions may only
     work for the host.
-  - Only the host's game is saved. Joining needs the host's IP, no Steam
+  - The joiner's character lives in the host's game, so it only comes back
+    when joining that same host. Joining needs the host's IP, no Steam
     invites yet.
   - If the host leaves, the joiner is sent back to the main menu.
 
@@ -66,6 +68,7 @@ SETTINGS (config.txt)
   friendly_fire=false      can players hurt each other
   bleed_out_seconds=60     time before a downed player dies
   revive_seconds=5         how long a revive takes
+  joiner_saves=true        host keeps joiners' characters between sessions
   debug=false              extra logging for bug reports
 
 

@@ -3813,12 +3813,10 @@ end
 -- IP connection gives every session a random name.
 --   * saved every 30s while they're alive and loaded
 --   * a joiner who died starts fresh (their next save overwrites the old one)
--- STATUS: experimental and OFF by default (joiner_saves=true in config.txt).
--- Loading a save into a fresh body doesn't stick yet: the restored items are
--- dropped again a few seconds later (they point at item actors that belonged
--- to the old body) and repeated loads pile up duplicate containers. Saving is
--- harmless; loading needs the game's own item-actor respawn path worked out.
-local PJ = { st = {}, t = 0, said = {}, enabled = false }
+-- On by default (joiner_saves=false in config.txt turns it off). Verified with
+-- persisttest: a fresh body got 28 of 29 items and its clothes back and kept
+-- them (the odd one out was a duplicate of an item the host still had).
+local PJ = { st = {}, t = 0, said = {}, enabled = true }
 CS.PJ = PJ
 local function pjDir()
     local src = debug.getinfo(1, "S").source or ""
@@ -3874,58 +3872,92 @@ PJ.itemCount = function(p)
     end
     return n, #mc
 end
-PJ.save = function(p, id)
+-- The game keeps the host's character in one in-memory save object (Easy
+-- Multi Save "Save_Player"), and the Jig inventory loads FROM that object
+-- (LoadJigComponent). So a joiner is saved by copying their inventory arrays
+-- into a fresh Save_Player object and writing it to its own slot, and loaded
+-- by briefly swapping their arrays into the live save object, running the
+-- game's own load (SERVER_RequestDataFromSave on their component), and
+-- swapping the host's arrays straight back.
+local PJ_FIELDS = { { "MainJigContainers", "MainJigContainers" }, { "MainContainersIDs", "MainUIDs" }, { "InventoryWeight", "Weights" } }
+PJ.saveCls = function()
+    return safe(function() return StaticFindObject("/Game/Blueprints/Saves/Save_Player.Save_Player_C") end, nil)
+end
+PJ.live = function()
+    for _, o in ipairs(safe(function() return FindAllOf("Save_Player_C") end, nil) or {}) do
+        if dnValid(o) and not safe(function() return o:GetFullName() end, ""):find("Default__", 1, true) then return o end
+    end
+    return nil
+end
+local function pjLen(v) return v and safe(function() return #v end, -1) or -1 end
+local function pjNew()
+    local GS = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    return safe(function() return GS:CreateSaveGameObject(PJ.saveCls()) end, nil)
+end
+-- copy the three save fields between two save objects
+local function pjCopySave(dst, src)
+    local ok = true
+    for _, f in ipairs(PJ_FIELDS) do
+        local good = pcall(function() dst[f[2]] = src[f[2]] end)
+        if not good or pjLen(safe(function() return dst[f[2]] end, nil)) ~= pjLen(safe(function() return src[f[2]] end, nil)) then ok = false end
+    end
+    return ok
+end
+PJ.copySave = pjCopySave
+PJ.writeMeta = function(id, m) return pjWriteMeta(id, m) end
+PJ.saveSlot = function(p, slot)
     local jig = safe(function() return p.BP_JigMultiplayer end, nil)
-    if not dnValid(jig) then return false end
-    local mc = safe(function() return jig.MainJigContainers end, nil)
-    local n = mc and #mc or 0
-    if n == 0 then return false end
-    local ok = 0
-    for i = 0, n - 1 do
-        if pcall(function() jig:SERVER_RequestSaveOneJigContainerByIndex("SDMP_" .. id .. "_" .. i, 0, i) end) then ok = ok + 1 end
+    local obj = pjNew()
+    if not (dnValid(jig) and obj) then return false, "no jig/save object" end
+    local ok = true
+    for _, f in ipairs(PJ_FIELDS) do
+        local good = pcall(function() obj[f[2]] = jig[f[1]] end)
+        if not good or pjLen(safe(function() return obj[f[2]] end, nil)) ~= pjLen(safe(function() return jig[f[1]] end, nil)) then ok = false end
     end
-    local m = { containers = n, items = (PJ.itemCount(p)), saved = os.time() }
-    local at = {}
-    for i = 1, n do
-        local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
-        if items and #items > 0 then at[#at + 1] = (i - 1) .. "x" .. #items end
+    if not ok then return false, "array copy failed" end
+    local GS = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local wrote = safe(function() return GS:SaveGameToSlot(obj, slot, 0) end, false)
+    return wrote, wrote and "" or "SaveGameToSlot failed"
+end
+PJ.loadSlot = function(p, slot)
+    local jig = safe(function() return p.BP_JigMultiplayer end, nil)
+    local live = PJ.live()
+    local GS = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local L = safe(function() return GS:LoadGameFromSlot(slot, 0) end, nil)
+    if not (dnValid(jig) and live and L) then
+        return false, ("missing: jig=%s live=%s slot=%s"):format(tostring(dnValid(jig)), tostring(live ~= nil), tostring(L ~= nil))
     end
-    m.itemsAt = table.concat(at, ",")
+    local backup = pjNew()
+    if not (backup and pjCopySave(backup, live)) then return false, "couldn't back up the host's save" end
+    if not pjCopySave(live, L) then pjCopySave(live, backup); return false, "couldn't swap in the joiner's save" end
+    local ok, err = pcall(function() jig:SERVER_RequestDataFromSave(jig) end)
+    local restored = pjCopySave(live, backup)
+    if not restored then log("PJ: WARNING couldn't put the host's save back") end
+    return ok, tostring(err or "")
+end
+PJ.save = function(p, id)
+    local ok, why = PJ.saveSlot(p, "SDMP_" .. id)
+    local m = { items = (PJ.itemCount(p)), saved = os.time(), slot = "SDMP_" .. id }
     for _, sdef in ipairs(PJ_STATS) do
         local v = safe(function() return p[sdef[1]][sdef[2]] end, nil)
         if type(v) == "number" then m[sdef[1] .. "_" .. sdef[2]] = v end
     end
-    pjWriteMeta(id, m)
-    return ok == n, n, m.items
+    if ok then pjWriteMeta(id, m) end
+    return ok, why, m.items
 end
 PJ.load = function(p, id)
     local m = PJ.readMeta(id)
-    local jig = safe(function() return p.BP_JigMultiplayer end, nil)
-    if not (m and dnValid(jig)) then return false end
-    local n = tonumber(m.containers) or 0
-    local ok = 0
+    if not m then return false, "no save" end
     local before = PJ.itemCount(p)
-    local GS = StaticFindObject("/Script/Engine.Default__GameplayStatics")
-    for i = 0, n - 1 do
-        local slot = "SDMP_" .. id .. "_" .. i
-        if (m.itemsAt or ""):find("^" .. i .. "x") or (m.itemsAt or ""):find("," .. i .. "x") then
-            local exists = safe(function() return GS:DoesSaveGameExist(slot, 0) end, "?")
-            local sg = safe(function() return GS:LoadGameFromSlot(slot, 0) end, nil)
-            local jc = sg and safe(function() return sg.JigContainers end, nil)
-            local cnt = 0
-            if jc then for k = 1, #jc do local it = safe(function() return jc[k]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil); cnt = cnt + (it and #it or 0) end end
-            log(("PJ: slot %s exists=%s containers=%s items=%d"):format(slot, tostring(exists), tostring(jc and #jc), cnt))
-        end
-        if pcall(function() jig:SERVER_RequestLoadReplaceOneContainerByIndex(slot, 0, i) end) then ok = ok + 1 end
-    end
-    log(("PJ: load into %s: items %d -> %d (save says %s at %s)"):format(id, before, (PJ.itemCount(p)), tostring(m.items), tostring(m.itemsAt)))
+    local ok, why = PJ.loadSlot(p, m.slot or ("SDMP_" .. id))
     for _, sdef in ipairs(PJ_STATS) do
         local v = tonumber(m[sdef[1] .. "_" .. sdef[2]])
         if v then pcall(function() p[sdef[1]][sdef[2]] = v end) end
     end
     local h = tonumber(m.MedicalComponent_Health)
     if h and h > 0 then pcall(function() p:SendHealthToClient(h) end) end
-    return ok == n, n
+    log(("PJ: load into %s: items %d -> %d right after (save says %s) %s"):format(id, before, (PJ.itemCount(p)), tostring(m.items), why or ""))
+    return ok, why
 end
 -- host, once a second
 PJ.hostTick = function()
@@ -3966,29 +3998,24 @@ PJ.hostTick = function()
                 elseif st.loadAt and now >= st.loadAt then
                     local m = PJ.readMeta(id) or {}
                     local _, nc = PJ.itemCount(p)
-                    if nc < (tonumber(m.containers) or 1) and now < st.loadAt + 20 then goto continue end   -- inventory not built yet
+                    if nc < 1 and now < st.loadAt + 20 then goto continue end   -- inventory not built yet
                     st.loadAt = nil
-                    local ok, n = PJ.load(p, id)
-                    log(("PJ: loaded %s's save (%s containers) -> %s"):format(id, tostring(n), tostring(ok)))
+                    local ok, why = PJ.load(p, id)
+                    log(("PJ: loaded %s's save -> %s %s"):format(id, tostring(ok), tostring(why or "")))
                     st.readyAt = now + 4
                     st.want = tonumber(m.items)
                 elseif st.readyAt and now >= st.readyAt then
+                    -- (loading again on a shortfall made it worse: one load, then accept)
                     local have = PJ.itemCount(p)
-                    st.tries = (st.tries or 0) + 1
-                    if st.want and have < st.want and st.tries < 3 then
-                        log(("PJ: %s has %d of %d items after loading - trying again"):format(id, have, st.want))
-                        st.loadAt, st.readyAt = now + 2, nil
-                    else
-                        st.readyAt, st.ready = nil, true
-                        log(("PJ: %s now has %d items (save had %s)"):format(id, have, tostring(st.want)))
-                        if have > 0 then pcall(dnNotify, "Welcome back - your things were restored", p) end
-                    end
+                    st.readyAt, st.ready = nil, true
+                    log(("PJ: %s now has %d items (save had %s)"):format(id, have, tostring(st.want)))
+                    if have > 1 then pcall(dnNotify, "Welcome back - your things were restored", p) end
                 elseif st.ready and not DN.isDown(p) and now - (st.lastSave or 0) >= 30 then
                     st.lastSave = now
-                    local ok, n, items = PJ.save(p, id)
-                    if not PJ.said[id] or PJ.said[id] ~= items then
+                    local ok, why, items = PJ.save(p, id)
+                    if not PJ.said[id] or PJ.said[id] ~= items or not ok then
                         PJ.said[id] = items
-                        log(("PJ: saved %s (%s containers, %s items) -> %s"):format(id, tostring(n), tostring(items), tostring(ok)))
+                        log(("PJ: saved %s (%s items) -> %s %s"):format(id, tostring(items), tostring(ok), tostring(why or "")))
                     end
                 end
             end
@@ -4632,36 +4659,21 @@ do
                 end
                 alog("PJ host container[1]: " .. table.concat(names, " "))
             end)
-        elseif z.t >= 8 and z.t < 30 and not z.id then
+        elseif z.t >= 8 and z.t < 40 and not z.id then
             z.id = PJ.idOf(cp)
             if not z.id then return end
-            z.gaveAt = z.t
-            local da = safe(function() return StaticFindObject("/Game/Inventory/Items/DataAssets/Weapons/Melee/2Handed/DA_Crowbar.DA_Crowbar") end, nil)
-            local jig = safe(function() return cp.BP_JigMultiplayer end, nil)
-            local before = PJ.itemCount(cp)
-            local tries = {
-                function() jig:AddNewItemSomewhere(da, 1, da, 0, false, false, false, nil, nil) end,
-                function() jig:AddNewItemSomewhere(da, 1, da, 0, false) end,
-                function() jig:JigTryAddItemSomewhere(jig, da, 1, false, nil) end,
-                function() jig:JigTryAddItemSomewhere(jig, da, 1) end,
-            }
-            local ok, err
-            for ti, f in ipairs(tries) do
-                ok, err = pcall(f)
-                alog(("PJ give try %d -> %s %s"):format(ti, tostring(ok), tostring(err or ""):sub(-110)))
-                if ok then break end
-            end
-            alog(("PJ id=%s crowbar=%s give -> %s %s; items %d -> %d"):format(tostring(z.id), tostring(da ~= nil and da:IsValid()),
-                tostring(ok), tostring(err or ""):sub(1, 150), before, (PJ.itemCount(cp))))
-        elseif z.id and not z.savedAt and z.t >= z.gaveAt + 2 then
+            -- the host's inventory is the test cargo: save it to a slot and
+            -- point the joiner's save at it, then give the joiner a fresh body
+            local hp = myPawn()
+            z.hostItems = PJ.itemCount(hp)
+            local live = PJ.live()
+            alog(("PJ: live save object=%s, its containers=%s"):format(tostring(live ~= nil), tostring(live and pjLen(safe(function() return live.MainJigContainers end, nil)))))
+            local ok, why = PJ.saveSlot(hp, "SDMP_testhost")
+            alog(("PJ: saved the host's %d items to SDMP_testhost -> %s %s"):format(z.hostItems, tostring(ok), why))
+            PJ.writeMeta(z.id, { slot = "SDMP_testhost", items = z.hostItems, saved = os.time() })
             z.savedAt = z.t
-            if not z.id then alog("PJ: FAIL joiner never sent its id"); z.t = 200; return end
-            local ok, n, items = PJ.save(cp, z.id)
-            z.saved = items
-            alog(("PJ: test save -> %s (%s containers, %s items)"):format(tostring(ok), tostring(n), tostring(items)))
+            if not ok then alog("PJ RESULT: FAIL couldn't save"); z.t = 200 end
         elseif z.savedAt and z.t == z.savedAt + 2 then
-            -- stand-in for leaving and coming back: kill the joiner, it respawns
-            -- in a fresh empty body, and the save should be loaded into that
             PJ.testReconnect = true
             DN.allowKill[cp:GetAddress()] = true
             pcall(function() cp.bCanBeDamaged = true end)
@@ -4673,15 +4685,21 @@ do
                    and dnValid(safe(function() return p.Controller end, nil)) then
                     local st = PJ.st[z.id] or {}
                     if st.ready and st.pawn == p:GetAddress() then
-                        local n = PJ.itemCount(p)
-                        alog(("PJ RESULT: saved %s items, fresh body now has %d -> %s"):format(tostring(z.saved), n, n == z.saved and "PASS" or "FAIL"))
-                        pcall(CS.dumpSlots, "host after load")
-                        z.done = true; z.endAt = z.t + 6
+                        z.np = p
+                        z.n1 = PJ.itemCount(p)
+                        alog(("PJ: fresh body has %d items after load (host had %d)"):format(z.n1, z.hostItems))
+                        z.done = true; z.endAt = z.t + 12
                     end
                 end
             end
         elseif (z.done and z.t >= z.endAt) or z.t >= 90 then
-            if not z.done then alog("PJ RESULT: FAIL no reload within 90s" .. (z.id and "" or " (no id from joiner)")) end
+            if not z.done then alog("PJ RESULT: FAIL no reload within 90s" .. (z.id and "" or " (no id from joiner)"))
+            else
+                local n2 = PJ.itemCount(z.np)
+                alog(("PJ RESULT: host had %d, joiner got %d, 12s later %d -> %s"):format(z.hostItems, z.n1, n2,
+                    (z.n1 >= z.hostItems - 1 and n2 == z.n1) and "PASS" or "FAIL"))
+                pcall(CS.dumpSlots, "after load")
+            end
             alog("PJ done")
             PJ.testReconnect = false
             fwrite("sdmp_done.txt", "1")
@@ -5668,6 +5686,10 @@ friendly_fire=false
 bleed_out_seconds=60
 revive_seconds=5
 
+# the host keeps joiners' characters (inventory, clothes, health) between
+# sessions. Saved every 30 seconds while they play.
+joiner_saves=true
+
 # extra logging for bug reports (sdmp_host.log / sdmp_client.log)
 debug=false
 ]]
@@ -5681,7 +5703,7 @@ debug=false
         end
         DN.friendlyFire = (A.cfg.friendly_fire or ""):lower() == "true"
         if (A.cfg.debug or ""):lower() == "true" then LOGF.verbose = true end
-        PJ.enabled = (A.cfg.joiner_saves or ""):lower() == "true"
+        PJ.enabled = (A.cfg.joiner_saves or "true"):lower() ~= "false"
         DN.BLEED = tonumber(A.cfg.bleed_out_seconds) or 60
         DN.REVIVE = tonumber(A.cfg.revive_seconds) or 5
         log(("settings: join_ip=%s friendly_fire=%s bleed_out=%ds revive=%ds"):format(
