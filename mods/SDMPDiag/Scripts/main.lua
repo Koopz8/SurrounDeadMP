@@ -4955,7 +4955,8 @@ do
                     end
                 end
             end
-        elseif (z.done and z.t >= z.endAt) or z.t >= 90 then
+        elseif not z.finished and ((z.done and z.t >= z.endAt) or z.t >= 90) then
+            z.finished = true   -- once: in "stay" mode the tick keeps running after this
             if not z.done then alog("PJ RESULT: FAIL no reload within 90s" .. (z.id and "" or " (no id from joiner)"))
             else
                 local n2 = PJ.itemCount(z.np)
@@ -5297,6 +5298,225 @@ do
         alog("LOOTHOOK hooks in")
     end
     -- dev: turn the local camera to the nearest loot container (no mouse look over remote control)
+    -- dev (host): drop a campfire kit on the ground next to each joiner, made
+    -- to replicate, so a joiner can pick it up and build with a real item.
+    -- sdmp_items logs every player's item count (host side).
+    A.GIVE_CLS = "/Game/Inventory/Items/Pickups/Buildable/Crafting/BP_CampfirePickup.BP_CampfirePickup_C"
+    A.cmdGive = function()
+            local cls = safe(function() return StaticFindObject(A.GIVE_CLS) end, nil)
+            if not dnValid(cls) then
+                safe(function() return LoadAsset(A.GIVE_CLS:gsub("_C$", "")) end, nil)
+                cls = safe(function() return StaticFindObject(A.GIVE_CLS) end, nil)
+            end
+            if not dnValid(cls) then alog("give: no campfire pickup class"); return end
+            local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+            for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+                if dnValid(p) and not safe(function() return p:IsLocallyControlled() end, true) then
+                    local l = p:K2_GetActorLocation()
+                    local f = p:GetActorForwardVector()
+                    local tr = { Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+                                 Translation = { X = l.X + f.X * 120, Y = l.Y + f.Y * 120, Z = l.Z - 40 },
+                                 Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+                    local a = safe(function() return gs:BeginDeferredActorSpawnFromClass(p, cls, tr, 1, p, 0) end, nil)
+                    if dnValid(a) then
+                        pcall(function() gs:FinishSpawningActor(a, tr, 0) end)
+                        pcall(function() a:SetReplicates(true) end)
+                        pcall(function() a:SetReplicateMovement(true) end)
+                        pcall(function() a:ForceNetUpdate() end)
+                    end
+                    local n0 = PJ.itemCount(p)
+                    alog(("give: campfire kit next to %s -> %s; joiner has %s items"):format(className(p), tostring(dnValid(a)), tostring(n0)))
+                    -- and pick it up for them on the host, the way the joiner's own
+                    -- pickup request ends up on the host
+                    gameDelay(1000, function()
+                        local ok, err = pcall(function() a:OnServerExecuteInteract({ TagName = FName("Jig.InteractOptions.Option1") }, p, {}) end)
+                        gameDelay(2000, function()
+                            alog(("give: picked up for the joiner -> %s %s; joiner items %s -> %s"):format(tostring(ok),
+                                tostring(err or ""):sub(1, 80), tostring(n0), tostring(PJ.itemCount(p))))
+                        end)
+                    end)
+                end
+            end
+    end
+    RegisterConsoleCommandHandler("sdmp_give", function() ExecuteInGameThread(function() pcall(A.cmdGive) end) return true end)
+    -- dev: list each player's items (host view), marking the buildable ones
+    A.cmdInv = function()
+            for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+                local jig = dnValid(p) and safe(function() return p.BP_JigMultiplayer end, nil)
+                local mc = dnValid(jig) and safe(function() return jig.MainJigContainers end, nil)
+                local names = {}
+                for i = 1, (mc and #mc or 0) do
+                    local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+                    for j = 1, (items and #items or 0) do
+                        local it = safe(function() return items[j]:get() end, nil) or items[j]
+                        local da = safe(function() return it["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] end, nil)
+                        local nm = dnValid(da) and (safe(function() return da:GetFName():ToString() end, "?")) or "?"
+                        local b = dnValid(da) and dnValid(safe(function() return da.BuildActorClass end, nil))
+                        names[#names + 1] = nm .. (b and "[BUILD]" or "")
+                    end
+                end
+                alog(("inv: %s local=%s: %s"):format(className(p), tostring(safe(function() return p:IsLocallyControlled() end, "?")), table.concat(names, ", ")))
+            end
+    end
+    RegisterConsoleCommandHandler("sdmp_inv", function() ExecuteInGameThread(function() pcall(A.cmdInv) end) return true end)
+    -- joiner: build the first buildable item in my own inventory the way the
+    -- game's "Build" does it (BuildUID + build mode + Svr_SpawnBuild), so the
+    -- host has a real item to take
+    A.cmdBuildReal = function()
+        local me = myPawn()
+        local jig = safe(function() return me.BP_JigMultiplayer end, nil)
+        local comp = safe(function() return me.BuildingComponent end, nil)
+        local da, uid
+        for _, arrName in ipairs({ "MainJigContainers", "LocalJSIContainers" }) do
+        local mc = dnValid(jig) and safe(function() return jig[arrName] end, nil)
+        for i = 1, (mc and #mc or 0) do
+            local el = safe(function() return mc[i]:get() end, nil) or mc[i]
+            local items = safe(function() return el["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+            if not safe(function() return #items end, nil) then items = nil end
+            for j = 1, (items and #items or 0) do
+                local it = safe(function() return items[j]:get() end, nil) or items[j]
+                local d = safe(function() return it["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] end, nil)
+                if not da and dnValid(d) and dnValid(safe(function() return d.BuildActorClass end, nil)) then
+                    da = d
+                    uid = safe(function() return it["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] end, nil)
+                end
+            end
+        end
+        end
+        local g0
+        if not (dnValid(da) and uid) then
+            -- a joiner's own jig keeps items in container objects, not
+            -- MainJigContainers; the host writes the item id to a file (test only)
+            local line = fread("sdmp_uid.txt") or ""
+            local a, b, c, d, path = line:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+) (%S+)")
+            if a then
+                g0 = { A = tonumber(a), B = tonumber(b), C = tonumber(c), D = tonumber(d) }
+                da = safe(function() return StaticFindObject(path) end, nil)
+                if not dnValid(da) then da = safe(function() return LoadAsset(path) end, nil) end
+                uid = g0
+            end
+        end
+        if not (dnValid(da) and uid and dnValid(comp)) then
+            alog("buildreal: no buildable item in my inventory; my jig: " .. A.jigDump(me))
+            pcall(function() alog("buildreal: LocalJSIContainers element: " .. PR.structOf(jig, "LocalJSIContainers")) end)
+            return
+        end
+        local g = g0 or bdGuid(uid)
+        alog(("buildreal: building %s, item id %d/%d/%d/%d"):format(className(da) .. " " .. bdPath(da), g.A, g.B, g.C, g.D))
+        pcall(function() comp.BuildUID = g end)
+        local ws = safe(function() return UEHelpers.GetWorld():K2_GetWorldSettings() end, nil)
+        local ok = pcall(function() comp:Event_LaunchBuildMode(da, false, ws) end)
+        gameDelay(2000, function()
+            local l = me:K2_GetActorLocation()
+            local f = me:GetActorForwardVector()
+            local tr = { Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+                         Translation = { X = l.X + f.X * 400, Y = l.Y + f.Y * 400, Z = l.Z - 88 },
+                         Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+            local ok2 = pcall(function() comp:Svr_SpawnBuild(tr) end)
+            alog(("buildreal: launch=%s spawn=%s"):format(tostring(ok), tostring(ok2)))
+            gameDelay(500, function() pcall(function() comp:Event_StopBuildMode() end) end)
+        end)
+    end
+    A.cmdUid = function()
+        for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+            if dnValid(p) and not safe(function() return p:IsLocallyControlled() end, true) and dnValid(safe(function() return p.Controller end, nil)) then
+                local mc = safe(function() return p.BP_JigMultiplayer.MainJigContainers end, nil)
+                for i = 1, (mc and #mc or 0) do
+                    local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+                    for j = 1, (items and #items or 0) do
+                        local it = safe(function() return items[j]:get() end, nil) or items[j]
+                        local d = safe(function() return it["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] end, nil)
+                        if dnValid(d) and dnValid(safe(function() return d.BuildActorClass end, nil)) then
+                            local g = bdGuid(safe(function() return it["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] end, nil) or {})
+                            fwrite("sdmp_uid.txt", ("%d %d %d %d %s"):format(g.A, g.B, g.C, g.D, bdPath(d)))
+                            alog(("uid: joiner's %s is %d/%d/%d/%d"):format(bdPath(d), g.A, g.B, g.C, g.D))
+                            return
+                        end
+                    end
+                end
+            end
+        end
+        alog("uid: no buildable item on a joiner")
+    end
+    -- joiner: move the nearest thing I built, the way the game's "Move" does it
+    A.cmdMoveReal = function()
+        local me = myPawn()
+        local comp = safe(function() return me.BuildingComponent end, nil)
+        local ml = me:K2_GetActorLocation()
+        local best, bd = nil, 2000 * 2000
+        for _, a in ipairs(safe(function() return FindAllOf("Buildable_MASTER_C") end, nil) or {}) do
+            local l = dnValid(a) and safe(function() return a:K2_GetActorLocation() end, nil)
+            if l then
+                local d = (l.X - ml.X)^2 + (l.Y - ml.Y)^2
+                if d < bd then best, bd = a, d end
+            end
+        end
+        if not best then alog("movereal: nothing built near me"); return end
+        local da = safe(function() return best.PickupDataAsset end, nil)
+        local l = best:K2_GetActorLocation()
+        alog(("movereal: moving %s at %.0f,%.0f (data %s)"):format(className(best), l.X, l.Y, tostring(dnValid(da))))
+        local ok = pcall(function() comp:Event_LaunchBuildMode(da, true, best) end)
+        gameDelay(2000, function()
+            local tr = { Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+                         Translation = { X = l.X + 300, Y = l.Y, Z = l.Z },
+                         Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+            local ok2 = pcall(function() comp:Svr_SpawnBuild(tr) end)
+            alog(("movereal: launch=%s spawn=%s"):format(tostring(ok), tostring(ok2)))
+            gameDelay(500, function() pcall(function() comp:Event_StopBuildMode() end) end)
+        end)
+    end
+    -- host: what's built near the joiner
+    A.cmdBuilds = function()
+        local jl
+        for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+            if dnValid(p) and not safe(function() return p:IsLocallyControlled() end, true) and dnValid(safe(function() return p.Controller end, nil)) then
+                jl = p:K2_GetActorLocation()
+            end
+        end
+        if not jl then alog("builds: no joiner"); return end
+        local out = {}
+        for _, a in ipairs(safe(function() return FindAllOf("Buildable_MASTER_C") end, nil) or {}) do
+            local l = dnValid(a) and safe(function() return a:K2_GetActorLocation() end, nil)
+            if l and (l.X - jl.X)^2 + (l.Y - jl.Y)^2 < 2500 * 2500 then
+                out[#out + 1] = ("%s@%.0f,%.0f"):format(className(a), l.X, l.Y)
+            end
+        end
+        alog(("builds near the joiner (%d): %s"):format(#out, table.concat(out, " ")))
+    end
+    A.cmdJig = function()
+        local me = myPawn()
+        local jig = safe(function() return me.BP_JigMultiplayer end, nil)
+        alog("jig: " .. A.jigDump(me))
+        for _, n in ipairs({ "MainJigContainers", "LocalJSIContainers", "MainContainersIDs" }) do
+            alog(("jig %s: %s"):format(n, tostring(safe(function() return PR.structOf(jig, n) end, "?"))))
+        end
+    end
+    -- dev: commands from a file, for when the keyboard can't reach a window.
+    -- sdmp_cmd.txt next to the mod: "host:inv", "host:give", "client:buildreal"
+    A.cmdTick = function()
+        local c = fread("sdmp_cmd.txt") or ""
+        local role, cmd = c:match("^%s*(%a+):(%a+)")
+        if not role then return end
+        local me = dnIsHost() and "host" or "client"
+        if role ~= me then return end
+        fwrite("sdmp_cmd.txt", "")
+        alog("cmd: " .. cmd)
+        local fn = ({ inv = A.cmdInv, buildreal = A.cmdBuildReal, give = A.cmdGive, jig = A.cmdJig, uid = A.cmdUid, movereal = A.cmdMoveReal, builds = A.cmdBuilds })[cmd]
+        if not fn then alog("cmd: unknown"); return end
+        local ok, err = pcall(fn)
+        if not ok then alog("cmd error: " .. tostring(err):sub(1, 300)) end
+    end
+    gameLoop(1000, function() pcall(A.cmdTick) end)
+    RegisterConsoleCommandHandler("sdmp_items", function()
+        ExecuteInGameThread(function()
+            for _, p in ipairs(safe(function() return FindAllOf("BP_PlayerCharacter_C") end, nil) or {}) do
+                if dnValid(p) then
+                    alog(("items: %s local=%s has %s items"):format(className(p), tostring(safe(function() return p:IsLocallyControlled() end, "?")), tostring(PJ.itemCount(p))))
+                end
+            end
+        end)
+        return true
+    end)
     RegisterConsoleCommandHandler("sdmp_face", function()
         ExecuteInGameThread(function()
             local pc, me = UEHelpers.GetPlayerController(), myPawn()

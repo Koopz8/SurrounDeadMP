@@ -58,9 +58,6 @@ KNOWN ISSUES
 ------------
   - Some movement stutter on the joiner's side. Lower graphics settings help.
   - Picking items up off the ground hasn't been tested with two players yet.
-  - Building as the joiner is new. Still unchecked: that it uses up the
-    building item, and moving something already built. Tell us if either
-    acts up.
   - The joiner's character lives in the host's game, so it only comes back
     when joining that same host. Joining needs the host's IP, no Steam
     invites yet.
