@@ -8,7 +8,7 @@ REM Pass "stay" to keep both windows open afterwards:  test.bat stay
 REM Pass "zombie" for the zombie-damage test:          test.bat zombie
 REM Pass "downed" for the downed / revive test:         test.bat downed
 REM Pass "door" for the door sync test:                 test.bat door
-REM Pass "persist" / "well" / "loot" for those tests:   test.bat loot
+REM Pass "persist"/"well"/"loot"/"build" for those:   test.bat loot
 REM (either order, e.g. test.bat zombie stay)
 
 set GAME=C:\Program Files (x86)\Steam\steamapps\common\SurrounDead\SurrounDead\Binaries\Win64
@@ -29,11 +29,13 @@ if /I "%1"=="well" set TEST=-sdmptest=well
 if /I "%2"=="well" set TEST=-sdmptest=well
 if /I "%1"=="loot" set TEST=-sdmptest=loot
 if /I "%2"=="loot" set TEST=-sdmptest=loot
+if /I "%1"=="build" set TEST=-sdmptest=build
+if /I "%2"=="build" set TEST=-sdmptest=build
 
 REM no test named: the old scripted-movement run is retired (it crashed the
 REM client), so just say what to run
 if "%TEST%"=="" (
-  echo Usage: test.bat zombie^|downed^|door^|persist^|well^|loot [stay]
+  echo Usage: test.bat zombie^|downed^|door^|persist^|well^|loot^|build [stay]
   echo Or double-click zombietest / downedtest / doortest / persisttest / playtest.
   pause
   exit /b 1

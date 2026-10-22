@@ -3595,6 +3595,11 @@ gameLoop(250, function()
             if DRm.ht % 20 == 1 then pcall(DRm.hook) end
             if dnIsHost() then pcall(DRm.hostTick) end
         end
+        local BDm = CS.BD
+        if BDm and not BDm.hooked then
+            BDm.ht = (BDm.ht or 0) + 1
+            if BDm.ht % 20 == 1 then pcall(BDm.hook) end
+        end
         local ok, err = pcall(dnLocalTick)
         if not ok and not DN.lErr then DN.lErr = true; log("DN local error: " .. tostring(err)) end
     end
@@ -3843,6 +3848,190 @@ end
 
 -- Probe helpers for the joiner-save work: function signatures and struct
 -- layouts, read from the reflection data at runtime.
+-- Building. The game's building only works for whoever has authority:
+--   joiner picks a build -> BuildingComponent.Event_LaunchBuildMode(DA, Replacing?, ReplacingActor)
+--   runs on the joiner only (it's a client RPC), so the host's copy of the
+--   joiner's component never learns WHAT is being built.
+--   joiner clicks -> Svr_SpawnBuild(transform) -> host's SpawnBuild spawns
+--   DARef.BuildActorClass = nothing, and the "move a build" path spawns a new
+--   one instead of moving the old one.
+--   SpawnBuild also only takes the item from the builder when the builder is
+--   locally controlled, so a joiner build would be free.
+-- Fix: the joiner tells the host what it's building through its Jig
+-- SERVER_ForwardInteract (reliable, has a string payload), the host fills in
+-- the joiner's component, and after a joiner's build the host takes the item.
+local BD = { tag = "SDMP_BUILD", hooked = false, tries = 0, sent = 0, rx = 0, built = 0, pending = {} }
+CS.BD = BD
+local BD_COMP = "/Game/Blueprints/Components/BuildingComponent.BuildingComponent_C:"
+local BD_JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+local function bdPath(o)
+    local fn = safe(function() return o:GetFullName() end, "") or ""
+    return fn:match("^%S+%s+(.+)$") or fn
+end
+local function bdGuid(g)
+    return { A = safe(function() return g.A end, 0) or 0, B = safe(function() return g.B end, 0) or 0,
+             C = safe(function() return g.C end, 0) or 0, D = safe(function() return g.D end, 0) or 0 }
+end
+local function bdArr(arr)
+    local out = {}
+    pcall(function() arr:ForEach(function(_, e)
+        local v = e:get()
+        if type(v) ~= "string" and type(v) ~= "number" then v = safe(function() return v:ToString() end, v) end
+        out[#out + 1] = v
+    end) end)
+    return out
+end
+-- The payload's string/number arrays arrive EMPTY when filled from Lua (UE4SS
+-- doesn't fill TArrays inside a struct param), but its UID (a Guid, 4 ints)
+-- gets through. So the message rides in the Guid:
+--   A = "SDMB" (new build) / "SDMM" (moving a build), B = hash of the data
+--   asset's path, C/D = X/Y of the build being moved.
+-- A new build then sends a second forward whose Guid is the item's BuildUID.
+-- Reliable RPCs arrive in order, so the host pairs them up.
+BD.NEW, BD.MOVE = 0x53444D42, 0x53444D4D
+local function bdHash(str)
+    local h = 2166136261
+    for i = 1, #str do
+        h = h ~ str:byte(i)
+        h = (h * 16777619) & 0xFFFFFFFF
+    end
+    if h >= 0x80000000 then h = h - 0x100000000 end
+    return h
+end
+local function bdI32(n)
+    n = math.floor(n + 0.5)
+    if n > 2147483647 then n = 2147483647 elseif n < -2147483648 then n = -2147483648 end
+    return n
+end
+local function bdForward(me, jig, guid)
+    local pc = safe(function() return me.Controller end, nil)
+    if not dnValid(pc) then pc = dnLocalPC() end
+    -- the actor slot gets our controller: not an interactable, so the forward
+    -- does nothing on the host except reach our hook
+    return pcall(function()
+        jig:SERVER_ForwardInteract(pc, { TagName = FName("Jig.InteractOptions.Option1") }, { UID_2_F97C1DB340A240E45E87AFB50172E1CA = guid })
+    end)
+end
+-- joiner: build mode started -> tell the host
+BD.send = function(comp)
+    local da = safe(function() return comp.DARef end, nil)
+    if not dnValid(da) then return end
+    local me = safe(function() return comp:GetOwner() end, nil)
+    local jig = dnValid(me) and safe(function() return me.BP_JigMultiplayer end, nil)
+    if not dnValid(jig) then return end
+    local rep = safe(function() return comp["ReplacingObject?"] end, false) == true
+    local ra = rep and safe(function() return comp.ReplacingActor end, nil) or nil
+    local rl = dnValid(ra) and safe(function() return ra:K2_GetActorLocation() end, nil) or { X = 0, Y = 0 }
+    local ok, err = bdForward(me, jig, { A = rep and BD.MOVE or BD.NEW, B = bdHash(bdPath(da)), C = bdI32(rl.X), D = bdI32(rl.Y) })
+    if not rep then bdForward(me, jig, bdGuid(safe(function() return comp.BuildUID end, nil) or {})) end
+    BD.sent = BD.sent + 1
+    log(("BD: told the host I'm building %s (move=%s) -> %s %s"):format(bdPath(da), tostring(rep), tostring(ok), tostring(err or ""):sub(1, 120)))
+end
+BD.daByHash = function(h)
+    BD.daCache = BD.daCache or {}
+    local c = BD.daCache[h]
+    if dnValid(c) then return c end
+    for _, cn in ipairs({ "JigsawItem_DataAsset_C", "PrimaryDataAsset" }) do
+        for _, o in ipairs(safe(function() return FindAllOf(cn) end, nil) or {}) do
+            if dnValid(o) then
+                local hh = bdHash(bdPath(o))
+                BD.daCache[hh] = o
+                if hh == h then return o end
+            end
+        end
+    end
+    return nil
+end
+-- host: a joiner's build info arrives
+BD.receive = function(jig, payload)
+    local p = safe(function() return payload:get() end, nil) or payload
+    local u = bdGuid(safe(function() return p.UID_2_F97C1DB340A240E45E87AFB50172E1CA end, nil) or {})
+    local who = safe(function() return jig:GetOwner() end, nil)
+    if not dnValid(who) or safe(function() return who:IsLocallyControlled() end, true) then return end
+    local key = who:GetAddress()
+    -- second half of a new build: the item's id
+    if BD.wantUID and BD.wantUID[key] then
+        BD.wantUID[key] = nil
+        local pend = BD.pending[key]
+        if pend then pend.uid = u end
+        return
+    end
+    if u.A ~= BD.NEW and u.A ~= BD.MOVE then return end
+    local comp = safe(function() return who.BuildingComponent end, nil)
+    if not dnValid(comp) then log("BD: joiner has no BuildingComponent"); return end
+    local da = BD.daByHash(u.B)
+    if not dnValid(da) then log(("BD: can't find the joiner's build data (hash %d)"):format(u.B)); return end
+    local rep = u.A == BD.MOVE
+    local ra = nil
+    if rep then
+        local best, bd = nil, 80 * 80
+        for _, a in ipairs(safe(function() return FindAllOf("Buildable_MASTER_C") end, nil) or {}) do
+            local l = dnValid(a) and safe(function() return a:K2_GetActorLocation() end, nil)
+            if l then
+                local d = (l.X - u.C)^2 + (l.Y - u.D)^2
+                if d < bd then best, bd = a, d end
+            end
+        end
+        ra = best
+        if not ra then log("BD: joiner is moving a build I can't find - ignoring"); return end
+    else
+        BD.wantUID = BD.wantUID or {}
+        BD.wantUID[key] = true
+    end
+    pcall(function() comp.DARef = da end)
+    pcall(function() comp["ReplacingObject?"] = rep end)
+    pcall(function() comp.ReplacingActor = ra end)
+    BD.pending[key] = { rep = rep }
+    BD.rx = BD.rx + 1
+    log(("BD: joiner is building %s%s"):format(bdPath(da), rep and (" (moving " .. className(ra) .. ")") or ""))
+end
+-- host: after a joiner's Svr_SpawnBuild ran
+BD.afterSpawn = function(comp)
+    local who = safe(function() return comp:GetOwner() end, nil)
+    if not dnValid(who) or safe(function() return who:IsLocallyControlled() end, true) then return end
+    local pend = BD.pending[who:GetAddress()]
+    BD.built = BD.built + 1
+    if not pend then log("BD: joiner built without telling me what - nothing spawned"); return end
+    BD.pending[who:GetAddress()] = nil
+    if pend.rep then log("BD: joiner moved a build"); return end
+    local u = pend.uid
+    local jig = safe(function() return who.BP_JigMultiplayer end, nil)
+    if u and (u.A ~= 0 or u.B ~= 0 or u.C ~= 0 or u.D ~= 0) and dnValid(jig) then
+        local ok, err = pcall(function() jig:SERVER_RequestConsumeItem(jig, u, 1, "") end)
+        log(("BD: joiner built; took the item -> %s %s"):format(tostring(ok), tostring(err or ""):sub(1, 100)))
+    else
+        log("BD: joiner built (no item id to take)")
+    end
+end
+BD.hook = function()
+    if BD.hooked or BD.tries >= 30 then return end
+    local cls = safe(function() return StaticFindObject("/Game/Blueprints/Components/BuildingComponent.BuildingComponent_C") end, nil)
+    if not dnValid(cls) then return end
+    BD.tries = BD.tries + 1
+    local ok1 = pcall(RegisterHook, BD_COMP .. "Event_LaunchBuildMode", function(ctx)
+        if dnIsHost() then return end
+        local comp = safe(function() return ctx:get() end, nil)
+        if dnValid(comp) then pcall(BD.send, comp) end
+    end)
+    local ok2 = pcall(RegisterHook, BD_COMP .. "Svr_SpawnBuild", function(ctx)
+        if not dnIsHost() then return end
+        local comp = safe(function() return ctx:get() end, nil)
+        if dnValid(comp) then pcall(BD.afterSpawn, comp) end
+    end)
+    local ok3 = pcall(RegisterHook, BD_JIG .. "SERVER_ForwardInteract", function(ctx, actor, option, payload)
+        if not dnIsHost() then return end
+        local jig = safe(function() return ctx:get() end, nil)
+        if dnValid(jig) then
+            local ok, err = pcall(BD.receive, jig, payload)
+            if not ok then log("BD: receive error " .. tostring(err):sub(1, 150)) end
+        end
+    end)
+    BD.hooked = ok1 and ok2 and ok3
+    if BD.hooked or BD.tries == 1 or BD.tries >= 30 then
+        log(("BD: hooks launch=%s spawn=%s forward=%s"):format(tostring(ok1), tostring(ok2), tostring(ok3)))
+    end
+end
+
 local PR = {}
 CS.PR = PR
 PR.sig = function(path)
@@ -5132,6 +5321,63 @@ do
         end)
         return true
     end)
+    -- Build test: the joiner places a campfire the way the game does it
+    -- (Event_LaunchBuildMode, then Svr_SpawnBuild with the spot) and the host
+    -- checks a campfire appeared there.
+    A.BUILD_DA = "/Game/Inventory/Items/DataAssets/Buildable/Crafting/DA_Campfire.DA_Campfire"
+    local function countNear(cn, l, r)
+        local n = 0
+        for _, a in ipairs(safe(function() return FindAllOf(cn) end, nil) or {}) do
+            local al = dnValid(a) and safe(function() return a:K2_GetActorLocation() end, nil)
+            if al and l and (al.X - l.X)^2 + (al.Y - l.Y)^2 < r * r then n = n + 1 end
+        end
+        return n
+    end
+    A.buildTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local cp = z.p
+        if z.t == 6 then
+            z.cl = safe(function() return cp:K2_GetActorLocation() end, nil)
+            z.n0 = countNear("Buildable_Campfire_C", z.cl, 1500)
+            alog(("BUILD: %d campfires near the joiner before; hooks in=%s"):format(z.n0, tostring(CS.BD and CS.BD.hooked)))
+            fwrite("sdmp_phase.txt", "build1")
+        elseif z.t == 16 then
+            local l = safe(function() return cp:K2_GetActorLocation() end, nil) or z.cl
+            local n = countNear("Buildable_Campfire_C", l, 1500)
+            alog(("BUILD RESULT joiner placed a campfire: near the joiner on the host %d -> %d (info from joiner %d, spawn requests %d) -> %s")
+                :format(z.n0 or -1, n, CS.BD.rx, CS.BD.built, n > (z.n0 or 0) and "PASS" or "FAIL"))
+        elseif z.t == 18 then
+            alog("BUILD done")
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    A.buildClient = function()
+        if A.bc1 or not (fread("sdmp_phase.txt") or ""):find("build1") then return end
+        A.bc1 = true
+        local me = myPawn()
+        local comp = safe(function() return me.BuildingComponent end, nil)
+        local da = safe(function() return StaticFindObject(A.BUILD_DA) end, nil)
+        if not dnValid(da) then da = safe(function() return LoadAsset(A.BUILD_DA) end, nil) end
+        if not (dnValid(comp) and dnValid(da)) then alog(("BUILD(client): comp=%s da=%s"):format(tostring(dnValid(comp)), tostring(dnValid(da)))); return end
+        local ws = safe(function() return UEHelpers.GetWorld():K2_GetWorldSettings() end, nil)
+        local ok, err = pcall(function() comp:Event_LaunchBuildMode(da, false, ws) end)
+        alog(("BUILD(client): build mode for %s -> %s %s"):format(className(da), tostring(ok), tostring(err or ""):sub(1, 100)))
+        gameDelay(2000, function()
+            local l = me:K2_GetActorLocation()
+            local f = me:GetActorForwardVector()
+            local tr = { Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+                         Translation = { X = l.X + f.X * 250, Y = l.Y + f.Y * 250, Z = l.Z - 88 },
+                         Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+            local ok2, err2 = pcall(function() comp:Svr_SpawnBuild(tr) end)
+            alog(("BUILD(client): Svr_SpawnBuild -> %s %s"):format(tostring(ok2), tostring(err2 or ""):sub(1, 100)))
+            gameDelay(500, function() pcall(function() comp:Event_StopBuildMode() end) end)
+            gameDelay(5000, function()
+                local n = countNear("Buildable_Campfire_C", me:K2_GetActorLocation(), 1500)
+                alog(("BUILD(client): campfires near me on the joiner's screen: %d"):format(n))
+            end)
+        end)
+    end
     -- crouch the way the player's key does: the server RPC, not Crouch()
     A.realCrouch = function(p, on)
         local fn = on and "Svr_Crouch" or "Svr_UnCrouch"
@@ -5535,7 +5781,7 @@ do
                     else
                         alog("no safe spot by the host yet - joiner stays where it spawned")
                     end
-                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot") and not A.ztest then
+                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -5619,7 +5865,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or A.zTick)() end
+            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or (A.test == "build" and A.buildTick) or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
@@ -5732,7 +5978,7 @@ do
                 A.step, A.t = "playing", 0
                 return
             end
-            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" then
+            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -5895,6 +6141,7 @@ do
             if A.test == "door" then pcall(A.doorClient) end
             if A.test == "well" then pcall(A.wellClient) end
             if A.test == "loot" then pcall(A.lootClient) end
+            if A.test == "build" then pcall(A.buildClient) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0
