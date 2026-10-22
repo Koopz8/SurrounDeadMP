@@ -2976,10 +2976,57 @@ local function gearReplicate()
         end
     end
 end
+-- Items lying on the ground are pickup actors spawned with replication OFF,
+-- same as gear: a joiner never saw anything the host or another player
+-- dropped, and the host's copy of a level item it picked up stayed put on
+-- the joiner's screen. While co-op is running the host turns replication on
+-- for loose pickups within 80 m of a joiner, so they appear, fall and vanish
+-- for everyone. Level-placed items keep their identity (the joiner's own copy
+-- becomes the replicated one, like doors).
+CS.groundDone = CS.groundDone or {}
+CS.GROUND_R2 = 8000 * 8000
+local function groundReplicate()
+    local remote = {}
+    for _, p in ipairs(livePlayers(5)) do
+        if safe(function() return p:IsLocallyControlled() end, true) == false then
+            local l = safe(function() return p:K2_GetActorLocation() end, nil)
+            if l then remote[#remote + 1] = l end
+        end
+    end
+    if #remote == 0 then return end
+    local n, seen = 0, 0
+    for _, c in ipairs(safe(function() return FindAllOf("BP_JigPickupComponent_C") end, nil) or {}) do
+        local a = dnValid(c) and safe(function() return c:GetOwner() end, nil)
+        if dnValid(a) then
+            seen = seen + 1
+            local k = safe(function() return a:GetAddress() end, 0)
+            if not CS.groundDone[k] and safe(function() return a.bReplicates end, true) == false
+               and not dnValid(safe(function() return a:GetAttachParentActor() end, nil))
+               and CS.inPlayWorld(a) then
+                local l = safe(function() return a:K2_GetActorLocation() end, nil)
+                local near = false
+                for _, r in ipairs(remote) do
+                    if l and (l.X - r.X)^2 + (l.Y - r.Y)^2 < CS.GROUND_R2 then near = true; break end
+                end
+                if near then
+                    CS.groundDone[k] = true
+                    pcall(function() a:SetReplicates(true) end)
+                    pcall(function() a:SetReplicateMovement(true) end)
+                    pcall(function() a:ForceNetUpdate() end)
+                    n = n + 1
+                    if n <= 6 then log("GROUND: replicating " .. className(a)) end
+                end
+            end
+        end
+    end
+    if n > 0 then log(("GROUND: %d loose item(s) now replicate (%d pickups loaded)"):format(n, seen)) end
+end
+CS.groundReplicate = groundReplicate
 local function clothingSync()
     clothingDrain()
     CS.gt = (CS.gt or 0) + 1
     if CS.gt % 8 == 0 and dnCoop() then pcall(gearReplicate) end   -- every 2s
+    if CS.gt % 8 == 4 and dnCoop() then pcall(groundReplicate) end -- every 2s, offset
     local now = os.time()
     for _, c in ipairs(listControllers()) do
         if safe(function() return c:IsLocalController() end, true) == false then
@@ -3868,9 +3915,18 @@ local function bdPath(o)
     local fn = safe(function() return o:GetFullName() end, "") or ""
     return fn:match("^%S+%s+(.+)$") or fn
 end
+-- Guid fields are unsigned on the engine side: a negative value we sent can
+-- come back as a large positive one, so read every field as signed 32-bit
+-- (hashes and negative map coordinates both depend on it)
+local function bdS32(v)
+    v = math.tointeger(tonumber(v) or 0) or math.floor(tonumber(v) or 0)
+    v = v & 0xFFFFFFFF
+    if v >= 0x80000000 then v = v - 0x100000000 end
+    return v
+end
 local function bdGuid(g)
-    return { A = safe(function() return g.A end, 0) or 0, B = safe(function() return g.B end, 0) or 0,
-             C = safe(function() return g.C end, 0) or 0, D = safe(function() return g.D end, 0) or 0 }
+    return { A = bdS32(safe(function() return g.A end, 0)), B = bdS32(safe(function() return g.B end, 0)),
+             C = bdS32(safe(function() return g.C end, 0)), D = bdS32(safe(function() return g.D end, 0)) }
 end
 local function bdArr(arr)
     local out = {}
@@ -3956,6 +4012,9 @@ BD.receive = function(jig, payload)
         if pend then pend.uid = u end
         return
     end
+    -- handled a moment later, outside the network call (object searches made
+    -- from inside it came back empty)
+    if u.A == BD.PICK then gameDelay(50, function() pcall(BD.pickedUp, who, u) end); return end
     if u.A ~= BD.NEW and u.A ~= BD.MOVE then return end
     local comp = safe(function() return who.BuildingComponent end, nil)
     if not dnValid(comp) then log("BD: joiner has no BuildingComponent"); return end
@@ -4003,6 +4062,73 @@ BD.afterSpawn = function(comp)
         log("BD: joiner built (no item id to take)")
     end
 end
+-- Ground pickups. A joiner's F press on an item reaches the host and the item
+-- goes into its inventory, but the item stayed on the ground for everyone:
+-- the game removes it in the success callback on the picking player's own
+-- machine, and a joiner isn't allowed to remove a networked actor. So when
+-- that callback fires on a joiner it tells the host which item it took
+-- ("SDPK", hash of the item's class, X/Y) and the host hides it and turns its
+-- collision off - which reaches every player. Hidden rather than destroyed:
+-- some item actors are reused as the equipped item later.
+BD.PICK = 0x5344504B
+BD.picks = 0
+BD.sendPicked = function(jig, actor)
+    if dnIsHost() or not dnValid(actor) then return end
+    local me = safe(function() return jig:GetOwner() end, nil)
+    if not dnValid(me) or not safe(function() return me:IsLocallyControlled() end, false) then return end
+    local l = safe(function() return actor:K2_GetActorLocation() end, nil)
+    if not l then return end
+    local ok = bdForward(me, jig, { A = BD.PICK, B = bdHash(className(actor)), C = bdI32(l.X), D = bdI32(l.Y) })
+    -- the server parks a taken item at the map origin, out of our network
+    -- range, so our copy would sit on the ground forever: hide it ourselves
+    pcall(function() actor:SetActorHiddenInGame(true) end)
+    pcall(function() actor:SetActorEnableCollision(false) end)
+    log(("PK: told the host I picked up %s at %.0f,%.0f (hash %d) -> %s"):format(className(actor), l.X, l.Y, bdHash(className(actor)), tostring(ok)))
+end
+-- host: actors joiners asked to pick up, newest last. By the time the joiner
+-- confirms, the server has already removed the item's pickup component, so
+-- the leftover actor can't be found by searching components any more.
+BD.reqs = {}
+BD.noteReq = function(jig, actorParam)
+    local who = safe(function() return jig:GetOwner() end, nil)
+    if not dnValid(who) or safe(function() return who:IsLocallyControlled() end, true) then return end
+    local a = safe(function() return actorParam:get() end, nil)
+    if not dnValid(a) then return end
+    local now = os.time()
+    local keep = {}
+    for _, r in ipairs(BD.reqs) do
+        if now - r.t < 30 and dnValid(r.a) then keep[#keep + 1] = r end
+    end
+    keep[#keep + 1] = { a = a, t = now, h = bdHash(className(a)), who = who:GetAddress() }
+    while #keep > 16 do table.remove(keep, 1) end
+    BD.reqs = keep
+end
+BD.hide = function(a)
+    pcall(function() a:SetReplicates(true) end)
+    pcall(function() a:SetActorHiddenInGame(true) end)
+    pcall(function() a:SetActorEnableCollision(false) end)
+    pcall(function() a:ForceNetUpdate() end)
+    BD.picks = BD.picks + 1
+end
+BD.pickedUp = function(who, u)
+    -- the joiner's newest request for this kind of item (the server may already
+    -- have moved the leftover actor, so position is only logged)
+    local best, bi
+    for i, r in ipairs(BD.reqs) do
+        if dnValid(r.a) and r.h == u.B and r.who == who:GetAddress() then best, bi = r.a, i end
+    end
+    if not best then
+        local have = {}
+        for _, r in ipairs(BD.reqs) do have[#have + 1] = ("%s/%d"):format(dnValid(r.a) and className(r.a) or "gone", r.h) end
+        log(("PK: a joiner picked up hash %d at %d,%d but I have no matching request (%s)"):format(u.B, u.C, u.D, table.concat(have, ", ")))
+        return
+    end
+    table.remove(BD.reqs, bi)
+    local l = safe(function() return best:K2_GetActorLocation() end, nil)
+    BD.hide(best)
+    log(("PK: %s picked up by a joiner - removed from the ground (now at %s, joiner saw it %.0f away)"):format(className(best),
+        l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?", l and math.sqrt((l.X - u.C)^2 + (l.Y - u.D)^2) or -1))
+end
 BD.hook = function()
     if BD.hooked or BD.tries >= 30 then return end
     local cls = safe(function() return StaticFindObject("/Game/Blueprints/Components/BuildingComponent.BuildingComponent_C") end, nil)
@@ -4026,6 +4152,33 @@ BD.hook = function()
             if not ok then log("BD: receive error " .. tostring(err):sub(1, 150)) end
         end
     end)
+    if not BD.pkHooked then
+        BD.pkHooked = pcall(RegisterHook, BD_JIG .. "CLIENT_AddActorToContainerSUCCESS", function(ctx, actor)
+            if dnIsHost() then return end
+            local jig = safe(function() return ctx:get() end, nil)
+            local a = safe(function() return actor:get() end, nil)
+            if dnValid(jig) and dnValid(a) then pcall(BD.sendPicked, jig, a) end
+        end)
+        -- picking up something you already carry (ammo) stacks instead
+        local okS = pcall(RegisterHook, BD_JIG .. "CLIENT_AddStackActorResponse", function(ctx, success, uid, count, actor)
+            if dnIsHost() then return end
+            if safe(function() return success:get() end, false) ~= true then return end
+            local jig = safe(function() return ctx:get() end, nil)
+            local a = safe(function() return actor:get() end, nil)
+            if dnValid(jig) and dnValid(a) then pcall(BD.sendPicked, jig, a) end
+        end)
+        local okR1 = pcall(RegisterHook, BD_JIG .. "SERVER_RequestAddActorToContainer", function(ctx, actor)
+            if not dnIsHost() then return end
+            local jig = safe(function() return ctx:get() end, nil)
+            if dnValid(jig) then pcall(BD.noteReq, jig, actor) end
+        end)
+        local okR2 = pcall(RegisterHook, BD_JIG .. "SERVER_RequestActorAddStackItem", function(ctx, actor)
+            if not dnIsHost() then return end
+            local jig = safe(function() return ctx:get() end, nil)
+            if dnValid(jig) then pcall(BD.noteReq, jig, actor) end
+        end)
+        log(("PK: pickup hooks -> %s, stack %s, requests %s/%s"):format(tostring(BD.pkHooked), tostring(okS), tostring(okR1), tostring(okR2)))
+    end
     BD.hooked = ok1 and ok2 and ok3
     if BD.hooked or BD.tries == 1 or BD.tries >= 30 then
         log(("BD: hooks launch=%s spawn=%s forward=%s"):format(tostring(ok1), tostring(ok2), tostring(ok3)))
@@ -5083,6 +5236,7 @@ do
     A.lootTick = function()
         local z = A.ztest
         z.t = z.t + 1
+        pcall(A.ltAuto)
         local hp, cp = myPawn(), z.p
         -- teleports fail when the spot overlaps something (the container's
         -- own mesh), so walk around it until one sticks
@@ -5168,6 +5322,7 @@ do
             moveBoth(lc, "loot container")
         elseif z.t == 23 then
             alog("LOOT: container before the joiner opens it: " .. A.jigDump(z.lc))
+            alog("LOOT: host faces it too -> " .. tostring(A.faceActor(z.lc, false)))
             local l = safe(function() return z.lc:K2_GetActorLocation() end, nil)
             local cl = safe(function() return cp:K2_GetActorLocation() end, nil)
             if l and cl then
@@ -5191,6 +5346,7 @@ do
     end
     A.lootClient = function()
         pcall(A.lootHooks)
+        pcall(A.ltAuto)
         local ph = fread("sdmp_phase.txt") or ""
         local me = myPawn()
         local ml = safe(function() return me:K2_GetActorLocation() end, nil)
@@ -5209,6 +5365,7 @@ do
             if not lc then alog("LOOT(client): no container near me"); return end
             local l = safe(function() return lc:K2_GetActorLocation() end, nil)
             local d = (l and ml) and math.sqrt((l.X-ml.X)^2 + (l.Y-ml.Y)^2 + (l.Z-ml.Z)^2) or -1
+            alog("LOOT(client): facing the container -> " .. tostring(A.faceActor(lc, false)))
             local ok, err = pcall(function() lc:OnExecuteInteract(me, tag) end)
             alog(("LOOT(client): open %s %.0f away -> %s %s"):format(className(lc), d, tostring(ok), tostring(err or ""):sub(1, 100)))
             gameDelay(3000, function()
@@ -5501,7 +5658,7 @@ do
         if role ~= me then return end
         fwrite("sdmp_cmd.txt", "")
         alog("cmd: " .. cmd)
-        local fn = ({ inv = A.cmdInv, buildreal = A.cmdBuildReal, give = A.cmdGive, jig = A.cmdJig, uid = A.cmdUid, movereal = A.cmdMoveReal, builds = A.cmdBuilds })[cmd]
+        local fn = ({ inv = A.cmdInv, buildreal = A.cmdBuildReal, give = A.cmdGive, jig = A.cmdJig, uid = A.cmdUid, movereal = A.cmdMoveReal, builds = A.cmdBuilds, lootprobe = A.cmdLootProbe })[cmd]
         if not fn then alog("cmd: unknown"); return end
         local ok, err = pcall(fn)
         if not ok then alog("cmd error: " .. tostring(err):sub(1, 300)) end
@@ -5597,6 +5754,571 @@ do
                 alog(("BUILD(client): campfires near me on the joiner's screen: %d"):format(n))
             end)
         end)
+    end
+    -- Ground pickups. A joiner's F press on an item goes pickup component ->
+    -- the player's jig SERVER_RequestAddActorToContainer on the host. The
+    -- pickup test drops a campfire kit by the joiner (one forced to replicate,
+    -- one left as the game spawns it), has the joiner pick up the replicated
+    -- one the way the interact key does, and hooks every step on both sides.
+    A.pkHooks = function()
+        if A.pkHooked then return end
+        A.pkHooked = true
+        local function argStr(v)
+            local o = safe(function() return v:get() end, v)
+            if type(o) == "userdata" then
+                local n = safe(function() return o:GetFName():ToString() end, nil)
+                if n then return n end
+                local tn = safe(function() return o.TagName:ToString() end, nil)
+                if tn then return tn end
+            end
+            return tostring(o):sub(1, 40)
+        end
+        local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+        local P = "/Game/JigSInventory/Jigsaw/Pickup/BP_JigPickupComponent.BP_JigPickupComponent_C:"
+        local list = {
+            J .. "SERVER_RequestAddActorToContainer", J .. "SERVER_RequestActorAddStackItem",
+            J .. "CLIENT_AddActorToContainerSUCCESS", J .. "CLIENT_RequestAddActorToContainerFAILED",
+            J .. "CLIENT_AddStackActorResponse", J .. "SERVER_RequestDropItem", J .. "CLIENT_DropRequestFailed",
+            J .. "JigMP_OnPickupAdded", J .. "SERVER_ForwardInteract", J .. "SERVER_RequestMoveItemToAnotherComp",
+            P .. "OnExecuteInteract", P .. "OnPickupInteractExecuted", P .. "RequestServerData",
+            P .. "OnInteractActorOverDistance", P .. "CheckDistanceFromActor", P .. "IsValidPickup",
+        }
+        for _, path in ipairs(list) do
+            local short = path:match(":(.+)$")
+            if dnValid(safe(function() return StaticFindObject(path) end, nil)) then
+                local ok, err = pcall(RegisterHook, path, function(ctx, ...)
+                    local args = {}
+                    for i, v in ipairs({ ... }) do if i <= 5 then args[#args + 1] = argStr(v) end end
+                    local who = safe(function() return className(ctx:get():GetOwner()) end, "?")
+                    alog(("PKHOOK %s on %s (%s)"):format(short, who, table.concat(args, ", ")))
+                end)
+                if not ok then alog("PKHOOK " .. short .. " not hooked: " .. tostring(err):sub(1, 80)) end
+            else
+                alog("PKHOOK " .. short .. " not loaded")
+            end
+        end
+        pcall(function()
+            NotifyOnNewObject("/Game/JigSInventory/Jigsaw/Pickup/BP_JigPickupComponent.BP_JigPickupComponent_C", function(o)
+                gameDelay(200, function()
+                    local a = dnValid(o) and safe(function() return o:GetOwner() end, nil)
+                    local l = dnValid(a) and safe(function() return a:K2_GetActorLocation() end, nil)
+                    alog(("PKHOOK new pickup %s at %s: %s"):format(dnValid(a) and className(a) or "?",
+                        l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?", dnValid(a) and A.pkState(a) or "no owner"))
+                end)
+            end)
+        end)
+        alog("PKHOOK hooks in")
+    end
+    A.pkSpawn = function(near, dx, dy, rep)
+        local cls = safe(function() return StaticFindObject(A.GIVE_CLS) end, nil)
+        if not dnValid(cls) then
+            safe(function() return LoadAsset(A.GIVE_CLS:gsub("_C$", "")) end, nil)
+            cls = safe(function() return StaticFindObject(A.GIVE_CLS) end, nil)
+        end
+        if not dnValid(cls) then return nil, "no class" end
+        local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+        local l = near:K2_GetActorLocation()
+        local tr = { Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+                     Translation = { X = l.X + dx, Y = l.Y + dy, Z = l.Z - 40 },
+                     Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 } }
+        local a = safe(function() return gs:BeginDeferredActorSpawnFromClass(near, cls, tr, 1, nil, 0) end, nil)
+        if not dnValid(a) then return nil, "spawn failed" end
+        pcall(function() gs:FinishSpawningActor(a, tr, 0) end)
+        local def = safe(function() return a:GetIsReplicated() end, "?")
+        if rep then
+            pcall(function() a:SetReplicates(true) end)
+            pcall(function() a:SetReplicateMovement(true) end)
+            pcall(function() a:ForceNetUpdate() end)
+        end
+        return a, ("replicates by default=%s"):format(tostring(def))
+    end
+    -- what a pickup actor looks like right now (valid, hidden, picked flags, attached to)
+    A.pkState = function(a)
+        if not dnValid(a) then return "gone" end
+        local c = safe(function() return a.BP_JigPickupComponent end, nil)
+        local par = safe(function() return a:GetAttachParentActor() end, nil)
+        local l = safe(function() return a:K2_GetActorLocation() end, nil)
+        return ("at %s hidden=%s canBePicked=%s canInteract=%s attachedTo=%s owner=%s rep=%s"):format(
+            l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?",
+            tostring(safe(function() return a.bHidden end, "?")),
+            tostring(dnValid(c) and safe(function() return c["CanBePicked?"] end, "?") or "nocomp"),
+            tostring(dnValid(c) and safe(function() return c["CanInteract?"] end, "?") or "nocomp"),
+            dnValid(par) and className(par) or "none",
+            className(safe(function() return a:GetOwner() end, nil)),
+            tostring(safe(function() return a.bReplicates end, "?")))
+    end
+    A.pkNames = function(p)
+        local out = {}
+        local mc = safe(function() return p.BP_JigMultiplayer.MainJigContainers end, nil)
+        for i = 1, (mc and #mc or 0) do
+            local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+            for j = 1, (items and #items or 0) do
+                local it = safe(function() return items[j]:get() end, nil) or items[j]
+                local d = safe(function() return it["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] end, nil)
+                if dnValid(d) then out[bdPath(d):match("([%w_]+)$") or "?"] = true end
+            end
+        end
+        return out
+    end
+    A.pkUidOf = function(p, exclude)
+        local mc = safe(function() return p.BP_JigMultiplayer.MainJigContainers end, nil)
+        local last
+        for i = 1, (mc and #mc or 0) do
+            local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+            for j = 1, (items and #items or 0) do
+                local it = safe(function() return items[j]:get() end, nil) or items[j]
+                local g = bdGuid(safe(function() return it["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] end, nil) or {})
+                local d = safe(function() return it["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] end, nil)
+                local nm = dnValid(d) and bdPath(d):match("([%w_]+)$") or "?"
+                -- attachments (a gun's loader or magazine) live inside another item, skip them
+                if (g.A ~= 0 or g.B ~= 0) and not nm:find("Loader") and not nm:find("Mag") and not nm:find("Scope") and not nm:find("Sight")
+                   and not (exclude and exclude[nm]) then
+                    last = { g = g, name = nm }
+                    if dnValid(d) and dnValid(safe(function() return d.BuildActorClass end, nil)) then return last end
+                end
+            end
+        end
+        return last
+    end
+    A.pkNear = function(l, r)
+        local out = {}
+        for _, a in ipairs(A.groundPickups()) do
+            local al = safe(function() return a:K2_GetActorLocation() end, nil)
+            if al and l and (al.X - l.X)^2 + (al.Y - l.Y)^2 < r * r then out[#out + 1] = a end
+        end
+        return out
+    end
+    -- dev: list the SteamCore functions a Steam join would use, with their
+    -- class paths and parameters, plus any live SteamCore subsystem objects
+    A.steamProbe = function()
+        local want = { GetSteamID = 1, GetSteamID_Pure = 1, SetRichPresence = 1, ClearRichPresence = 1,
+            GetFriendRichPresence = 1, RequestFriendRichPresence = 1, GetFriendCount = 1, GetFriendByIndex = 1,
+            GetFriendPersonaName = 1, GetPersonaName = 1, ActivateGameOverlayInviteDialogConnectString = 1,
+            ActivateGameOverlayInvitedialog = 1, GetLaunchCommandLine = 1, MakeSteamID = 1, GetSteamIdFromPlayerState = 1,
+            CreateLobby = 1, JoinLobby = 1, SetLobbyData = 1, GetLobbyData = 1, GetLobbyOwner = 1 }
+        local found, insts = {}, {}
+        ForEachUObject(function(o)
+            local fn = safe(function() return o:GetFullName() end, "") or ""
+            if fn:find("/Script/SteamCore", 1, true) then
+                if fn:sub(1, 9) == "Function " then
+                    local name = fn:match(":([%w_]+)$")
+                    if name and want[name] then found[#found + 1] = fn:sub(10) end
+                elseif not fn:find("Default__", 1, true) and not fn:find("^Class ") and not fn:find("^Script") then
+                    if #insts < 40 then insts[#insts + 1] = fn end
+                end
+            end
+        end)
+        table.sort(found)
+        for _, f in ipairs(found) do alog("STEAMFN " .. f .. " (" .. PR.sig(f) .. ")") end
+        alog(("STEAM probe: %d functions; SteamCore objects: %s"):format(#found, table.concat(insts, " | "):sub(1, 1500)))
+    end
+    -- Real key presses for tests: Enhanced Input lets us inject an action the
+    -- same way a key does, so the game's own handlers run (scripted calls to
+    -- the interact functions skip part of the real path).
+    A.IA = "/Game/Input/InventoryPlayerActions/"
+    A.inputSub = function()
+        for _, o in ipairs(safe(function() return FindAllOf("EnhancedInputLocalPlayerSubsystem") end, nil) or {}) do
+            if dnValid(o) and not safe(function() return o:GetFullName() end, ""):find("Default__", 1, true) then return o end
+        end
+        return nil
+    end
+    A.press = function(ia, secs, tag)
+        local act = safe(function() return StaticFindObject(A.IA .. ia .. "." .. ia) end, nil)
+        if not dnValid(act) then act = safe(function() return LoadAsset(A.IA .. ia .. "." .. ia) end, nil) end
+        local sub = A.inputSub()
+        if not (dnValid(act) and dnValid(sub)) then
+            alog(("INJ %s: action=%s subsystem=%s"):format(ia, tostring(dnValid(act)), tostring(dnValid(sub)))); return false
+        end
+        if not A.injSig then
+            A.injSig = true
+            local E = "/Script/EnhancedInput.EnhancedInputSubsystemInterface:"
+            alog("INJ sig Start: " .. PR.sig(E .. "StartContinuousInputInjectionForAction"))
+            alog("INJ sig Inject: " .. PR.sig(E .. "InjectInputForAction"))
+        end
+        -- FInputActionValue keeps its value in a field Lua can't fill, so use
+        -- the vector form and repeat it every frame for as long as the key is held
+        if not A.injSig2 then
+            A.injSig2 = true
+            alog("INJ sig Vector: " .. PR.sig("/Script/EnhancedInput.EnhancedInputSubsystemInterface:InjectInputVectorForAction"))
+        end
+        local want, n, okAny, lastErr = math.max(1, math.ceil(secs * 1000 / 16)), 0, false, nil
+        local function once()
+            local ok, err = pcall(function() sub:InjectInputVectorForAction(act, { X = 1.0, Y = 0.0, Z = 0.0 }, {}, {}) end)
+            n = n + 1
+            okAny = okAny or ok
+            if not ok then lastErr = err end
+        end
+        once()
+        gameLoop(16, function()
+            if n >= want then
+                alog(("INJ %s held %.1fs (%s): %d injections, ok=%s %s"):format(ia, secs, tag or "", n, tostring(okAny), tostring(lastErr or ""):sub(1, 100)))
+                return true
+            end
+            once()
+        end)
+        local ok = true
+        return ok
+    end
+    -- turn the local camera at an actor (host also steps next to it first)
+    A.faceActor = function(a, step)
+        local pc, me = UEHelpers.GetPlayerController(), myPawn()
+        local l = safe(function() return a:K2_GetActorLocation() end, nil)
+        local ml = safe(function() return me:K2_GetActorLocation() end, nil)
+        if not (l and ml) then return false end
+        local d0 = math.sqrt((l.X - ml.X)^2 + (l.Y - ml.Y)^2)
+        if step and d0 > 160 then
+            local dest = { X = l.X + (ml.X - l.X) / d0 * 140, Y = l.Y + (ml.Y - l.Y) / d0 * 140, Z = ml.Z }
+            pcall(function() me:K2_TeleportTo(dest, me:K2_GetActorRotation()) end)
+            ml = safe(function() return me:K2_GetActorLocation() end, ml)
+        end
+        local cam = safe(function() return pc.PlayerCameraManager:GetCameraLocation() end, nil) or { X = ml.X, Y = ml.Y, Z = ml.Z + 70 }
+        local yaw = math.deg(math.atan(l.Y - cam.Y, l.X - cam.X))
+        local pitch = math.deg(math.atan(l.Z - cam.Z, math.sqrt((l.X - cam.X)^2 + (l.Y - cam.Y)^2)))
+        return pcall(function() pc:SetControlRotation({ Pitch = pitch, Yaw = yaw, Roll = 0.0 }) end)
+    end
+    -- dev: every loaded function whose name matches one of the patterns
+    A.fnProbe = function(pats, tag)
+        local found = {}
+        ForEachUObject(function(o)
+            local fn = safe(function() return o:GetFullName() end, "") or ""
+            if fn:sub(1, 9) == "Function " then
+                local low = fn:lower()
+                for _, p in ipairs(pats) do
+                    if low:find(p, 1, true) then found[#found + 1] = fn:sub(10); break end
+                end
+            end
+        end)
+        table.sort(found)
+        alog(("FNPROBE %s: %d functions"):format(tag or "", #found))
+        for i = 1, math.min(#found, 40) do alog("FNPROBE " .. found[i] .. " (" .. PR.sig(found[i]) .. ")") end
+    end
+    -- dev (file command "lootprobe", run while a loot window is open): find the
+    -- Loot All handler and trace every item move and its reply, to see why a
+    -- joiner's Loot All only moves one item per press
+    A.cmdLootProbe = function()
+        pcall(A.fnProbe, { "lootall", "loot_all", "takeall", "take_all" }, "loot all")
+        if A.ltHooked then alog("LT: already tracing"); return end
+        A.ltHooked = true
+        local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+        local n = 0
+        for _, f in ipairs({ "SERVER_RequestMoveItemToAnotherComp", "CLIENT_MoveItemToIndex", "CLIENT_MoveToIndexFailed",
+                             "MC_MoveItemToIndex", "MC_ItemRemoved", "CLIENT_ItemRemoved", "CLIENT_NewItemAdded", "MC_NewItemAdded",
+                             "CLIENT_AddNewItem", "MC_AddNewItem", "CLIENT_ContainerDataResponse", "SERVER_RequestData",
+                             "CLIENT_SwapContainersResponse", "CLIENT_UpdateCounts", "MC_UpdateCounts" }) do
+            if dnValid(safe(function() return StaticFindObject(J .. f) end, nil)) then
+                local ok = pcall(RegisterHook, J .. f, function(ctx)
+                    local who = safe(function() return className(ctx:get():GetOwner()) end, "?")
+                    alog(("LT %s on %s"):format(f, who))
+                end)
+                if ok then n = n + 1 end
+            end
+        end
+        ForEachUObject(function(o)
+            local fn = safe(function() return o:GetFullName() end, "") or ""
+            if fn:sub(1, 9) == "Function " and fn:lower():find("lootall", 1, true) then
+                local path = fn:sub(10)
+                if pcall(RegisterHook, path, function() alog("LT called " .. path:match("[^.:]+$")) end) then n = n + 1 end
+            end
+        end)
+        alog(("LT: tracing %d functions - press Loot All now"):format(n))
+    end
+    -- loot test: switch the Loot All trace on by itself as soon as the loot
+    -- window's code has loaded (it loads the first time a window opens)
+    A.ltAuto = function()
+        if A.ltHooked then return end
+        A.ltN = (A.ltN or 0) + 1
+        if A.ltN % 3 ~= 0 then return end
+        local hit = false
+        ForEachUObject(function(o)
+            if hit then return end
+            local fn = safe(function() return o:GetFullName() end, "") or ""
+            if fn:sub(1, 9) == "Function " and fn:lower():find("lootall", 1, true) then hit = true end
+        end)
+        if hit then alog("LT: loot window code is loaded - tracing"); pcall(A.cmdLootProbe) end
+    end
+    -- Steam helpers (SteamCore is linked into the game). Its classes are
+    -- either subsystems (find the live instance) or static libraries (call the
+    -- class default object); try the instance first.
+    A.steamObj = function(cls)
+        for _, o in ipairs(safe(function() return FindAllOf(cls) end, nil) or {}) do
+            if dnValid(o) and not safe(function() return o:GetFullName() end, ""):find("Default__", 1, true)
+               and safe(function() return o:GetFullName() end, ""):find("/Script/SteamCore", 1, true) == nil then return o end
+        end
+        return safe(function() return StaticFindObject("/Script/SteamCore.Default__" .. cls) end, nil)
+    end
+    -- Steam joining. SteamCore's Steam-id struct has no fields Lua can see,
+    -- so anything that takes a Steam id comes through blank. What works: the
+    -- host's own id from Steam's loginusers.vdf, rich presence (plain
+    -- strings) and the invite dialog with a connect string. A friend who
+    -- clicks Join Game or accepts the invite gets their game started with
+    -- "+sdmpjoin=steam.<id>", which boot() picks up. Steam's own P2P relay
+    -- carries the game (SteamSocketsNetDriver), so no port forwarding.
+    A.steamUp = function()
+        local fr = A.steamObj("Friends")
+        local n = dnValid(fr) and safe(function() return fr:GetPersonaName():ToString() end, "") or ""
+        return #n > 0, n
+    end
+    A.mySteamId = function()
+        if A.steamId64 then return A.steamId64 end
+        local up, persona = A.steamUp()
+        if not up then return nil, "Steam isn't running for this game (start it from Steam)" end
+        local roots = {}
+        local lib = pjDir():match("^(.-)[/\\][Ss]team[Aa]pps[/\\]")
+        if lib then roots[#roots + 1] = lib end
+        roots[#roots + 1] = "C:\\Program Files (x86)\\Steam"
+        roots[#roots + 1] = "C:\\Program Files\\Steam"
+        for _, root in ipairs(roots) do
+            local f = io.open(root .. "\\config\\loginusers.vdf", "r")
+            if f then
+                local txt = f:read("*a") or ""
+                f:close()
+                local byName, recent
+                for id, body in txt:gmatch('"(7656119%d+)"%s*(%b{})') do
+                    if body:match('"PersonaName"%s*"([^"]*)"') == persona then byName = id end
+                    if body:match('"MostRecent"%s*"1"') then recent = id end
+                end
+                if byName or recent then A.steamId64 = byName or recent; return A.steamId64 end
+            end
+        end
+        return nil, "couldn't find your Steam id in loginusers.vdf"
+    end
+    A.steamHost = function()
+        local id, why = A.mySteamId()
+        if not id then alog("STEAM: can't host over Steam - " .. tostring(why)); return false end
+        local fr = A.steamObj("Friends")
+        A.steamConnect = "+sdmpjoin=steam." .. id
+        local ok1 = safe(function() return fr:SetRichPresence("connect", A.steamConnect) end, false)
+        local ok2 = safe(function() return fr:SetRichPresence("status", "Hosting co-op") end, false)
+        alog(("STEAM: hosting as Steam id ...%s, Join Game on -> %s %s"):format(id:sub(-4), tostring(ok1), tostring(ok2)))
+        return ok1 == true
+    end
+    A.steamInvite = function()
+        if A.role ~= "host" or not A.steamConnect then log("SDMP: F9 invites friends while you host over Steam"); return end
+        local fr = A.steamObj("Friends")
+        local ok = pcall(function() fr:ActivateGameOverlayInviteDialogConnectString(A.steamConnect) end)
+        log("STEAM: invite dialog -> " .. tostring(ok))
+    end
+    A.steamProbe2 = function()
+        local fr, us = A.steamObj("Friends"), A.steamObj("User")
+        alog(("STEAM2 Friends=%s User=%s"):format(dnValid(fr) and fr:GetFullName() or "none", dnValid(us) and us:GetFullName() or "none"))
+        local function str(v) return safe(function() return v:ToString() end, nil) or tostring(v) end
+        local ok, id = pcall(function() return us:GetSteamID() end)
+        local keys = {}
+        if type(id) == "table" then for k, v in pairs(id) do keys[#keys + 1] = tostring(k) .. "=" .. type(v) end end
+        alog(("STEAM2 GetSteamID -> %s %s {%s}"):format(tostring(ok), type(id), table.concat(keys, ",")))
+        A.myId = id
+        local pn = str(safe(function() return fr:GetPersonaName() end, ""))
+        alog(("STEAM2 persona name length %d"):format(#(pn or "")))
+        local ok1, r1 = pcall(function() return fr:SetRichPresence("status", "Testing co-op") end)
+        local ok1b, r1b = pcall(function() return fr:SetRichPresence("sdmp_host", "test") end)
+        local ok2, r2 = pcall(function() return fr:GetFriendRichPresence(id, "sdmp_host") end)
+        alog(("STEAM2 rich presence status -> %s %s, sdmp_host -> %s %s; read back on self -> %s '%s'"):format(
+            tostring(ok1), tostring(r1), tostring(ok1b), tostring(r1b), tostring(ok2), str(r2)))
+        pcall(function() fr:ClearRichPresence() end)
+        for _, flags in ipairs({ { 3 }, { 11 } }) do
+            local okc, n = pcall(function() return fr:GetFriendCount(flags) end)
+            alog(("STEAM2 GetFriendCount({%s}) -> %s %s"):format(table.concat(flags, ","), tostring(okc), tostring(n)))
+        end
+        local eng = UEHelpers.GetEngine()
+        local defs = safe(function() return eng.NetDriverDefinitions end, nil)
+        for i = 1, (defs and #defs or 0) do
+            alog(("STEAM2 net driver %s = %s (fallback %s)"):format(
+                tostring(safe(function() return defs[i].DefName:ToString() end, "?")),
+                tostring(safe(function() return defs[i].DriverClassName:ToString() end, "?")),
+                tostring(safe(function() return defs[i].DriverClassNameFallback:ToString() end, "?"))))
+        end
+    end
+    -- Steam test (game started through Steam): can an id struct survive a trip
+    -- through Lua, does rich presence work, and does the host listen on Steam
+    A.steamProbe3 = function()
+        local function str(v) return safe(function() return v:ToString() end, nil) or tostring(v) end
+        local fr, us = A.steamObj("Friends"), A.steamObj("User")
+        local su = safe(function() return StaticFindObject("/Script/SteamCore.Default__SteamUtilities") end, nil)
+        alog(("STEAM3 objects: friends=%s user=%s utilities=%s"):format(tostring(dnValid(fr)), tostring(dnValid(us)), tostring(dnValid(su))))
+        alog("STEAM3 persona name length " .. #(str(safe(function() return fr:GetPersonaName() end, "")) or ""))
+        local id = safe(function() return us:GetSteamID() end, nil)
+        local keys = {}
+        if type(id) == "table" then for k in pairs(id) do keys[#keys + 1] = tostring(k) end end
+        alog(("STEAM3 GetSteamID -> %s {%s}"):format(type(id), table.concat(keys, ",")))
+        pcall(function()
+            local st = StaticFindObject("/Script/SteamCore.SteamID")
+            local f = {}
+            st:ForEachProperty(function(pr) f[#f + 1] = pr:GetFName():ToString() .. ":" .. pr:GetClass():GetFName():ToString() end)
+            alog("STEAM3 FSteamID reflected fields: " .. (#f > 0 and table.concat(f, ", ") or "none"))
+        end)
+        alog("STEAM3 BreakSteamID sig: " .. PR.sig("/Script/SteamCore.SteamUtilities:BreakSteamID"))
+        local okb, br = pcall(function() return su:BreakSteamID(id) end)
+        local bs = okb and str(br) or nil
+        alog(("STEAM3 BreakSteamID -> %s %s, digits=%d"):format(tostring(okb), type(br), bs and #(bs:gsub("%D", "")) or -1))
+        local okr = safe(function() return fr:SetRichPresence("sdmp_test", "roundtrip") end, "err")
+        alog("STEAM3 SetRichPresence -> " .. tostring(okr))
+        local back1 = str(safe(function() return fr:GetFriendRichPresence(id, "sdmp_test") end, "err"))
+        alog("STEAM3 read back through GetSteamID's struct -> '" .. tostring(back1) .. "'")
+        if bs and #bs > 5 then
+            local mk = safe(function() return su:MakeSteamID(bs) end, nil)
+            local back2 = str(safe(function() return fr:GetFriendRichPresence(mk, "sdmp_test") end, "err"))
+            alog("STEAM3 read back through MakeSteamID(BreakSteamID) -> '" .. tostring(back2) .. "'")
+        end
+        local nf = safe(function() return fr:GetFriendCount({ 3 }) end, -1)
+        alog("STEAM3 friends: " .. tostring(nf))
+        if (tonumber(nf) or 0) > 0 then
+            local f0 = safe(function() return fr:GetFriendByIndex(0, { 3 }) end, nil)
+            local nm = str(safe(function() return fr:GetFriendPersonaName(f0) end, ""))
+            alog(("STEAM3 first friend's name through the struct: length %d"):format(#(nm or "")))
+        end
+        local sid, why = A.mySteamId()
+        alog(("STEAM3 own Steam id from loginusers.vdf: %s"):format(sid and ("found, 17 digits=" .. tostring(#sid == 17) .. ", ends " .. sid:sub(-4)) or tostring(why)))
+        local okH, hosted = pcall(A.steamHost)
+        alog(("STEAM3 Join Game set up -> %s %s (%s)"):format(tostring(okH), tostring(hosted), tostring(A.steamConnect and A.steamConnect:gsub("%d%d%d%d%d%d%d%d%d%d%d%d%d", "...") or "-")))
+        local nd = safe(function() return UEHelpers.GetWorld().NetDriver end, nil)
+        alog("STEAM3 host net driver: " .. (dnValid(nd) and className(nd) or "none"))
+    end
+    -- newest pickup near l that wasn't in the before-list
+    A.pkNew = function(l, before)
+        local seen = {}
+        for _, x in ipairs(before or {}) do seen[safe(function() return x:GetAddress() end, 0)] = true end
+        local hl = safe(function() return myPawn():K2_GetActorLocation() end, nil)
+        local found
+        for _, x in ipairs(A.groundPickups()) do
+            if not seen[safe(function() return x:GetAddress() end, 0)] then
+                local xl = x:K2_GetActorLocation()
+                local function dist(p) return p and math.sqrt((xl.X - p.X)^2 + (xl.Y - p.Y)^2) or -1 end
+                alog(("PICK new ground item %s: %.0f from the joiner, %.0f from the host"):format(className(x), dist(l), dist(hl)))
+                found = found or x
+            end
+        end
+        return found
+    end
+    A.pkTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local cp, hp = z.p, myPawn()
+        local tag = { TagName = FName("Jig.InteractOptions.Option1") }
+        z.ph = z.ph or "wait"
+        if z.t == 3 then
+            pcall(A.pkHooks)
+        end
+        if z.ph == "wait" and z.t >= 8 then
+            -- the joiner's saved inventory arrives ~8-15 s after its body
+            if PJ.itemCount(cp) > 3 or z.t >= 45 then
+                local u = A.pkUidOf(cp)
+                if not u then alog("PICK: joiner has no item to drop"); z.ph = "end"; z.tp = z.t; return end
+                z.before = A.groundPickups("before drop")
+                z.d0 = PJ.itemCount(cp)
+                z.dropName = u.name
+                alog(("PICK: joiner drops %s; %d items, %d ground items near it"):format(u.name, z.d0, #z.before))
+                fwrite("sdmp_phase.txt", ("drop:%d,%d,%d,%d"):format(u.g.A, u.g.B, u.g.C, u.g.D))
+                z.ph, z.tp = "dropped", z.t
+            end
+        elseif z.ph == "dropped" and z.t == z.tp + 6 then
+            A.groundPickups("after drop")
+            z.dk = A.pkNew(cp:K2_GetActorLocation(), z.before)
+            z.d1 = PJ.itemCount(cp)
+            alog(("PICK RESULT joiner drop lands on the host: joiner items %d -> %d, new ground item %s -> %s"):format(
+                z.d0, z.d1, z.dk and (className(z.dk) .. "{" .. A.pkState(z.dk) .. "}") or "none", z.dk and "PASS" or "FAIL"))
+            -- give the joiner something to pick up: the host steps next to it and drops one of its own items
+            local cl = cp:K2_GetActorLocation()
+            pcall(function() hp:K2_TeleportTo({ X = cl.X + 200, Y = cl.Y, Z = cl.Z + 30 }, hp:K2_GetActorRotation()) end)
+            z.before2 = A.groundPickups()
+            local ex = A.pkNames(cp)
+            if z.dropName then ex[z.dropName] = true end
+            local u = A.pkUidOf(hp, ex) or A.pkUidOf(hp)
+            if u then
+                local jig = hp.BP_JigMultiplayer
+                alog(("PICK: host drops %s next to the joiner -> %s"):format(u.name, tostring(pcall(function() jig:SERVER_RequestDropItem(u.g, 1, jig) end))))
+            end
+            z.ph, z.tp = "hostgift", z.t
+        elseif z.ph == "hostgift" and z.t == z.tp + 4 then
+            z.dk = A.pkNew(cp:K2_GetActorLocation(), z.before2)
+            z.d1 = PJ.itemCount(cp)
+            if not z.dk then alog("PICK: the host's drop didn't land either"); z.ph = "end"; z.tp = z.t; return end
+            local l = z.dk:K2_GetActorLocation()
+            alog("PICK: item for the joiner: " .. className(z.dk) .. " " .. A.pkState(z.dk))
+            fwrite("sdmp_phase.txt", ("pick1:%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z))
+            z.ph, z.tp = "picking", z.t
+        elseif z.ph == "picking" and z.t == z.tp + 8 then
+            local n = PJ.itemCount(cp)
+            local dl = dnValid(z.dk) and safe(function() return z.dk:K2_GetActorLocation() end, nil)
+            local cl0 = cp:K2_GetActorLocation()
+            local left = dl and not safe(function() return z.dk.bHidden end, true) and (dl.X - cl0.X)^2 + (dl.Y - cl0.Y)^2 < 5000 * 5000
+            alog(("PICK RESULT joiner picks it back up: joiner items %d -> %d, item on the host's ground after: %s -> %s"):format(
+                z.d1, n, left and A.pkState(z.dk) or "gone", (n > z.d1 and not left) and "PASS" or "FAIL"))
+            -- now what the host's own pickup does to a really dropped item
+            local u = A.pkUidOf(hp)
+            z.hbefore = A.groundPickups()
+            z.h0 = PJ.itemCount(hp)
+            if u then
+                local jig = hp.BP_JigMultiplayer
+                local ok = pcall(function() jig:SERVER_RequestDropItem(u.g, 1, jig) end)
+                alog(("PICK: host drops %s -> %s"):format(u.name, tostring(ok)))
+            end
+            z.ph, z.tp = "hostdrop", z.t
+        elseif z.ph == "hostdrop" and z.t == z.tp + 4 then
+            z.hk = A.pkNew(hp:K2_GetActorLocation(), z.hbefore)
+            z.h1 = PJ.itemCount(hp)
+            alog(("PICK: host's drop: items %d -> %d, item %s"):format(z.h0, z.h1, z.hk and A.pkState(z.hk) or "none"))
+            if z.hk then
+                local l = z.hk:K2_GetActorLocation()
+                fwrite("sdmp_phase.txt", ("see:%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z))
+                alog("PICK host faces its drop -> " .. tostring(A.faceActor(z.hk, true)))
+                gameDelay(400, function() A.press("IA_Interact", 0.3, "host pick up") end)
+            end
+        elseif z.ph == "hostdrop" and z.t == z.tp + 9 then
+            local hl0 = dnValid(z.hk) and safe(function() return z.hk:K2_GetActorLocation() end, nil)
+            local left = hl0 and not safe(function() return z.hk.bHidden end, true) and (hl0.X - hp:K2_GetActorLocation().X)^2 < 5000 * 5000
+            alog(("PICK RESULT host picks up its own drop: host items %d -> %d, item after: %s"):format(
+                z.h1 or -1, PJ.itemCount(hp), left and A.pkState(z.hk) or "gone"))
+            z.ph, z.tp = "end", z.t
+        elseif z.ph == "end" and z.t == z.tp + 3 then
+            alog("PICK done")
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    A.pkClient = function()
+        local ph = fread("sdmp_phase.txt") or ""
+        local me = myPawn()
+        local tag = { TagName = FName("Jig.InteractOptions.Option1") }
+        local function at(s)
+            local x, y, zz = s:match(":(%-?%d+),(%-?%d+),(%-?%d+)")
+            return x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(zz) }
+        end
+        if ph:find("^drop:") and not A.pc2 then
+            A.pc2 = true
+            pcall(A.pkHooks)
+            local ga, gb, gc, gd = ph:match("drop:(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+)")
+            local jig = me.BP_JigMultiplayer
+            local ok, err = pcall(function() jig:SERVER_RequestDropItem({ A = tonumber(ga), B = tonumber(gb), C = tonumber(gc), D = tonumber(gd) }, 1, jig) end)
+            alog(("PICK(client): drop request -> %s %s"):format(tostring(ok), tostring(err or ""):sub(1, 100)))
+        elseif ph:find("^pick1:") and not A.pc1 then
+            A.pc1 = true
+            local target = at(ph)
+            local pk, d = nearestActor(A.groundPickups("client"), target)
+            if not pk or d > 300 then
+                alog(("PICK(client): the dropped item isn't on my screen (nearest %.0f away)"):format(d or -1)); return
+            end
+            alog(("PICK(client): I can see the dropped %s (%.0f from the host's spot, role %s), picking it up"):format(
+                className(pk), d, tostring(safe(function() return pk:GetLocalRole() end, "?"))))
+            local ok, err = pcall(function() pk:OnExecuteInteract(me, tag) end)
+            alog(("PICK(client): OnExecuteInteract -> %s %s"):format(tostring(ok), tostring(err or ""):sub(1, 100)))
+            gameDelay(1500, function() alog("PICK(client): +1s item: " .. A.pkState(pk)) end)
+            gameDelay(6000, function()
+                alog("PICK(client): +6s item: " .. A.pkState(pk))
+                local still = dnValid(pk) and not safe(function() return pk.bHidden end, true)
+                alog(("PICK RESULT(client) the item is gone from my screen after picking it up -> %s"):format(still and "FAIL" or "PASS"))
+            end)
+        elseif ph:find("^see:") and not A.pc3 then
+            A.pc3 = true
+            local target = at(ph)
+            gameDelay(3000, function()
+                local pk, d = nearestActor(A.groundPickups(), target)
+                alog(("PICK(client): host's dropped item on my screen: %s (%.0f away)"):format(pk and A.pkState(pk) or "none", d or -1))
+            end)
+            gameDelay(7000, function()
+                local pk, d = nearestActor(A.groundPickups(), target)
+                alog(("PICK(client): after the host picked it up: %s (%.0f away)"):format(
+                    (pk and d < 300) and A.pkState(pk) or "gone", d or -1))
+            end)
+        end
     end
     -- crouch the way the player's key does: the server RPC, not Crouch()
     A.realCrouch = function(p, on)
@@ -5851,7 +6573,7 @@ do
             A.readyFor = ready and (A.readyFor or 0) + 1 or 0
             if A.readyFor < 3 and A.boot < 90 then return end
             alog(("main menu settled after %ds - starting the listen reload"):format(A.boot))
-            ExecuteInGameThread(setIpDriver)
+            if not A.useSteam then ExecuteInGameThread(setIpDriver) end
             A.worldAddr = worldAddr()
             ExecuteInGameThread(hostListen)
             A.step, A.t = "listening", 0
@@ -5876,7 +6598,7 @@ do
                and #(safe(function() return FindAllOf("Actor") end, nil) or {}) < 200 then   -- bare level, not a slow load
                 A.relisten = (A.relisten or 0) + 1
                 alog("no main menu 40s after the listen reload - reloading again (try " .. A.relisten .. ")")
-                ExecuteInGameThread(setIpDriver)
+                if not A.useSteam then ExecuteInGameThread(setIpDriver) end
                 A.worldAddr = worldAddr()
                 A.waitMenu, A.lt = 0, 0
                 ExecuteInGameThread(hostListen)
@@ -5915,7 +6637,16 @@ do
                     end
                 end
             end)
-            if A.play then
+            if A.play and A.useSteam then
+                pcall(CS.clearPressAnyKey)
+                local okH, hosted = pcall(A.steamHost)
+                if okH and hosted then
+                    pcall(dnNotify, "Co-op: hosting over Steam. Friends click Join Game on your Steam profile, or press F9 to invite them", myPawn())
+                else
+                    pcall(dnNotify, "Co-op: hosting over Steam, but Join Game couldn't be set up - see sdmp_host.log", myPawn())
+                end
+                if A.pt then fwrite("sdmp_ready.txt", "1") end
+            elseif A.play then
                 alog("hosting - friends join with F8 (your IP as join_ip in their config.txt)")
                 pcall(CS.clearPressAnyKey)
                 pcall(dnNotify, "Co-op: you're hosting. Friends put your IP in their config.txt and press F8 (UDP port 7777)", myPawn())
@@ -6001,7 +6732,7 @@ do
                     else
                         alog("no safe spot by the host yet - joiner stays where it spawned")
                     end
-                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build") and not A.ztest then
+                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" or A.test == "pick") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -6085,8 +6816,12 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or (A.test == "build" and A.buildTick) or A.zTick)() end
+            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or (A.test == "build" and A.buildTick) or (A.test == "pick" and A.pkTick) or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
+            if A.test == "steam" then
+                if A.serveT == 5 then pcall(A.steamProbe3) end
+                if A.serveT == 8 then fwrite("sdmp_done.txt", "1") end
+            end
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
                 A.step = "quit"; console("quit"); return
@@ -6120,7 +6855,7 @@ do
                 if A.t > 480 then alog("FAIL: host never became ready"); A.step = "dead" end
                 return
             end
-            ExecuteInGameThread(setIpDriver)
+            if not A.useSteam then ExecuteInGameThread(setIpDriver) end
             -- The menu runs inside PersistentLevel - the same map we're about
             -- to join. Joining straight from it loads PersistentLevel while
             -- the old copy is still in memory, and the async loader dies on
@@ -6198,7 +6933,7 @@ do
                 A.step, A.t = "playing", 0
                 return
             end
-            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" then
+            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" or A.test == "pick" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -6362,6 +7097,7 @@ do
             if A.test == "well" then pcall(A.wellClient) end
             if A.test == "loot" then pcall(A.lootClient) end
             if A.test == "build" then pcall(A.buildClient) end
+            if A.test == "pick" then pcall(A.pkClient) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0
@@ -6525,9 +7261,17 @@ do
         if A.auto or A.role then LOGF.verbose = true end
         A.quit = cl:find("%-sdmpquit") ~= nil
         A.test = cl:match("%-sdmptest=(%a+)")
+        A.useSteam = A.test == "steam"
         -- co-op straight from the command line (shortcuts, playtest.bat)
         if cl:find("%-sdmplowgfx") then console("scalability 0"); console("r.ScreenPercentage 50") end
         A.pt = cl:find("%-sdmpplaytest") ~= nil   -- one-PC play test: host auto-Continues, joiner waits for it
+        -- Steam "Join Game" / accepted invite: Steam starts us with the host's connect string
+        local sj = cl:match("[%+%-]sdmpjoin=(%S+)")
+        if sj and not A.role then
+            log("SDMP: started from a Steam join - joining " .. sj)
+            A.startPlay("client", sj)
+            return
+        end
         local pm = cl:match("%-sdmpplay=(%S+)")
         if pm and not A.role then
             if pm == "host" then A.startPlay("host", nil)
@@ -6573,6 +7317,15 @@ do
         if A.looping then log("SDMP: co-op is already running (" .. tostring(A.role) .. ")"); return end
         A.role, A.play, A.auto, A.quit, A.test = role, true, false, false, nil
         A.joinAddr = addr
+        if role == "host" then
+            A.useSteam = (A.cfg.connection or "ip"):lower() == "steam"
+            if A.useSteam and not A.steamUp() then
+                A.useSteam = false
+                log("SDMP: connection=steam but Steam isn't running for this game - hosting over IP instead")
+            end
+        else
+            A.useSteam = (addr or ""):lower():find("^steam%.") ~= nil
+        end
         A.step, A.t, A.boot, A.lt = "init", 0, 0, 0
         A.handled, A.seen, A.dpSet = {}, {}, false
         LOGF.path = modDir() .. "\\sdmp_" .. role .. ".log"
@@ -6606,7 +7359,17 @@ do
 # The host needs UDP port 7777 forwarded on their router (or use a LAN /
 # virtual LAN like Radmin VPN, ZeroTier or Tailscale and put that IP here).
 
-# IP address of the friend you're joining (add :port if they changed it)
+# How friends reach you when you host (F7):
+#   steam = through Steam, no port forwarding. Start the game from Steam.
+#           Friends click "Join Game" on your Steam profile, or accept your
+#           invite (press F9 while hosting). Their game must be closed when
+#           they click it - Steam starts it and joins you.
+#   ip    = they put your IP in join_ip and press F8 (needs UDP 7777
+#           forwarded, or a virtual LAN like Radmin VPN, ZeroTier, Tailscale)
+connection=ip
+
+# IP address of the friend you're joining (add :port if they changed it).
+# steam.<their Steam id> also works and goes through Steam.
 join_ip=127.0.0.1
 
 # can players hurt each other?
@@ -6662,6 +7425,9 @@ debug=false
             if not ip or ip == "" then log("SDMP: set join_ip in config.txt first"); return end
             startPlay("client", ip)
         end)
+    end)
+    RegisterKeyBind(Key.F9, function()
+        ExecuteInGameThread(function() pcall(A.steamInvite) end)
     end)
     RegisterConsoleCommandHandler("sdmp_reload", function()
         ExecuteInGameThread(function() pcall(loadCfg) end)
