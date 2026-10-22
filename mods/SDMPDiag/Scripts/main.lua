@@ -2287,7 +2287,53 @@ local function livePlayers(minAge)
     return out
 end
 
-local ZA = { next = {}, tick = 0, plays = 0, logged = 0, sndErr = false }
+local ZA = { next = {}, tick = 0, plays = 0, logged = 0, sndErr = false, last = {}, cnt = {}, events = 0 }
+-- Swing signal. The host's zombie plays a real attack montage; joiners used to
+-- guess when to swing (stopped + close), which looked off. Now the host tags
+-- every real swing on the zombie's AnimRootMotionTranslationScale - a float
+-- the engine already replicates to everyone watching that zombie - as
+-- 1 + (flip * 500 + montage index) / 1e6. Joiners play exactly that montage
+-- when the value changes. (A 0.05 % root-motion scale change does nothing
+-- visible on the host.)
+local function zaMontage(z, i)   -- i is 1-based
+    local arr = safe(function() return z.AttackMontage end, nil)
+    local n = arr and safe(function() return arr:GetArrayNum() end, 0) or 0
+    if i < 1 or i > n then return nil, n end
+    local e = safe(function() return arr[i] end, nil)
+    local m = e
+    if not (m and safe(function() return m:IsValid() end, false)) then m = safe(function() return e:get() end, nil) end
+    if m and safe(function() return m:IsValid() end, false) then return m, n end
+    return nil, n
+end
+pcall(function()
+    RegisterHook("/Script/Engine.Character:PlayAnimMontage", function(ctx, montage)
+        local z = safe(function() return ctx:get() end, nil)
+        if not z then return end
+        local cn = safe(function() return z:GetClass():GetFName():ToString() end, "")
+        if not cn:find("Zombie") then return end
+        local w = UEHelpers.GetWorld()
+        local gm = w and safe(function() return w.AuthorityGameMode end, nil)
+        if not (gm and safe(function() return gm:IsValid() end, false)) then return end   -- host only
+        local m = safe(function() return montage:get() end, nil)
+        if not m then return end
+        local ma = m:GetAddress()
+        local idx
+        for i = 1, 16 do
+            local cand, n = zaMontage(z, i)
+            if i > n then break end
+            if cand and cand:GetAddress() == ma then idx = i; break end
+        end
+        if not idx then return end   -- not an attack (hit reaction, death...)
+        local k = z:GetAddress()
+        ZA.cnt[k] = 1 - (ZA.cnt[k] or 0)
+        local v = 1.0 + (ZA.cnt[k] * 500 + idx) / 1e6
+        pcall(function() z.AnimRootMotionTranslationScale = v end)
+        pcall(function() StaticFindObject("/Script/NetCore.Default__NetPushModelHelpers"):MarkPropertyDirty(z, FName("AnimRootMotionTranslationScale")) end)
+        pcall(function() z:ForceNetUpdate() end)
+        ZA.events = ZA.events + 1
+        if ZA.events <= 3 then log(("ZA: host swing %d tagged (montage %d)"):format(ZA.events, idx)) end
+    end)
+end)
 local function zombieSwingMirror()
     if not worldSettled() then return end
     local world = UEHelpers.GetWorld()
@@ -2341,7 +2387,34 @@ local function zombieSwingMirror()
                         end
                     end
                 end
-                if zl and not dead and (ZA.next[key] or 0) <= ZA.tick then
+                -- the host's swing signal
+                local sv = safe(function() return z.AnimRootMotionTranslationScale end, nil)
+                if type(sv) == "number" then
+                    local prev = ZA.last[key]
+                    ZA.last[key] = sv
+                    if prev and math.abs(sv - prev) > 5e-7 and sv > 1.0000005 and not dead then
+                        local code = math.floor((sv - 1.0) * 1e6 + 0.5)
+                        local idx = code % 500
+                        local m = zaMontage(z, idx)
+                        if m then
+                            local anim = safe(function() return z.Mesh:GetAnimInstance() end, nil)
+                            if anim and safe(function() return anim:IsValid() end, false) then
+                                if not ZA.rm then ZA.rm = {} end
+                                if not ZA.rm[key] then ZA.rm[key] = true; pcall(function() anim.RootMotionMode = 1 end) end
+                            end
+                            pcall(function() z:PlayAnimMontage(m, 1.0, FName("None")) end)
+                            if gs and gs:IsValid() and zl then
+                                pcall(function() gs:PlaySoundAtLocation(z, z.AttackSound, zl, { Pitch = 0, Yaw = 0, Roll = 0 }, 1.0, 1.0, 0.0, nil, nil, nil, nil) end)
+                            end
+                            if not ZA.gotEvent then log("ZA: first swing signal from the host - following the host's swings from now on") end
+                            ZA.gotEvent = true
+                            ZA.plays = ZA.plays + 1
+                            ZA.evPlays = (ZA.evPlays or 0) + 1
+                            if ZA.evPlays <= 3 then log(("ZA: mirrored host swing (montage %d, %d so far)"):format(idx, ZA.evPlays)) end
+                        end
+                    end
+                end
+                if zl and not dead and not ZA.gotEvent and (ZA.next[key] or 0) <= ZA.tick then
                     local close = false
                     for _, p in ipairs(players) do
                         local d2 = (p.X - zl.X)^2 + (p.Y - zl.Y)^2
@@ -2397,10 +2470,11 @@ local function zombieSwingMirror()
         end
     end
     for k in pairs(ZA.next) do if not seen[k] then ZA.next[k] = nil end end
+    for k in pairs(ZA.last) do if not seen[k] then ZA.last[k] = nil end end
     if ZA.rm then for k in pairs(ZA.rm) do if not seen[k] then ZA.rm[k] = nil end end end
     if report and st.nz > 0 then
-        log(("ZA status: players=%d zombies=%d nearest=%.0f dz=%.0f speed=%.0f dead=%s swings=%d"):format(
-            #players, st.nz, st.best, st.bdz, st.bspd, tostring(st.bdead), ZA.plays))
+        log(("ZA status: players=%d zombies=%d nearest=%.0f dz=%.0f speed=%.0f dead=%s swings=%d (from host signal %d)"):format(
+            #players, st.nz, st.best, st.bdz, st.bspd, tostring(st.bdead), ZA.plays, ZA.evPlays or 0))
     elseif report then
         log(("ZA status: players=%d, no BP_MasterZombie_C found"):format(#players))
     end
@@ -4706,6 +4780,59 @@ do
             z.t = 1000
         end
     end
+    -- Well test: does a joiner drinking from a well (the game's own Jig
+    -- interact, which asks the server) actually quench the joiner's thirst?
+    A.wellTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local hp, cp = myPawn(), z.p
+        if z.t == 4 then
+            local best, bd = nil, 1e18
+            local hl = safe(function() return hp:K2_GetActorLocation() end, nil)
+            for _, w in ipairs(safe(function() return FindAllOf("BP_WaterWell_C") end, nil) or {}) do
+                local l = dnValid(w) and safe(function() return w:K2_GetActorLocation() end, nil)
+                if l and hl then
+                    local d = (l.X - hl.X)^2 + (l.Y - hl.Y)^2
+                    if d < bd then best, bd = w, d end
+                end
+            end
+            if not best then alog("WELL RESULT: no well loaded"); z.t = 1000; fwrite("sdmp_done.txt", "1"); return end
+            z.well = best
+            local l = best:K2_GetActorLocation()
+            pcall(function() hp:K2_TeleportTo({ X = l.X + 200, Y = l.Y, Z = l.Z + 100 }, hp:K2_GetActorRotation()) end)
+            pcall(function() cp:K2_TeleportTo({ X = l.X + 120, Y = l.Y + 60, Z = l.Z + 100 }, cp:K2_GetActorRotation()) end)
+            pcall(function() best.CurrentWater = best.MaxWater end)
+            alog(("WELL: %.0f away, water %s/%s - both moved there"):format(math.sqrt(bd), tostring(safe(function() return best.CurrentWater end, "?")), tostring(safe(function() return best.MaxWater end, "?"))))
+        elseif z.t == 8 then
+            pcall(function() cp.HungerThirstComponent.CurrentThirst = 40.0 end)
+            z.before = safe(function() return cp.HungerThirstComponent.CurrentThirst end, -1)
+            alog("WELL: joiner thirst set to " .. tostring(z.before) .. " - joiner drinks next")
+            fwrite("sdmp_phase.txt", "well1")
+        elseif z.t == 20 then
+            local after = safe(function() return cp.HungerThirstComponent.CurrentThirst end, -1)
+            alog(("WELL RESULT: joiner thirst %s -> %s (server) -> %s"):format(tostring(z.before), tostring(after),
+                (type(after) == "number" and after > (z.before or 0) + 5) and "PASS" or "FAIL"))
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    A.wellClient = function()
+        if A.wc1 or not (fread("sdmp_phase.txt") or ""):find("well1") then return end
+        A.wc1 = true
+        local me = myPawn()
+        local best, bd = nil, 1e18
+        local ml = safe(function() return me:K2_GetActorLocation() end, nil)
+        for _, w in ipairs(safe(function() return FindAllOf("BP_WaterWell_C") end, nil) or {}) do
+            local l = dnValid(w) and safe(function() return w:K2_GetActorLocation() end, nil)
+            if l and ml then
+                local d = (l.X - ml.X)^2 + (l.Y - ml.Y)^2
+                if d < bd then best, bd = w, d end
+            end
+        end
+        if not best then alog("WELL(client): no well near me"); return end
+        -- what pressing E on "Drink" does
+        local ok, err = pcall(function() best:OnExecuteInteract(me, { TagName = FName("Jig.InteractOptions.Option1") }) end)
+        alog(("WELL(client): drink at well %.0f away -> %s %s"):format(math.sqrt(bd), tostring(ok), tostring(err or ""):sub(1, 100)))
+    end
     -- crouch the way the player's key does: the server RPC, not Crouch()
     A.realCrouch = function(p, on)
         local fn = on and "Svr_Crouch" or "Svr_UnCrouch"
@@ -4942,7 +5069,23 @@ do
             -- the map and the menu comes back up without it.
             if not UEHelpers.GetPlayerController() then return end
             A.boot = (A.boot or 0) + 1
-            if A.boot < 3 then return end
+            -- Wait for the main menu to finish loading before the listen reload.
+            -- Reloading while the game's own first load is still going left the
+            -- new level stuck on its loading screen with no menu (it happened on
+            -- most first launches of the day).
+            local ready = false
+            pcall(function()
+                local hasMenuLevel = false
+                for _, l in ipairs(FindAllOf("MainMenu_C") or {}) do if l:IsValid() then hasMenuLevel = true end end
+                local loading = false
+                for _, w in ipairs(FindAllOf("LoadingScreenWidget_C") or {}) do
+                    if w:IsValid() and safe(function() return w:IsInViewport() end, false) then loading = true end
+                end
+                ready = hasMenuLevel and not loading
+            end)
+            A.readyFor = ready and (A.readyFor or 0) + 1 or 0
+            if A.readyFor < 3 and A.boot < 90 then return end
+            alog(("main menu settled after %ds - starting the listen reload"):format(A.boot))
             ExecuteInGameThread(setIpDriver)
             A.worldAddr = worldAddr()
             ExecuteInGameThread(hostListen)
@@ -4960,10 +5103,29 @@ do
             end
         elseif A.step == "continue" then
             if myPawn() then A.step = "ingame"; return end
+            A.ct = (A.ct or 0) + 1
+            -- Sometimes (first launch after a while) the listen reload comes up
+            -- as a bare PersistentLevel with no main menu streamed in, and it
+            -- never recovers. Do the listen reload again.
+            if A.ct == 40 and not menu() and not myPawn() and (A.relisten or 0) < 2
+               and #(safe(function() return FindAllOf("Actor") end, nil) or {}) < 200 then   -- bare level, not a slow load
+                A.relisten = (A.relisten or 0) + 1
+                alog("no main menu 40s after the listen reload - reloading again (try " .. A.relisten .. ")")
+                ExecuteInGameThread(setIpDriver)
+                A.worldAddr = worldAddr()
+                A.waitMenu, A.lt = 0, 0
+                ExecuteInGameThread(hostListen)
+                A.step, A.t, A.ct = "listening", 0, 0
+                return
+            end
             if A.play and not A.pt then return end   -- the host picks Continue / Load themselves
+            -- a slow cold start can leave the menu on "press any key" past the
+            -- listening step's timeout: keep nudging that until the menu shows
+            if not menu() and A.t % 5 == 0 then pressAnyKey() end
             if A.t % 10 == 0 then pressContinue() end
             A.t = A.t + 1
-            if A.t > 60 then alog("FAIL: no host pawn 60s after Continue"); A.step = "dead" end
+
+            if A.t > 150 then alog("FAIL: no host pawn 150s after Continue"); A.step = "dead" end
         elseif A.step == "ingame" then
             ExecuteInGameThread(netStatus)
             -- The join crash. Starting the client on Entry didn't help (and the
@@ -5074,7 +5236,7 @@ do
                     else
                         alog("no safe spot by the host yet - joiner stays where it spawned")
                     end
-                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist") and not A.ztest then
+                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -5158,7 +5320,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or A.zTick)() end
+            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
@@ -5271,7 +5433,7 @@ do
                 A.step, A.t = "playing", 0
                 return
             end
-            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" then
+            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -5432,6 +5594,7 @@ do
             end
             if A.t == 20 or A.t == 40 then pcall(CS.dumpSlots, "client t=" .. A.t) end
             if A.test == "door" then pcall(A.doorClient) end
+            if A.test == "well" then pcall(A.wellClient) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0

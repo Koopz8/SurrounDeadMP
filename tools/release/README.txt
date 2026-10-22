@@ -36,7 +36,8 @@ Joiner:
 
 WHAT WORKS
 ----------
-  - Both players in the same world, zombies chase and hurt both
+  - Both players in the same world, zombies chase and hurt both, and the
+    joiner sees the same zombie attacks the host does
   - Downed instead of dead: stand or crouch next to your downed partner for
     5 seconds to revive them. 60 seconds to bleed out. If both of you go
     down, it's game over for real.
@@ -44,6 +45,7 @@ WHAT WORKS
   - Time of day and weather match for both players
   - Clothing and gear show up on the other player
   - Doors opened by either player open for both
+  - Both players can drink from wells
   - Friendly fire is off (friendly_fire=true in config.txt to turn it on)
   - The host's game keeps the joiner's character (inventory, clothes,
     health) for next time. If the joiner dies, they start fresh, same as
@@ -53,9 +55,7 @@ WHAT WORKS
 KNOWN ISSUES
 ------------
   - Some movement stutter on the joiner's side. Lower graphics settings help.
-  - The zombie attack animation looks a bit off on the joiner's screen.
-  - Drinking from wells, building and other world interactions may only
-    work for the host.
+  - Building hasn't been tested with two players yet.
   - The joiner's character lives in the host's game, so it only comes back
     when joining that same host. Joining needs the host's IP, no Steam
     invites yet.

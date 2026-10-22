@@ -24,11 +24,13 @@ if /I "%1"=="door" set TEST=-sdmptest=door
 if /I "%2"=="door" set TEST=-sdmptest=door
 if /I "%1"=="persist" set TEST=-sdmptest=persist
 if /I "%2"=="persist" set TEST=-sdmptest=persist
+if /I "%1"=="well" set TEST=-sdmptest=well
+if /I "%2"=="well" set TEST=-sdmptest=well
 
 REM no test named: the old scripted-movement run is retired (it crashed the
 REM client), so just say what to run
 if "%TEST%"=="" (
-  echo Usage: test.bat zombie^|downed^|door^|persist [stay]
+  echo Usage: test.bat zombie^|downed^|door^|persist^|well [stay]
   echo Or double-click zombietest / downedtest / doortest / persisttest / playtest.
   pause
   exit /b 1
