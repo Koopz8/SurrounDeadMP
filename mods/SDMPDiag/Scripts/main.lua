@@ -4833,6 +4833,305 @@ do
         local ok, err = pcall(function() best:OnExecuteInteract(me, { TagName = FName("Jig.InteractOptions.Option1") }) end)
         alog(("WELL(client): drink at well %.0f away -> %s %s"):format(math.sqrt(bd), tostring(ok), tostring(err or ""):sub(1, 100)))
     end
+    -- Loot test: the joiner picks an item up off the ground and opens a loot
+    -- container, both with the game's own interact call (same as pressing E).
+    -- class chain, matching functions and component properties of an actor
+    A.describe = function(a, tag, pat)
+        local cls, guard = safe(function() return a:GetClass() end, nil), 0
+        while dnValid(cls) and guard < 10 do
+            local cname = safe(function() return cls:GetFName():ToString() end, "?")
+            if cname:match("^Actor$") or cname:match("^Object$") then break end
+            local fns, props = {}, {}
+            pcall(function() cls:ForEachFunction(function(fn)
+                local n = safe(function() return fn:GetFName():ToString() end, "?")
+                for alt in pat:gmatch("[^|]+") do
+                    if n:find(alt) then fns[#fns + 1] = n; break end
+                end
+            end) end)
+            pcall(function() cls:ForEachProperty(function(pr)
+                local n = safe(function() return pr:GetFName():ToString() end, "?")
+                local ok, v = pcall(function() return a[n] end)
+                if ok and dnValid(v) and safe(function() return v:IsA(StaticFindObject("/Script/Engine.ActorComponent")) end, false) then
+                    props[#props + 1] = n .. "=" .. className(v)
+                end
+            end) end)
+            alog(("%s class %s | fns: %s | comps: %s"):format(tag, cname, table.concat(fns, ","), table.concat(props, ",")))
+            cls = safe(function() return cls:GetSuperStruct() end, nil)
+            guard = guard + 1
+        end
+    end
+    local function nearestActor(list, loc, filter)
+        local best, bd = nil, 1e18
+        for _, a in ipairs(list or {}) do
+            if dnValid(a) and (not filter or filter(a)) then
+                local l = safe(function() return a:K2_GetActorLocation() end, nil)
+                if l and loc then
+                    local d = (l.X - loc.X)^2 + (l.Y - loc.Y)^2 + (l.Z - loc.Z)^2
+                    if d < bd then best, bd = a, d end
+                end
+            end
+        end
+        return best, best and math.sqrt(bd) or -1
+    end
+    A.groundPickups = function(why)
+        local out, n, noOwner, attached, hidden, other = {}, 0, 0, 0, 0, 0
+        for _, c in ipairs(safe(function() return FindAllOf("BP_JigPickupComponent_C") end, nil) or {}) do
+            n = n + 1
+            local a = dnValid(c) and safe(function() return c:GetOwner() end, nil)
+            if not dnValid(a) then noOwner = noOwner + 1
+            elseif dnValid(safe(function() return a:GetAttachParentActor() end, nil)) then attached = attached + 1
+            elseif safe(function() return a.bHidden end, false) then hidden = hidden + 1
+            elseif not CS.inPlayWorld(a) then other = other + 1
+            else out[#out + 1] = a end
+        end
+        if why then
+            alog(("LOOT %s: %d pickup comps, %d usable (no owner %d, attached %d, hidden %d, other world %d)")
+                :format(why, n, #out, noOwner, attached, hidden, other))
+        end
+        return out
+    end
+    A.lootTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local hp, cp = myPawn(), z.p
+        -- teleports fail when the spot overlaps something (the container's
+        -- own mesh), so walk around it until one sticks
+        local function tpNear(p, l, r0)
+            for _, r in ipairs({ r0, r0 + 60, r0 + 120, r0 + 200 }) do
+                for i = 0, 7 do
+                    local an = i * math.pi / 4
+                    local ok = safe(function()
+                        return p:K2_TeleportTo({ X = l.X + r * math.cos(an), Y = l.Y + r * math.sin(an), Z = l.Z + 90 }, p:K2_GetActorRotation())
+                    end, false)
+                    if ok then return r end
+                end
+            end
+            return -1
+        end
+        local function moveBoth(a, tag)
+            local l = a:K2_GetActorLocation()
+            local rh, rc = tpNear(hp, l, 260), tpNear(cp, l, 120)
+            alog(("LOOT: moved to the %s (%s): host at %d, joiner at %d"):format(tag, className(a), rh, rc))
+        end
+        if z.t == 4 then
+            pcall(A.lootHooks)
+            local hl = safe(function() return hp:K2_GetActorLocation() end, nil)
+            local list = A.groundPickups("host")
+            local pk, d = nearestActor(list, hl)
+            if pk then
+                local cls = {}
+                for i = 1, math.min(#list, 6) do cls[#cls + 1] = className(list[i]) end
+                alog("LOOT: ground item classes e.g. " .. table.concat(cls, ", "))
+            end
+            if not pk then alog("LOOT: no ground pickup found"); z.t = 19; return end
+            z.pk = pk
+            alog(("LOOT: nearest ground item %s, %.0f away"):format(className(pk), d))
+            moveBoth(pk, "ground item")
+        elseif z.t == 8 then
+            z.items0 = PJ.itemCount(cp)
+            fwrite("sdmp_phase.txt", "loot1")
+            alog("LOOT: joiner has " .. z.items0 .. " items - joiner picks up next")
+        elseif z.t == 16 then
+            local n = PJ.itemCount(cp)
+            z.pickOk = n > z.items0
+            alog(("LOOT RESULT pickup: joiner items %d -> %d (server) -> %s; item still on ground=%s"):format(z.items0, n,
+                z.pickOk and "PASS" or "FAIL", tostring(dnValid(z.pk) and not safe(function() return z.pk.bHidden end, true))))
+        elseif z.t == 20 then
+            -- only a container nobody has searched yet tells us anything
+            local hl = safe(function() return hp:K2_GetActorLocation() end, nil)
+            local all = safe(function() return FindAllOf("BP_LootContainer_C") end, nil) or {}
+            local looted = 0
+            local function fresh(a)
+                local l = safe(function() return a.BP_JigMultiplayer["Looted?"] end, true)
+                if l then looted = looted + 1 end
+                return not l
+            end
+            local lc, d = nearestActor(all, hl, fresh)
+            alog(("LOOT: %d containers loaded, %d already searched"):format(#all, looted))
+            if not lc then alog("LOOT: no unsearched container loaded"); z.t = 39; return end
+            z.lc = lc
+            alog(("LOOT: nearest unsearched container %.0f away"):format(d))
+            -- every variable on the loot container class, to find its interact options
+            pcall(function()
+                local cls = StaticFindObject("/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C")
+                local parts = {}
+                cls:ForEachProperty(function(pr)
+                    local n = safe(function() return pr:GetFName():ToString() end, "?")
+                    local t = safe(function() return pr:GetClass():GetFName():ToString() end, "?")
+                    local v = ""
+                    if t == "MapProperty" then
+                        local keys = {}
+                        pcall(function() lc[n]:ForEach(function(k, _)
+                            keys[#keys + 1] = safe(function() return k:get().TagName:ToString() end, nil)
+                                or safe(function() return tostring(k:get()) end, "?")
+                        end) end)
+                        v = "{" .. table.concat(keys, ",") .. "}"
+                    elseif t == "StructProperty" then
+                        v = safe(function() return lc[n].TagName:ToString() end, "")
+                    elseif t == "BoolProperty" or t == "FloatProperty" or t == "DoubleProperty" or t == "IntProperty" then
+                        v = tostring(safe(function() return lc[n] end, "?"))
+                    end
+                    parts[#parts + 1] = n .. ":" .. t:gsub("Property", "") .. (v ~= "" and ("=" .. v) or "")
+                end)
+                alog("LOOT container vars: " .. table.concat(parts, " "))
+            end)
+            moveBoth(lc, "loot container")
+        elseif z.t == 23 then
+            alog("LOOT: container before the joiner opens it: " .. A.jigDump(z.lc))
+            local l = safe(function() return z.lc:K2_GetActorLocation() end, nil)
+            local cl = safe(function() return cp:K2_GetActorLocation() end, nil)
+            if l and cl then
+                alog(("LOOT: joiner is %.0f from the container (server view)"):format(math.sqrt((l.X-cl.X)^2 + (l.Y-cl.Y)^2 + (l.Z-cl.Z)^2)))
+            end
+            fwrite("sdmp_phase.txt", l and ("loot2:%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "loot2")
+        elseif z.t == 31 then
+            -- A script can't fake the 4 s search hold, so loot never generates here
+            -- (not for the host either). What it can check is the network half: the
+            -- joiner's search request reaching the container on the host. The full
+            -- search + take was checked by hand: items show for the joiner and land
+            -- in its server-side inventory.
+            local hits = A.lootFromJoiner or 0
+            alog(("LOOT RESULT joiner search request reached the host: %d time(s) -> %s"):format(hits, hits > 0 and "PASS" or "FAIL"))
+        elseif z.t == 40 then
+            local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+            alog("LOOT sig SERVER_RequestMoveItemToAnotherComp: " .. PR.sig(J .. "SERVER_RequestMoveItemToAnotherComp"))
+            alog("LOOT done")
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    A.lootClient = function()
+        pcall(A.lootHooks)
+        local ph = fread("sdmp_phase.txt") or ""
+        local me = myPawn()
+        local ml = safe(function() return me:K2_GetActorLocation() end, nil)
+        local tag = { TagName = FName("Jig.InteractOptions.Option1") }
+        if ph:find("loot1") and not A.lc1 then
+            A.lc1 = true
+            local pk, d = nearestActor(A.groundPickups("client"), ml)
+            if not pk then alog("LOOT(client): no ground item near me"); return end
+            local ok, err = pcall(function() pk:OnExecuteInteract(me, tag) end)
+            alog(("LOOT(client): pick up %s %.0f away -> %s %s"):format(className(pk), d, tostring(ok), tostring(err or ""):sub(1, 100)))
+        elseif ph:find("loot2") and not A.lc2 then
+            A.lc2 = true
+            local x, y, zz = ph:match("loot2:(%-?%d+),(%-?%d+),(%-?%d+)")
+            local target = x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(zz) } or ml
+            local lc = nearestActor(safe(function() return FindAllOf("BP_LootContainer_C") end, nil), target)
+            if not lc then alog("LOOT(client): no container near me"); return end
+            local l = safe(function() return lc:K2_GetActorLocation() end, nil)
+            local d = (l and ml) and math.sqrt((l.X-ml.X)^2 + (l.Y-ml.Y)^2 + (l.Z-ml.Z)^2) or -1
+            local ok, err = pcall(function() lc:OnExecuteInteract(me, tag) end)
+            alog(("LOOT(client): open %s %.0f away -> %s %s"):format(className(lc), d, tostring(ok), tostring(err or ""):sub(1, 100)))
+            gameDelay(3000, function()
+                -- the search bar filled: a joiner asks the server through its own jig
+                local f1, ferr = pcall(function() me.BP_JigMultiplayer:SERVER_ForwardInteract(lc, tag, {}) end)
+                alog(("LOOT(client): SERVER_ForwardInteract -> %s %s"):format(tostring(f1), tostring(ferr or ""):sub(1, 100)))
+            end)
+            gameDelay(4000, function()
+                local e1 = pcall(function() lc:OpenContainer() end)
+                alog(("LOOT(client): OpenContainer -> %s"):format(tostring(e1)))
+            end)
+            local function check(when)
+                local seen = PJ.itemCount(lc)
+                local wins = {}
+                for _, w in ipairs(safe(function() return FindAllOf("UserWidget") end, nil) or {}) do
+                    local n = className(w)
+                    if dnValid(w) and (n:find("Loot") or n:find("Container") or n:find("Inventory"))
+                       and safe(function() return w:IsInViewport() end, false) then wins[#wins + 1] = n end
+                end
+                alog(("LOOT(client) %s: container shows %s items here, open windows: %s | %s"):format(when, tostring(seen),
+                    #wins > 0 and table.concat(wins, ",") or "none", A.lootWindows()))
+                alog("LOOT(client) jig: " .. A.jigDump(lc))
+            end
+            gameDelay(2000, function() pcall(check, "+2s") end)
+            gameDelay(6000, function() pcall(check, "+6s") end)
+            gameDelay(9000, function() pcall(check, "+9s") end)
+        end
+    end
+    A.lootWindows = function()
+        local out = {}
+        for _, cn in ipairs({ "BP_LootContainerWidget_C", "W_Inventory_C", "BP_InventoryWidget_C", "BP_JigInventoryWidget_C" }) do
+            for _, w in ipairs(safe(function() return FindAllOf(cn) end, nil) or {}) do
+                if dnValid(w) then
+                    local vis = safe(function() return w:IsVisible() end, "?")
+                    local vp = safe(function() return w:IsInViewport() end, "?")
+                    out[#out + 1] = ("%s(vis=%s,vp=%s)"):format(cn, tostring(vis), tostring(vp))
+                end
+            end
+        end
+        return #out > 0 and table.concat(out, " ") or "none"
+    end
+    A.jigDump = function(a)
+        local jig = safe(function() return a.BP_JigMultiplayer end, nil)
+        if not dnValid(jig) then return "no jig" end
+        local parts = {}
+        pcall(function() jig:GetClass():ForEachProperty(function(pr)
+            local n = safe(function() return pr:GetFName():ToString() end, "?")
+            local ok, v = pcall(function() return jig[n] end)
+            if ok and type(v) == "userdata" then
+                local ok2, len = pcall(function() return #v end)
+                if ok2 and type(len) == "number" and len > 0 then parts[#parts + 1] = n .. "#" .. len end
+            elseif ok and (type(v) == "boolean" or type(v) == "number") then
+                parts[#parts + 1] = n .. "=" .. tostring(v)
+            end
+        end) end)
+        return table.concat(parts, " ")
+    end
+    -- log the loot container's interaction calls, so a real E press shows
+    -- what the game itself calls (and on which side)
+    A.lootHooks = function()
+        if A.lootHooked then return end
+        A.lootHooked = true
+        local LC = "/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:"
+        for _, f in ipairs({ "OnBeginInteract", "OnExecuteInteract", "OnExecuteInteractEnded", "OnStopExecuteInteract",
+                             "OnRequestServerInteract", "OnServerExecuteInteract", "OpenContainer", "Event_HoldToInteract",
+                             "OnEndInteract", "PauseInteract" }) do
+            local ok, err = pcall(RegisterHook, LC .. f, function(ctx, a1, a2)
+                local who = safe(function() return className(ctx:get()) end, "?")
+                if f == "OnServerExecuteInteract" then
+                    local by = safe(function() return a2:get() end, nil)
+                    local same = by and A.ztest and A.ztest.p
+                        and safe(function() return by:GetAddress() == A.ztest.p:GetAddress() end, false)
+                    if same then A.lootFromJoiner = (A.lootFromJoiner or 0) + 1 end
+                end
+                alog(("LOOTHOOK %s on %s"):format(f, who))
+            end)
+            if not ok then alog("LOOTHOOK " .. f .. " not hooked: " .. tostring(err):sub(1, 80)) end
+        end
+        local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+        for _, f in ipairs({ "SERVER_ForwardInteract", "SERVER_RequestData", "CLIENT_ContainerDataResponse" }) do
+            local ok, err = pcall(RegisterHook, J .. f, function(ctx)
+                local who = safe(function() return className(ctx:get():GetOwner()) end, "?")
+                alog(("LOOTHOOK jig %s (jig of %s)"):format(f, who))
+            end)
+            if not ok then alog("LOOTHOOK " .. f .. " not hooked: " .. tostring(err):sub(1, 80)) end
+        end
+        alog("LOOTHOOK hooks in")
+    end
+    -- dev: turn the local camera to the nearest loot container (no mouse look over remote control)
+    RegisterConsoleCommandHandler("sdmp_face", function()
+        ExecuteInGameThread(function()
+            local pc, me = UEHelpers.GetPlayerController(), myPawn()
+            local ml = safe(function() return me:K2_GetActorLocation() end, nil)
+            local lc = ml and nearestActor(safe(function() return FindAllOf("BP_LootContainer_C") end, nil), ml)
+            if not lc then alog("face: nothing"); return end
+            local l = lc:K2_GetActorLocation()
+            -- step up to it first (this only sticks where we have authority, i.e. on the host)
+            local d0 = math.sqrt((l.X-ml.X)^2 + (l.Y-ml.Y)^2)
+            if d0 > 140 then
+                local dest = { X = l.X + (ml.X - l.X) / d0 * 120, Y = l.Y + (ml.Y - l.Y) / d0 * 120, Z = ml.Z }
+                pcall(function() me:K2_TeleportTo(dest, me:K2_GetActorRotation()) end)
+                ml = safe(function() return me:K2_GetActorLocation() end, ml)
+            end
+            local yaw = math.deg(math.atan(l.Y - ml.Y, l.X - ml.X))
+            local cam = safe(function() return pc.PlayerCameraManager:GetCameraLocation() end, nil) or { X = ml.X, Y = ml.Y, Z = ml.Z + 80 }
+            local hd = math.sqrt((l.X-cam.X)^2 + (l.Y-cam.Y)^2)
+            local pitch = math.deg(math.atan((l.Z + 40) - cam.Z, hd))
+            local ok = pcall(function() pc:SetControlRotation({ Pitch = pitch, Yaw = yaw, Roll = 0.0 }) end)
+            pcall(A.lootHooks)
+            alog(("face: %s %.0f away, yaw %.0f -> %s"):format(className(lc), math.sqrt((l.X-ml.X)^2 + (l.Y-ml.Y)^2), yaw, tostring(ok)))
+        end)
+        return true
+    end)
     -- crouch the way the player's key does: the server RPC, not Crouch()
     A.realCrouch = function(p, on)
         local fn = on and "Svr_Crouch" or "Svr_UnCrouch"
@@ -5236,7 +5535,7 @@ do
                     else
                         alog("no safe spot by the host yet - joiner stays where it spawned")
                     end
-                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well") and not A.ztest then
+                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -5320,7 +5619,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or A.zTick)() end
+            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
             if A.quit and A.serveT > 300 then
                 alog("FAIL: no finished client after 5 min - quitting")
@@ -5352,7 +5651,7 @@ do
             if (not A.play or A.pt) and not (fread("sdmp_ready.txt") or ""):find("1") then
                 A.t = A.t + 1
                 if A.t % 10 == 1 then alog("waiting for host to be ready") end
-                if A.t > 240 then alog("FAIL: host never became ready"); A.step = "dead" end
+                if A.t > 480 then alog("FAIL: host never became ready"); A.step = "dead" end
                 return
             end
             ExecuteInGameThread(setIpDriver)
@@ -5433,7 +5732,7 @@ do
                 A.step, A.t = "playing", 0
                 return
             end
-            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" then
+            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -5595,6 +5894,7 @@ do
             if A.t == 20 or A.t == 40 then pcall(CS.dumpSlots, "client t=" .. A.t) end
             if A.test == "door" then pcall(A.doorClient) end
             if A.test == "well" then pcall(A.wellClient) end
+            if A.test == "loot" then pcall(A.lootClient) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0

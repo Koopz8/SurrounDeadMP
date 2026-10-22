@@ -46,6 +46,7 @@ WHAT WORKS
   - Clothing and gear show up on the other player
   - Doors opened by either player open for both
   - Both players can drink from wells
+  - Both players can search loot containers and take what's inside
   - Friendly fire is off (friendly_fire=true in config.txt to turn it on)
   - The host's game keeps the joiner's character (inventory, clothes,
     health) for next time. If the joiner dies, they start fresh, same as
@@ -55,7 +56,8 @@ WHAT WORKS
 KNOWN ISSUES
 ------------
   - Some movement stutter on the joiner's side. Lower graphics settings help.
-  - Building hasn't been tested with two players yet.
+  - Building, and picking items up off the ground, haven't been tested
+    with two players yet.
   - The joiner's character lives in the host's game, so it only comes back
     when joining that same host. Joining needs the host's IP, no Steam
     invites yet.
