@@ -3945,6 +3945,7 @@ end
 -- A new build then sends a second forward whose Guid is the item's BuildUID.
 -- Reliable RPCs arrive in order, so the host pairs them up.
 BD.NEW, BD.MOVE = 0x53444D42, 0x53444D4D
+local PK   -- joiners' own skills, further down
 local function bdHash(str)
     local h = 2166136261
     for i = 1, #str do
@@ -4015,6 +4016,19 @@ BD.receive = function(jig, payload)
     -- handled a moment later, outside the network call (object searches made
     -- from inside it came back empty)
     if u.A == BD.PICK then gameDelay(50, function() pcall(BD.pickedUp, who, u) end); return end
+    if u.A == BD.PK_SKILL or u.A == BD.PK_TREE then
+        local ok, err = pcall(PK.rx, who, u)
+        if not ok then log("PK: " .. tostring(err):sub(1, 150)) end
+        return
+    end
+    if u.A == BD.VEH_IN or u.A == BD.VEH_OUT or u.A == BD.VEH_INPUT then
+        local function go()
+            local ok, err = pcall(BD.vehRx, who, u)
+            if not ok then log("VH: " .. tostring(err):sub(1, 150)) end
+        end
+        if u.A == BD.VEH_IN then gameDelay(50, go) else go() end
+        return
+    end
     if u.A ~= BD.NEW and u.A ~= BD.MOVE then return end
     local comp = safe(function() return who.BuildingComponent end, nil)
     if not dnValid(comp) then log("BD: joiner has no BuildingComponent"); return end
@@ -4129,6 +4143,538 @@ BD.pickedUp = function(who, u)
     log(("PK: %s picked up by a joiner - removed from the ground (now at %s, joiner saw it %.0f away)"):format(className(best),
         l and ("%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z) or "?", l and math.sqrt((l.X - u.C)^2 + (l.Y - u.D)^2) or -1))
 end
+-- Loot All for joiners. The loot window sends one move per item in the same
+-- frame, and picks each item's target slot from the joiner's own copy of
+-- their inventory - which doesn't change until the host answers. So every
+-- item asks for the same free slot, the host takes the first and refuses
+-- the rest: one item per press. Fix on the host: collect a joiner's moves,
+-- and once the burst is done move the refused items again ourselves, trying
+-- "any slot" (-1) first and then the slots after the one they asked for.
+BD.la = { q = {}, busy = false, fixed = 0 }
+BD.laHas = function(jig, uid)
+    local mc = safe(function() return jig.MainJigContainers end, nil)
+    for i = 1, (mc and #mc or 0) do
+        local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+        for j = 1, (items and #items or 0) do
+            local it = safe(function() return items[j]:get() end, nil) or items[j]
+            local g = bdGuid(safe(function() return it["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] end, nil) or {})
+            if g.A == uid.A and g.B == uid.B and g.C == uid.C and g.D == uid.D then return true end
+        end
+    end
+    return false
+end
+-- the ToContainer struct only lives as long as the RPC call, so copy it into
+-- a plain table (field names read off the function once)
+BD.laFields = function()
+    if BD.laF then return BD.laF end
+    local out = {}
+    pcall(function()
+        StaticFindObject(BD_JIG .. "SERVER_RequestMoveItemToAnotherComp"):ForEachProperty(function(p)
+            if p:GetFName():ToString() == "ToContainer" then
+                p:GetStruct():ForEachProperty(function(f)
+                    out[#out + 1] = { name = f:GetFName():ToString(), kind = f:GetClass():GetFName():ToString() }
+                end)
+            end
+        end)
+    end)
+    local d = {}
+    for _, f in ipairs(out) do d[#d + 1] = f.name .. ":" .. f.kind end
+    log("LA: ToContainer fields " .. table.concat(d, ", "))
+    BD.laF = out
+    return out
+end
+BD.laCopy = function(c)
+    if c == nil then return nil end
+    local t = {}
+    for _, f in ipairs(BD.laFields()) do
+        local v = safe(function() return c[f.name] end, nil)
+        if f.kind == "StructProperty" then
+            -- Guids (the container's id) are the only structs in it
+            t[f.name] = bdGuid(v or {})
+        elseif f.kind == "NameProperty" then
+            t[f.name] = FName(safe(function() return v:ToString() end, "None"))
+        elseif f.kind == "StrProperty" then
+            t[f.name] = safe(function() return v:ToString() end, "")
+        elseif type(v) == "userdata" then
+            t[f.name] = safe(function() return v:get() end, nil)
+        else
+            t[f.name] = v
+        end
+    end
+    return t
+end
+BD.laNote = function(ctx, from, to, uid, rot, idx, cont)
+    if BD.la.retrying then return end
+    local caller = safe(function() return ctx:get() end, nil)
+    local who = dnValid(caller) and safe(function() return caller:GetOwner() end, nil)
+    if not dnValid(who) or safe(function() return who:IsLocallyControlled() end, true) then return end
+    local r = {
+        caller = caller,
+        from = safe(function() return from:get() end, nil), to = safe(function() return to:get() end, nil),
+        uid = bdGuid(safe(function() return uid:get() end, nil) or {}),
+        rot = safe(function() return rot:get() end, false), idx = tonumber(safe(function() return idx:get() end, 0)) or 0,
+        cont = BD.laCopy(safe(function() return cont:get() end, nil)),
+    }
+    -- only container -> player moves (Loot All); a player rearranging their own bag is left alone
+    if not (dnValid(r.from) and dnValid(r.to)) or r.from:GetAddress() == r.to:GetAddress() then return end
+    BD.la.q[#BD.la.q + 1] = r
+    BD.la.stamp = (BD.la.stamp or 0) + 1
+    local mine = BD.la.stamp
+    gameDelay(300, function() if BD.la.stamp == mine then pcall(BD.laRun) end end)
+end
+BD.laRun = function()
+    local q = BD.la.q
+    BD.la.q = {}
+    local left, seen = {}, {}
+    for _, r in ipairs(q) do
+        local k = ("%d.%d.%d.%d"):format(r.uid.A, r.uid.B, r.uid.C, r.uid.D)
+        if not seen[k] and dnValid(r.from) and BD.laHas(r.from, r.uid) then left[#left + 1] = r end
+        seen[k] = true
+    end
+    if #left == 0 then return end
+    BD.la.fixed = 0
+    log(("LA: %d Loot All item(s) were refused - moving them again"):format(#left))
+    do
+        local c, d = left[1].cont or {}, {}
+        for k, v in pairs(c) do d[#d + 1] = k:match("^([%a]+)") .. "=" .. (type(v) == "table" and ("%d/%d"):format(v.A or 0, v.B or 0) or tostring(v)) end
+        log("LA: container " .. table.concat(d, " "))
+    end
+    local step = 0
+    local function tryOne(r, tries)
+        if not (dnValid(r.from) and BD.laHas(r.from, r.uid)) then BD.la.fixed = BD.la.fixed + 1; return true end
+        local idx = (tries == 0) and -1 or (r.idx + tries)
+        BD.la.retrying = true
+        local ok, err = pcall(function()
+            r.caller:SERVER_RequestMoveItemToAnotherComp(r.from, r.to, r.uid, r.rot, idx, r.cont, 0, { A = 0, B = 0, C = 0, D = 0 }, 0)
+        end)
+        BD.la.retrying = false
+        if not ok and tries == 0 then log("LA: re-move failed: " .. tostring(err):sub(1, 150)) end
+        return false
+    end
+    -- one attempt per item per 0.15 s, up to 40 slots each, in order
+    local i, tries = 1, 0
+    gameLoop(150, function()
+        local r = left[i]
+        if not r then
+            log(("LA: done, %d item(s) moved on retry"):format(BD.la.fixed))
+            return true
+        end
+        if tryOne(r, tries) or tries >= 40 then
+            if tries >= 40 then log("LA: no room for an item after 40 tries") end
+            i, tries = i + 1, 0
+        else
+            tries = tries + 1
+        end
+    end)
+end
+-- Vehicles for joiners. Getting in is all single-player code: the vehicle
+-- attaches GetPlayerCharacter(0) to itself and the driving component feeds
+-- that player's keys into the vehicle's movement - on a joiner's machine
+-- that only moves their own copy, which the host overwrites. So:
+--   joiner gets in  -> tells the host ("SDVE" + class hash + X/Y); the host
+--                      seats the joiner's character in that vehicle
+--   joiner drives   -> their movement keys go to the host 20x a second
+--                      ("SDVI"); the host sets throttle / brake / steering
+--                      on the real vehicle, whose movement replicates back
+--   joiner gets out -> "SDVX"; the host unseats them by the driver door
+BD.VEH_IN, BD.VEH_OUT, BD.VEH_INPUT = 0x53445645, 0x53445658, 0x53445649
+BD.vh = { seat = {}, keys = {}, ghost = {} }
+BD.vehMove = function(v)
+    return safe(function() return v.VehicleMovementComponent end, nil) or safe(function() return v:GetVehicleMovementComponent() end, nil)
+end
+BD.vehFind = function(u)
+    local best, bd = nil, 600 * 600
+    for _, v in ipairs(safe(function() return FindAllOf("BP_VehicleMaster_C") end, nil) or {}) do
+        local l = dnValid(v) and safe(function() return v:K2_GetActorLocation() end, nil)
+        if l and bdHash(className(v)) == u.B then
+            local d = (l.X - u.C)^2 + (l.Y - u.D)^2
+            if d < bd then best, bd = v, d end
+        end
+    end
+    return best
+end
+BD.vehRx = function(who, u)
+    local key = who:GetAddress()
+    local seat = BD.vh.seat[key]
+    if u.A == BD.VEH_IN then
+        local v = BD.vehFind(u)
+        if not v then log("VH: a joiner got into a vehicle I can't find"); return end
+        BD.vh.seat[key] = { v = v, who = who }
+        pcall(function() who.CharacterMovement:DisableMovement() end)
+        pcall(function() who:SetActorEnableCollision(false) end)
+        pcall(function() who:K2_AttachToActor(v, FName("None"), 2, 2, 1, false) end)
+        log("VH: joiner is driving " .. className(v))
+    elseif u.A == BD.VEH_INPUT and seat and dnValid(seat.v) then
+        local mc = BD.vehMove(seat.v)
+        if not dnValid(mc) then return end
+        local b = u.B
+        local throttle = (b & 1 ~= 0) and 1.0 or 0.0
+        local brake = (b & 2 ~= 0) and 1.0 or 0.0
+        local hand = (b & 4 ~= 0)
+        local steer = math.max(-1.0, math.min(1.0, u.C / 1000.0))
+        pcall(function() mc:SetThrottleInput(throttle) end)
+        pcall(function() mc:SetBrakeInput(brake) end)
+        pcall(function() mc:SetSteeringInput(steer) end)
+        pcall(function() mc:SetHandbrakeInput(hand) end)
+        BD.vh.inputs = (BD.vh.inputs or 0) + 1
+    elseif u.A == BD.VEH_OUT and seat then
+        BD.vh.seat[key] = nil
+        local v = seat.v
+        local mc = dnValid(v) and BD.vehMove(v)
+        if dnValid(mc) then
+            pcall(function() mc:SetThrottleInput(0.0) end); pcall(function() mc:SetSteeringInput(0.0) end)
+            pcall(function() mc:SetHandbrakeInput(true) end)
+        end
+        pcall(function() who:K2_DetachFromActor(1, 1, 1) end)
+        local l = dnValid(v) and safe(function() return v:K2_GetActorLocation() end, nil)
+        local r = dnValid(v) and safe(function() return v:GetActorRightVector() end, nil)
+        if l and r then
+            pcall(function() who:K2_TeleportTo({ X = l.X - r.X * 250, Y = l.Y - r.Y * 250, Z = l.Z + 120 }, who:K2_GetActorRotation()) end)
+        end
+        pcall(function() who:SetActorEnableCollision(true) end)
+        pcall(function() who.CharacterMovement:SetMovementMode(1, 0) end)
+        log(("VH: joiner got out (%d inputs relayed)"):format(BD.vh.inputs or 0))
+    end
+end
+-- joiner side
+BD.vehSend = function(code, v, b, c)
+    local me = (function()
+        local pc = dnLocalPC()
+        return pc and safe(function() return pc.Pawn end, nil)
+    end)()
+    local jig = dnValid(me) and safe(function() return me.BP_JigMultiplayer end, nil)
+    if not dnValid(jig) then return false end
+    if code == BD.VEH_INPUT then return bdForward(me, jig, { A = code, B = b, C = c, D = 0 }) end
+    local l = safe(function() return v:K2_GetActorLocation() end, nil) or { X = 0, Y = 0 }
+    return bdForward(me, jig, { A = code, B = bdHash(className(v)), C = bdI32(l.X), D = bdI32(l.Y) })
+end
+BD.vehKeys = function()
+    if dnIsHost() or not BD.vh.mine then return end
+    local now = os.clock()
+    local function held(n) return (now - (BD.vh.keys[n] or -10)) < 0.15 end
+    local b = (held("MoveForward") and 1 or 0) + (held("MoveBackwards") and 2 or 0) + (held("Jump") and 4 or 0)
+    local steer = (held("MoveRight") and 1000 or 0) - (held("MoveLeft") and 1000 or 0)
+    local sig = b * 10000 + steer
+    if sig ~= BD.vh.lastSig or now - (BD.vh.lastSend or 0) > 0.5 then
+        BD.vh.lastSig, BD.vh.lastSend = sig, now
+        BD.vehSend(BD.VEH_INPUT, nil, b, steer)
+    end
+end
+-- Joiners' own skills. The character's Blueprints look perks up through
+-- GetPlayerController(self, 0) - on the host that's always the HOST, so a
+-- joiner took damage through the host's Toughness, earned the host Toughness
+-- XP when hit, and used the host's skill tree (Deathbringer etc). So on the
+-- host:
+--   * GetPlayerController(<a joiner's character or something it owns>, 0)
+--     is turned into that joiner's controller (index 1, 2 ... on a listen
+--     server). Not while the character is dead - the death code's
+--     UnPossess() keeps going through the old path the respawn handling
+--     already knows about.
+--   * the joiner's controller copy on the host gets the joiner's real
+--     numbers: the joiner sends its passive skills ("SDPS", one field per
+--     message) and unlocked skill-tree skills ("SDTT", a bit mask).
+--   * XP the host-side code gives that copy (Toughness when hit, ...) is
+--     passed down to the joiner, riding on Client_UpdateOxygenUI with a
+--     value no real oxygen level can have; the joiner adds it to its own
+--     skills and puts its oxygen bar back.
+PK = { on = false, idx = {}, ctx = {}, sent = {}, maskSent = nil, pend = {}, applied = 0, redir = 0, xpSent = 0, xpGot = 0 }
+BD.PK_SKILL, BD.PK_TREE = 0x53445053, 0x53445454
+PK.XP = { "Fitness", "Strength", "Toughness", "Sneaking", "FirstAid", "Marksmanship", "Reloading", "Thief", "Fishing", "Scavenging" }
+PK.OXY = -1000000   -- carrier values are below this
+PK.PS = "/Game/Blueprints/Components/PassiveSkillsComponent.PassiveSkillsComponent_C"
+PK.fieldList = function()
+    if PK.fields then return PK.fields end
+    local cls = StaticFindObject(PK.PS)
+    if not dnValid(cls) then return nil end
+    local list = {}
+    pcall(function() cls:ForEachProperty(function(pr)
+        local n = pr:GetFName():ToString()
+        local t = pr:GetClass():GetFName():ToString()
+        if (t == "DoubleProperty" or t == "FloatProperty" or t == "IntProperty" or t == "BoolProperty")
+           and not n:find("^CallFunc") and not n:find("^Temp_") and not n:find("^K2Node") then
+            list[#list + 1] = { n = n, b = t == "BoolProperty" }
+        end
+    end) end)
+    if #list > 0 then PK.fields = list end
+    return PK.fields
+end
+PK.skills = function()
+    local l = {}
+    for _, a in ipairs(safe(function() return FindAllOf("BP_SkillTreeAsset_C") end, nil) or {}) do
+        if dnValid(a) then l[#l + 1] = { a = a, n = a:GetFName():ToString() } end
+    end
+    table.sort(l, function(x, y) return x.n < y.n end)
+    return l
+end
+PK.compOf = function(pc, cls)
+    for _, c in ipairs(safe(function() return FindAllOf(cls) end, nil) or {}) do
+        local o = dnValid(c) and safe(function() return c:GetOwner() end, nil)
+        if o and dnValid(o) and o:GetAddress() == pc:GetAddress() then return c end
+    end
+end
+-- the tree object can be missing on a controller copy; never touch it then
+-- (a method call on a null object takes the game down, pcall can't catch it)
+PK.treeOk = function(t)
+    local tree = safe(function() return t.TechnologyTree end, nil)
+    return dnValid(t) and tree ~= nil and dnValid(tree)
+end
+-- host: a joiner's controller copy never gets its tree set up (the game does
+-- that with the skill-tree screen, on the joiner's machine), so give it one:
+-- the same template, and a bare tree widget object the plugin wants with it
+PK.giveTree = function(tt)
+    local tpl = StaticFindObject("/Game/Blueprints/SkillTree/SkillTree.SkillTree")
+    local wcls = StaticFindObject("/Script/TechTree.TechTreeWidget")
+    if not (dnValid(tpl) and dnValid(wcls)) then return end
+    local w = StaticConstructObject(wcls, tt)
+    if not dnValid(w) then return end
+    tt:AssignTechTree(tpl, w)
+    local at = safe(function() return tt:GetAssignedTechTree() end, nil)
+    if at and dnValid(at) then
+        tt.TechnologyTree = at
+        tt.TechTreeWidget = w
+        log("PERK: set up the joiner's skill tree on the host")
+    end
+end
+-- host: which GetPlayerController index each joiner's character answers to
+PK.refresh = function()
+    PK.on = false
+    if not dnIsHost() then return end
+    local world = UEHelpers.GetWorld()
+    local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local idx = {}
+    for i = 1, 7 do
+        local pc = safe(function() return gs:GetPlayerController(world, i) end, nil)
+        if not dnValid(pc) then break end
+        local p = safe(function() return pc.Pawn end, nil)
+        if dnValid(p) and safe(function() return pc:IsLocalController() end, true) == false then
+            idx[p:GetAddress()] = { i = i, p = p }
+            PK.on = true
+        end
+    end
+    PK.idx, PK.ctx = idx, {}
+end
+PK.target = function(w)
+    local a = w:GetAddress()
+    local c = PK.ctx[a]
+    if c == nil then
+        c = false
+        local e = PK.idx[a]
+        if not e then
+            local o = safe(function() return w:GetOwner() end, nil)
+            if o and dnValid(o) then e = PK.idx[o:GetAddress()] end
+        end
+        if e then c = e end
+        PK.ctx[a] = c
+    end
+    if not c then return nil end
+    -- leave the death sequence alone (see above)
+    if safe(function() return c.p["PlayerDead?"] end, false) == true then return nil end
+    if (safe(function() return c.p.MedicalComponent.Health end, 1) or 1) <= 0 then return nil end
+    return c.i
+end
+PK.hook = function()
+    if PK.hooked then return end
+    PK.hooked = true
+    local ok1 = pcall(RegisterHook, "/Script/Engine.GameplayStatics:GetPlayerController", function(ctx, wc, index)
+        if not PK.on then return end
+        if index:get() ~= 0 then return end
+        local w = wc:get()
+        if not w or not w:IsValid() then return end
+        local i = PK.target(w)
+        if i then index:set(i); PK.redir = PK.redir + 1 end
+    end)
+    -- host: XP the game hands a joiner's copy goes down to the joiner
+    local okx = 0
+    for k, sk in ipairs(PK.XP) do
+        if pcall(RegisterHook, PK.PS .. ":AddXP_" .. sk, function(ctx, amt)
+            if not PK.on then return end
+            local c = ctx:get()
+            local o = safe(function() return c:GetOwner() end, nil)
+            if not dnValid(o) or safe(function() return o:IsLocalController() end, true) then return end
+            local v = safe(function() return amt:get() end, 0) or 0
+            if v <= 0 then return end
+            local key = o:GetAddress()
+            PK.pend[key] = PK.pend[key] or { pc = o, xp = {} }
+            PK.pend[key].xp[k] = (PK.pend[key].xp[k] or 0) + v
+        end) then okx = okx + 1 end
+    end
+    -- joiner: pick the XP up again
+    local oko = pcall(RegisterHook, "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:Client_UpdateOxygenUI", function(ctx, oxy)
+        if dnIsHost() then return end
+        local v = safe(function() return oxy:get() end, 0) or 0
+        if v > PK.OXY then PK.lastOxy = v; return end
+        local me = ctx:get()
+        local n = -v + PK.OXY          -- = k * 1e6 + xp * 1000
+        local k = math.floor(n / 1000000)
+        local xp = (n - k * 1000000) / 1000
+        local sk = PK.XP[k]
+        local comp = sk and PK.compOf(safe(function() return me.Controller end, nil) or dnLocalPC(), "PassiveSkillsComponent_C")
+        if comp then
+            local ok = pcall(function() comp["AddXP_" .. sk](comp, xp) end)
+            PK.xpGot = PK.xpGot + 1
+            if PK.xpGot <= 3 then log(("PERK: host sent %.2f %s XP -> %s"):format(xp, sk, tostring(ok))) end
+        end
+        local real = PK.lastOxy or 100.0
+        gameDelay(10, function() pcall(function() me:Client_UpdateOxygenUI(real) end) end)
+    end)
+    log(("PERK: perk hooks controller=%s xp=%d oxygen=%s"):format(tostring(ok1), okx, tostring(oko)))
+end
+-- host: flush XP owed to joiners (one carrier call per skill)
+PK.flush = function()
+    for key, e in pairs(PK.pend) do
+        PK.pend[key] = nil
+        local p = dnValid(e.pc) and safe(function() return e.pc.Pawn end, nil)
+        if dnValid(p) then
+            for k, v in pairs(e.xp) do
+                local x = math.min(v, 999.0)
+                pcall(function() p:Client_UpdateOxygenUI(PK.OXY - (k * 1000000 + math.floor(x * 1000 + 0.5))) end)
+                PK.xpSent = PK.xpSent + 1
+            end
+        end
+    end
+end
+-- joiner: send our skills to the host when they change
+PK.send = function()
+    if dnIsHost() then return end
+    local pc = dnLocalPC()
+    local me = pc and safe(function() return pc.Pawn end, nil)
+    local jig = dnValid(me) and safe(function() return me.BP_JigMultiplayer end, nil)
+    if not dnValid(jig) then return end
+    local comp = PK.compOf(pc, "PassiveSkillsComponent_C")
+    local fields = PK.fieldList()
+    if comp and fields then
+        local n = 0
+        for i, fd in ipairs(fields) do
+            local v = safe(function() return comp[fd.n] end, nil)
+            local enc
+            if fd.b then enc = v and 1 or 0
+            elseif type(v) == "number" then enc = bdI32(v * 1000) end
+            if enc and PK.sent[i] ~= enc and n < 25 then
+                if bdForward(me, jig, { A = BD.PK_SKILL, B = i, C = enc, D = 0 }) then PK.sent[i] = enc; n = n + 1 end
+            end
+        end
+        if n > 0 and not PK.saidSkills then PK.saidSkills = true; log(("PERK: sent the host my passive skills (%d fields)"):format(n)) end
+    end
+    local tt = PK.compOf(pc, "TechTreeComponent_C")
+    if PK.treeOk(tt) then
+        local mask, list = 0, PK.skills()
+        for i, sk in ipairs(list) do
+            if safe(function() return tt:IsTechnologyUnlocked(sk.a) end, false) == true then mask = mask | (1 << (i - 1)) end
+        end
+        local now = os.clock()
+        if mask ~= PK.maskSent or now - (PK.maskT or 0) > 30 then
+            if bdForward(me, jig, { A = BD.PK_TREE, B = mask, C = #list, D = 0 }) then
+                if mask ~= PK.maskSent then log(("PERK: my skill tree -> host (mask %d of %d)"):format(mask, #list)) end
+                PK.maskSent, PK.maskT = mask, now
+            end
+        end
+    end
+end
+-- host: apply what a joiner sent to its controller copy
+PK.rx = function(who, u)
+    local pc = safe(function() return who.Controller end, nil)
+    if not dnValid(pc) then return end
+    if u.A == BD.PK_SKILL then
+        local fd = (PK.fieldList() or {})[u.B]
+        local comp = fd and PK.compOf(pc, "PassiveSkillsComponent_C")
+        if not comp then return end
+        pcall(function() comp[fd.n] = fd.b and (u.C ~= 0) or (u.C / 1000.0) end)
+        PK.applied = PK.applied + 1
+        if PK.applied == 1 then log("PERK: got a joiner's passive skills") end
+    elseif u.A == BD.PK_TREE then
+        local tt = PK.compOf(pc, "TechTreeComponent_C")
+        if dnValid(tt) and not PK.treeOk(tt) then pcall(PK.giveTree, tt) end
+        if not PK.treeOk(tt) then
+            if not PK.saidNoTree then PK.saidNoTree = true; log("PERK: couldn't set up the joiner's skill tree on the host - skipped") end
+            return
+        end
+        local list = PK.skills()
+        if #list ~= u.C then log(("PERK: skill count differs (joiner %d, host %d) - skipped"):format(u.C, #list)); return end
+        local ch = {}
+        for i, sk in ipairs(list) do
+            local want = (u.B >> (i - 1)) & 1 == 1
+            local have = safe(function() return tt:IsTechnologyUnlocked(sk.a) end, false) == true
+            if want ~= have then
+                pcall(function() if want then tt:UnlockTechnology(sk.a) else tt:LockTechnology(sk.a) end end)
+                ch[#ch + 1] = (want and "+" or "-") .. sk.n:gsub("^Skill_", "")
+            end
+        end
+        if #ch > 0 then log("PERK: joiner's skill tree on the host: " .. table.concat(ch, " ")) end
+    end
+end
+gameLoop(2000, function() pcall(PK.refresh); pcall(PK.flush) end)
+gameLoop(3000, function() pcall(PK.send) end)
+
+-- Crafting trace (cheap, crafting is rare): the Jig inventory already does
+-- crafting as server requests (SERVER_RequestCraftItem -> host crafts ->
+-- CLIENT_ItemCraftedResponse), so this only logs it. "CR:" lines.
+BD.crHook = function()
+    if BD.crHooked then return end
+    BD.crHooked = true
+    local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
+    local ok1 = pcall(RegisterHook, J .. "HandleServerFuncRequestCraft", function(ctx, comp, idx)
+        local jig = ctx:get()
+        local o = safe(function() return jig:GetOwner() end, nil)
+        log(("CR: craft request on the host from %s, recipe %s via %s"):format(
+            (dnValid(o) and safe(function() return o:IsLocallyControlled() end, true) == false) and "a joiner" or "the host",
+            tostring(safe(function() return idx:get() end, "?")), tostring(safe(function() return className(comp:get()) end, "?"))))
+    end)
+    local ok2 = pcall(RegisterHook, J .. "ClientFuncItemCrafted", function(ctx, tmp, added, success)
+        if dnIsHost() then return end
+        log("CR: host answered my craft: success=" .. tostring(safe(function() return success:get() end, "?")))
+    end)
+    log(("CR: crafting trace hooks %s/%s"):format(tostring(ok1), tostring(ok2)))
+end
+
+-- A joiner's game spawns its own vehicles too (they come up as ours - local
+-- authority - not the host's). Those never sync with anything: getting into
+-- one drives a car only we can see, and the host's real car sits in the same
+-- spot. Hide them and switch their collision off so only the host's show.
+BD.vehGhosts = function()
+    if dnIsHost() then return end
+    for _, v in ipairs(safe(function() return FindAllOf("BP_VehicleMaster_C") end, nil) or {}) do
+        if dnValid(v) and not BD.vh.ghost[v:GetAddress()] and safe(function() return v:GetLocalRole() end, 0) == 3 then
+            BD.vh.ghost[v:GetAddress()] = true
+            if BD.vh.mine == v then BD.vh.mine = nil end
+            pcall(function() v:SetActorHiddenInGame(true) end)
+            pcall(function() v:SetActorEnableCollision(false) end)
+            pcall(function() v:SetActorTickEnabled(false) end)
+            BD.vh.ghosts = (BD.vh.ghosts or 0) + 1
+            local l = safe(function() return v:K2_GetActorLocation() end, { X = 0, Y = 0 })
+            log(("VH: hid our own copy of %s at %.0f,%.0f (only the host's vehicles are real)"):format(className(v), l.X, l.Y))
+        end
+    end
+end
+BD.vehHook = function()
+    if BD.vh.hooked then return end
+    local V = "/Game/Blueprints/Vehicles/BP_VehicleMaster.BP_VehicleMaster_C:"
+    local P = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
+    local okIn = pcall(RegisterHook, V .. "Interact_GetInVehicle", function(ctx)
+        local v = safe(function() return ctx:get() end, nil)
+        if not dnValid(v) then return end
+        if dnIsHost() then log("VH: get-in ran on the host for " .. className(v)); return end
+        BD.vh.mine = v
+        log("VH: I got into " .. className(v) .. " -> " .. tostring(BD.vehSend(BD.VEH_IN, v)))
+    end)
+    local okOut = pcall(RegisterHook, V .. "ExitVehicle", function(ctx)
+        if dnIsHost() or not BD.vh.mine then return end
+        local v = BD.vh.mine
+        BD.vh.mine = nil
+        log("VH: I got out -> " .. tostring(BD.vehSend(BD.VEH_OUT, v)))
+    end)
+    -- movement keys, as the game's own bindings see them (they fire every frame while held)
+    local nk = 0
+    pcall(function() StaticFindObject(P):ForEachFunction(function(fn)
+        local nm = fn:GetFName():ToString()
+        for _, k in ipairs({ "MoveForward", "MoveBackwards", "MoveLeft", "MoveRight", "Jump" }) do
+            if nm:find("^InpActEvt_IA_" .. k .. "_") then
+                if pcall(RegisterHook, P .. ":" .. nm, function() BD.vh.keys[k] = os.clock() end) then nk = nk + 1 end
+            end
+        end
+    end) end)
+    BD.vh.hooked = okIn and okOut
+    log(("VH: vehicle hooks in=%s out=%s keys=%d"):format(tostring(okIn), tostring(okOut), nk))
+end
 BD.hook = function()
     if BD.hooked or BD.tries >= 30 then return end
     local cls = safe(function() return StaticFindObject("/Game/Blueprints/Components/BuildingComponent.BuildingComponent_C") end, nil)
@@ -4152,6 +4698,14 @@ BD.hook = function()
             if not ok then log("BD: receive error " .. tostring(err):sub(1, 150)) end
         end
     end)
+    if not BD.vh.hooked then pcall(BD.vehHook) end
+    if not PK.hooked then pcall(PK.hook) end
+    if not BD.crHooked then pcall(BD.crHook) end
+    if not BD.vh.loop then
+        BD.vh.loop = true
+        gameLoop(50, function() pcall(BD.vehKeys) end)
+        gameLoop(2000, function() pcall(BD.vehGhosts) end)
+    end
     if not BD.pkHooked then
         BD.pkHooked = pcall(RegisterHook, BD_JIG .. "CLIENT_AddActorToContainerSUCCESS", function(ctx, actor)
             if dnIsHost() then return end
@@ -4167,6 +4721,12 @@ BD.hook = function()
             local a = safe(function() return actor:get() end, nil)
             if dnValid(jig) and dnValid(a) then pcall(BD.sendPicked, jig, a) end
         end)
+        local okLA = pcall(RegisterHook, BD_JIG .. "SERVER_RequestMoveItemToAnotherComp", function(ctx, from, to, uid, rot, idx, cont)
+            if not dnIsHost() then return end
+            local ok, err = pcall(BD.laNote, ctx, from, to, uid, rot, idx, cont)
+            if not ok then log("LA: note error " .. tostring(err):sub(1, 120)) end
+        end)
+        log("LA: loot all hook -> " .. tostring(okLA))
         local okR1 = pcall(RegisterHook, BD_JIG .. "SERVER_RequestAddActorToContainer", function(ctx, actor)
             if not dnIsHost() then return end
             local jig = safe(function() return ctx:get() end, nil)
@@ -5236,7 +5796,9 @@ do
     A.lootTick = function()
         local z = A.ztest
         z.t = z.t + 1
-        pcall(A.ltAuto)
+        -- (A.ltAuto removed: scanning every object every 3 s froze both games)
+        -- zombies wander over and down the joiner while someone holds F by hand
+        if z.t == 2 then pcall(function() z.p.bCanBeDamaged = false end) end
         local hp, cp = myPawn(), z.p
         -- teleports fail when the spot overlaps something (the container's
         -- own mesh), so walk around it until one sticks
@@ -5323,6 +5885,8 @@ do
         elseif z.t == 23 then
             alog("LOOT: container before the joiner opens it: " .. A.jigDump(z.lc))
             alog("LOOT: host faces it too -> " .. tostring(A.faceActor(z.lc, false)))
+            A.aimAt = z.lc   -- keep the camera on it, so a real F hold works
+            pcall(A.cmdLootProbe)
             local l = safe(function() return z.lc:K2_GetActorLocation() end, nil)
             local cl = safe(function() return cp:K2_GetActorLocation() end, nil)
             if l and cl then
@@ -5346,7 +5910,7 @@ do
     end
     A.lootClient = function()
         pcall(A.lootHooks)
-        pcall(A.ltAuto)
+        -- (A.ltAuto removed: scanning every object every 3 s froze both games)
         local ph = fread("sdmp_phase.txt") or ""
         local me = myPawn()
         local ml = safe(function() return me:K2_GetActorLocation() end, nil)
@@ -5362,10 +5926,17 @@ do
             local x, y, zz = ph:match("loot2:(%-?%d+),(%-?%d+),(%-?%d+)")
             local target = x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(zz) } or ml
             local lc = nearestActor(safe(function() return FindAllOf("BP_LootContainer_C") end, nil), target)
-            if not lc then alog("LOOT(client): no container near me"); return end
+            if not lc then
+                -- just teleported: the area may still be streaming in
+                A.lcTries = (A.lcTries or 0) + 1
+                if A.lcTries < 10 then A.lc2 = false; return end
+                alog("LOOT(client): no container near me"); return
+            end
             local l = safe(function() return lc:K2_GetActorLocation() end, nil)
             local d = (l and ml) and math.sqrt((l.X-ml.X)^2 + (l.Y-ml.Y)^2 + (l.Z-ml.Z)^2) or -1
             alog("LOOT(client): facing the container -> " .. tostring(A.faceActor(lc, false)))
+            A.aimAt = lc
+            gameDelay(15000, function() pcall(A.cmdLootProbe) end)
             local ok, err = pcall(function() lc:OnExecuteInteract(me, tag) end)
             alog(("LOOT(client): open %s %.0f away -> %s %s"):format(className(lc), d, tostring(ok), tostring(err or ""):sub(1, 100)))
             gameDelay(3000, function()
@@ -5658,7 +6229,7 @@ do
         if role ~= me then return end
         fwrite("sdmp_cmd.txt", "")
         alog("cmd: " .. cmd)
-        local fn = ({ inv = A.cmdInv, buildreal = A.cmdBuildReal, give = A.cmdGive, jig = A.cmdJig, uid = A.cmdUid, movereal = A.cmdMoveReal, builds = A.cmdBuilds, lootprobe = A.cmdLootProbe })[cmd]
+        local fn = ({ inv = A.cmdInv, buildreal = A.cmdBuildReal, give = A.cmdGive, jig = A.cmdJig, uid = A.cmdUid, movereal = A.cmdMoveReal, builds = A.cmdBuilds, lootprobe = A.cmdLootProbe, lua = A.cmdLua, equipprobe = A.cmdEquipProbe, equipmelee = A.cmdEquipMelee, aimoff = function() A.aimAt = nil end, combattrace = function() A.cbHooks(dnIsHost() and "host" or "client") end })[cmd]
         if not fn then alog("cmd: unknown"); return end
         local ok, err = pcall(fn)
         if not ok then alog("cmd error: " .. tostring(err):sub(1, 300)) end
@@ -5960,9 +6531,10 @@ do
         return ok
     end
     -- turn the local camera at an actor (host also steps next to it first)
-    A.faceActor = function(a, step)
+    A.faceActor = function(a, step, zoff)
         local pc, me = UEHelpers.GetPlayerController(), myPawn()
         local l = safe(function() return a:K2_GetActorLocation() end, nil)
+        if l and zoff then l = { X = l.X, Y = l.Y, Z = l.Z + zoff } end
         local ml = safe(function() return me:K2_GetActorLocation() end, nil)
         if not (l and ml) then return false end
         local d0 = math.sqrt((l.X - ml.X)^2 + (l.Y - ml.Y)^2)
@@ -5996,7 +6568,6 @@ do
     -- Loot All handler and trace every item move and its reply, to see why a
     -- joiner's Loot All only moves one item per press
     A.cmdLootProbe = function()
-        pcall(A.fnProbe, { "lootall", "loot_all", "takeall", "take_all" }, "loot all")
         if A.ltHooked then alog("LT: already tracing"); return end
         A.ltHooked = true
         local J = "/Game/JigSInventory/Jigsaw/Components/BP_JigMultiplayer.BP_JigMultiplayer_C:"
@@ -6013,15 +6584,30 @@ do
                 if ok then n = n + 1 end
             end
         end
-        ForEachUObject(function(o)
-            local fn = safe(function() return o:GetFullName() end, "") or ""
-            if fn:sub(1, 9) == "Function " and fn:lower():find("lootall", 1, true) then
-                local path = fn:sub(10)
-                if pcall(RegisterHook, path, function() alog("LT called " .. path:match("[^.:]+$")) end) then n = n + 1 end
-            end
+        -- (walking every object to find the Loot All handler froze the game
+        -- ~2 s; it lives in W_LootContainerUI_C under no "lootall" name)
+        alog("LT sig MoveToIndexFailed: " .. PR.sig(J .. "CLIENT_MoveToIndexFailed"))
+        alog("LT sig MoveItemToAnotherComp: " .. PR.sig(J .. "SERVER_RequestMoveItemToAnotherComp"))
+        -- what each move asks for (host side: the RPC arrives)
+        pcall(RegisterHook, J .. "SERVER_RequestMoveItemToAnotherComp", function(ctx, from, to, uid, rot, idx, cont)
+            local function o(v) local x = safe(function() return v:get() end, nil); return className(x) end
+            local g = bdGuid(safe(function() return uid:get() end, nil) or {})
+            local ci = safe(function() return cont:get() end, nil)
+            local cs = {}
+            pcall(function() ci:GetStruct():ForEachProperty(function(pr) local nm = pr:GetFName():ToString(); cs[#cs + 1] = nm:match("^([%a]+)") .. "=" .. tostring(safe(function() return ci[nm] end, "?")) end) end)
+            alog(("LT move %s -> %s item %d index %s container {%s}"):format(o(from), o(to), g.A, tostring(safe(function() return idx:get() end, "?")), table.concat(cs, ",")))
+        end)
+        pcall(RegisterHook, J .. "CLIENT_MoveToIndexFailed", function(ctx, a1, a2, a3)
+            local function v(x) local y = safe(function() return x:get() end, nil); if type(y) == "userdata" then return className(y) end return tostring(y) end
+            alog(("LT failed reply: %s %s %s"):format(v(a1), v(a2), v(a3)))
         end)
         alog(("LT: tracing %d functions - press Loot All now"):format(n))
     end
+    -- dev: keep the local camera on A.aimAt (tests set it; file command
+    -- "aimoff" stops it), so a real key held by hand hits the right thing
+    gameLoop(100, function()
+        if A.aimAt and dnValid(A.aimAt) then pcall(A.faceActor, A.aimAt, false, 60) end
+    end)
     -- loot test: switch the Loot All trace on by itself as soon as the loot
     -- window's code has loaded (it loads the first time a window opens)
     A.ltAuto = function()
@@ -6172,6 +6758,479 @@ do
         alog(("STEAM3 Join Game set up -> %s %s (%s)"):format(tostring(okH), tostring(hosted), tostring(A.steamConnect and A.steamConnect:gsub("%d%d%d%d%d%d%d%d%d%d%d%d%d", "...") or "-")))
         local nd = safe(function() return UEHelpers.GetWorld().NetDriver end, nil)
         alog("STEAM3 host net driver: " .. (dnValid(nd) and className(nd) or "none"))
+    end
+    -- dev, test runs only (-sdmpauto): "lua" file command runs the code in
+    -- sdmp_lua.txt next to the mod, so probes don't need a game restart.
+    -- The chunk gets A, CS, BD, PR, PJ, alog, safe, dnValid, className,
+    -- myPawn, gameDelay, bdGuid, bdPath through its environment.
+    A.cmdLua = function()
+        if not A.auto then alog("lua: only in test runs"); return end
+        local src = fread("sdmp_lua.txt")
+        if not src or src == "" then alog("lua: sdmp_lua.txt is empty"); return end
+        local env = setmetatable({ A = A, CS = CS, BD = BD, PR = PR, PJ = PJ, alog = alog, safe = safe, dnValid = dnValid,
+            className = className, myPawn = myPawn, gameDelay = gameDelay, bdGuid = bdGuid, bdPath = bdPath }, { __index = _G })
+        local fn, err = load(src, "sdmp_lua", "t", env)
+        if not fn then alog("lua: compile error " .. tostring(err)); return end
+        local ok, res = pcall(fn)
+        alog("lua: " .. (ok and ("ok " .. tostring(res)) or ("error " .. tostring(res))):sub(1, 1500))
+    end
+    -- dev (file command "equipprobe"): hook every equip / slot / hotbar /
+    -- fire / melee function on the player character, to see which ones a
+    -- real key press runs on a joiner
+    A.cmdEquipProbe = function()
+        if A.eqHooked then alog("EQ: already tracing"); return end
+        A.eqHooked = true
+        local P = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
+        local cls = StaticFindObject(P)
+        local n, names = 0, {}
+        cls:ForEachFunction(function(fn)
+            local nm = fn:GetFName():ToString()
+            local low = nm:lower()
+            if (low:find("equip") or low:find("activeslot") or low:find("hotbar") or low:find("fire") or low:find("melee")
+                or low:find("shoot") or low:find("attack") or low:find("weapon")) and not low:find("ubergraph") then
+                names[#names + 1] = nm
+                if pcall(RegisterHook, P .. ":" .. nm, function(ctx)
+                    local me = safe(function() return ctx:get() end, nil)
+                    A.eqCount = A.eqCount or {}
+                    A.eqCount[nm] = (A.eqCount[nm] or 0) + 1
+                    if A.eqCount[nm] <= 6 then
+                        alog(("EQ %s (%s pawn) #%d"):format(nm, safe(function() return me:IsLocallyControlled() end, false) and "my" or "other", A.eqCount[nm]))
+                    end
+                end) then n = n + 1 end
+            end
+        end)
+        alog(("EQ: hooked %d: %s"):format(n, table.concat(names, " "):sub(1, 1500)))
+        alog("EQ sig SERVER_ChangeActiveSlot: " .. PR.sig(P .. ":SERVER_ChangeActiveSlot"))
+        alog("EQ sig ServerFuncChangeActiveSlot: " .. PR.sig(P .. ":ServerFuncChangeActiveSlot"))
+    end
+    -- dev (file command "equipmelee"): ask the server to put the melee slot in hand
+    A.cmdEquipMelee = function()
+        local me = myPawn()
+        for _, tag in ipairs({ "Jig.PlayerSlot.MeleeWeapon", "Jig.PlayerSlot.Melee" }) do
+            local ok, err = pcall(function() me:SERVER_ChangeActiveSlot({ TagName = FName(tag) }) end)
+            alog(("EQ: SERVER_ChangeActiveSlot(%s) -> %s %s"):format(tag, tostring(ok), tostring(err or ""):sub(1, 100)))
+        end
+        gameDelay(2000, function()
+            local w = safe(function() return me:GetCurrentActiveWeapon() end, nil)
+            alog("EQ: weapon in hand now: " .. (type(w) == "userdata" and className(w) or tostring(w)))
+        end)
+    end
+    -- ------------------------------------------------------------- combat
+    -- Network functions (RPCs) of a class and its parents, with direction.
+    A.netFns = function(path)
+        local cls = safe(function() return StaticFindObject(path) end, nil)
+        if not dnValid(cls) then return nil end
+        local out = {}
+        local c, depth = cls, 0
+        while dnValid(c) and depth < 6 do
+            local cn = safe(function() return c:GetFName():ToString() end, "?")
+            if cn:find("^Actor$") or cn:find("^Pawn$") or cn:find("^Character$") or cn:find("^Object$") then break end
+            pcall(function() c:ForEachFunction(function(fn)
+                local fl = safe(function() return fn:GetFunctionFlags() end, 0) or 0
+                if fl & 0x40 ~= 0 then
+                    local kind = (fl & 0x200000 ~= 0) and "server" or (fl & 0x1000000 ~= 0) and "client" or (fl & 0x4000 ~= 0) and "multicast" or "net"
+                    out[#out + 1] = { name = fn:GetFName():ToString(), kind = kind, path = c:GetFullName():match("%s(%S+)$") .. ":" .. fn:GetFName():ToString(),
+                                      reliable = fl & 0x80 ~= 0 }
+                end
+            end) end)
+            c = safe(function() return c:GetSuperStruct() end, nil)
+            depth = depth + 1
+        end
+        return out
+    end
+    A.CB_CLASSES = {
+        "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C",
+        "/Game/Inventory/Items/Pickups/Weapons/Firearms/BP_FirearmPickup.BP_FirearmPickup_C",
+        "/Game/Inventory/Items/Pickups/Weapons/Melee/BP_MeleePickup.BP_MeleePickup_C",
+        "/Game/Inventory/Items/Other/Components/BP_WeaponsPickupComponent.BP_WeaponsPickupComponent_C",
+        "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C",
+    }
+    -- noisy every-frame RPCs: count them, don't log them
+    A.CB_QUIET = { Grass = true, Svr_ReduceStamina = true, Client_UpdateStaminaUI = true, Svr_SetMovement = true, Svr_FlashlightRotation = true,
+                   MC_FlashlightRotation = true, Svr_SetActorRotation = true, Svr_UpdateSpeed = true, MC_UpdateSpeed = true,
+                   Client_UpdateHungerUI = true, Client_UpdateThirstUI = true, Client_UpdateHealthUI = true, Client_UpdateRadiationUI = true,
+                   Client_UpdateOxygenUI = true, MC_AttachClothing = true }
+    A.cbCount = {}
+    A.cbHooks = function(tag)
+        if A.cbHooked then return end
+        A.cbHooked = true
+        local n = 0
+        for _, path in ipairs(A.CB_CLASSES) do
+            local fns = A.netFns(path)
+            if not fns then alog(("CB %s: %s not loaded"):format(tag, path:match("([%w_]+)$")))
+            else
+                local names = {}
+                for _, f in ipairs(fns) do
+                    names[#names + 1] = f.name .. "(" .. f.kind:sub(1, 1) .. (f.reliable and "R" or "") .. ")"
+                    if not A.CB_QUIET[f.name] then
+                        local ok = pcall(RegisterHook, f.path, function(ctx)
+                            A.cbCount[f.name] = (A.cbCount[f.name] or 0) + 1
+                            if A.cbCount[f.name] <= 4 then
+                                local o = safe(function() return ctx:get() end, nil)
+                                local own = dnValid(o) and safe(function() return o:GetOwner() end, nil)
+                                alog(("CBRPC %s %s on %s (owner %s) #%d"):format(f.kind, f.name, className(o), className(own), A.cbCount[f.name]))
+                            end
+                        end)
+                        if ok then n = n + 1 end
+                    end
+                end
+                alog(("CB %s: %s rpcs: %s"):format(tag, path:match("([%w_]+)$"), table.concat(names, " ")))
+            end
+        end
+        -- every damage call, both sides
+        local function dmgLog(kind, damaged, dmg, causer, inst)
+            local t = safe(function() return damaged:get() end, nil)
+            local tn = className(t)
+            if not (tn:find("Zombie") or tn:find("Player") or tn:find("Infected") or tn:find("Bandit")) then return end
+            A.cbCount["dmg"] = (A.cbCount["dmg"] or 0) + 1
+            if A.cbCount["dmg"] > 40 then return end
+            local c = safe(function() return causer:get() end, nil)
+            local i = safe(function() return inst:get() end, nil)
+            local ic = dnValid(i) and safe(function() return i.Pawn end, nil)
+            local function side(a) if not dnValid(a) then return "" end return safe(function() return a:IsLocallyControlled() end, false) and "(local)" or "(remote)" end
+            alog(("CBDMG %s %s %.1f to %s, causer %s owner %s, instigator %s %s"):format(tag, kind,
+                tonumber(safe(function() return dmg:get() end, -1)) or -1, tn, className(c),
+                className(dnValid(c) and safe(function() return c:GetOwner() end, nil) or nil), className(ic), side(ic)))
+        end
+        pcall(RegisterHook, "/Script/Engine.GameplayStatics:ApplyDamage", function(ctx, damaged, dmg, inst, causer) pcall(dmgLog, "ApplyDamage", damaged, dmg, causer, inst) end)
+        pcall(RegisterHook, "/Script/Engine.GameplayStatics:ApplyPointDamage", function(ctx, damaged, dmg, dir, hit, inst, causer) pcall(dmgLog, "ApplyPointDamage", damaged, dmg, causer, inst) end)
+        pcall(RegisterHook, "/Script/Engine.GameplayStatics:ApplyRadialDamage", function(ctx) alog("CBDMG " .. tag .. " ApplyRadialDamage") end)
+        -- XP: who gets it
+        for _, f in ipairs({ "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C:Event_XP" }) do
+            pcall(RegisterHook, f, function(ctx) alog("CBXP " .. tag .. " zombie Event_XP") end)
+        end
+        alog(("CB %s: hooked %d rpcs + damage"):format(tag, n))
+    end
+    A.zHealth = function(zb)
+        local dc = safe(function() return zb.DamageComponent end, nil)
+        local h = dnValid(dc) and safe(function() return dc.CurrentHealth end, nil)
+        local dead = safe(function() return zb["IsDead?"] end, nil)
+        return tonumber(h) or -1, dead
+    end
+    A.xpOf = function(p)
+        local lc = safe(function() return p.LevellingComponent end, nil)
+        return dnValid(lc) and (tonumber(safe(function() return lc.CurrentXP end, -1)) or -1) or -1,
+               dnValid(lc) and (tonumber(safe(function() return lc.CurrentLevel end, -1)) or -1) or -1
+    end
+    A.cbTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local cp, hp = z.p, myPawn()
+        z.ph = z.ph or "wait"
+        if z.t == 2 then
+            pcall(A.cbHooks, "host")
+            pcall(A.cmdEquipProbe)
+            pcall(function() cp.bCanBeDamaged = false end)   -- the joiner mustn't die mid-test
+        end
+        local pid = PJ.idOf(cp)
+        local loaded = not PJ.enabled or not pid or (PJ.st[pid] and PJ.st[pid].ready)
+        if z.ph == "wait" and z.t >= 12 and (loaded or z.t >= 60) then
+            -- arm the joiner: the host stands next to it and drops its weapons and ammo.
+            -- Only after the joiner's save has loaded - the load replaces whatever
+            -- they picked up before it (and picking up mid-load emptied them once).
+            local cl = cp:K2_GetActorLocation()
+            pcall(function() hp:K2_TeleportTo({ X = cl.X + 150, Y = cl.Y, Z = cl.Z + 30 }, hp:K2_GetActorRotation()) end)
+            local jig = hp.BP_JigMultiplayer
+            local mc = safe(function() return jig.MainJigContainers end, nil)
+            local drops = {}
+            for i = 1, (mc and #mc or 0) do
+                local items = safe(function() return mc[i]["ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"] end, nil)
+                for j = 1, (items and #items or 0) do
+                    local it = safe(function() return items[j]:get() end, nil) or items[j]
+                    local d = safe(function() return it["ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"]["ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"] end, nil)
+                    local path = dnValid(d) and bdPath(d) or ""
+                    if (path:find("/Weapons/") or path:find("Ammo")) and not path:find("Loader") and not path:find("Mag") and #drops < 6 then
+                        drops[#drops + 1] = { g = bdGuid(safe(function() return it["UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"] end, nil) or {}), name = path:match("([%w_]+)$") }
+                    end
+                end
+            end
+            for _, d in ipairs(drops) do pcall(function() jig:SERVER_RequestDropItem(d.g, 1, jig) end) end
+            local names = {}
+            for _, d in ipairs(drops) do names[#names + 1] = d.name end
+            -- and fresh ones from the item classes, in case the host has none left
+            local W = "/Game/Inventory/Items/Pickups/"
+            for i, cp2 in ipairs({ W .. "Weapons/Melee/2Handed/BP_BaseballBatPickup.BP_BaseballBatPickup_C",
+                                   W .. "Weapons/Firearms/Sidearm/BP_M9Pickup.BP_M9Pickup_C",
+                                   W .. "Attachments/Ammo/BP_9mmAmmoPickup.BP_9mmAmmoPickup_C" }) do
+                A.GIVE_CLS = cp2
+                local a = A.pkSpawn(cp, 60 * i - 120, 90, true)
+                names[#names + 1] = cp2:match("([%w_]+)$") .. (dnValid(a) and "(spawned)" or "(spawn failed)")
+            end
+            alog("CB: host drops for the joiner: " .. (#names > 0 and table.concat(names, ", ") or "nothing (no weapons)"))
+            z.ph, z.tp = "arming", z.t
+        elseif z.ph == "arming" and z.t == z.tp + 3 then
+            fwrite("sdmp_phase.txt", "arm")
+        elseif z.ph == "arming" and z.t >= z.tp + 14 then
+            local cl = cp:K2_GetActorLocation()
+            local best, bd = nil, 1e18
+            for _, a in ipairs(safe(function() return FindAllOf("BP_MasterZombie_C") end, nil) or {}) do
+                if dnValid(a) and not safe(function() return a["IsDead?"] end, false) then
+                    local l = a:K2_GetActorLocation()
+                    local d = (l.X - cl.X)^2 + (l.Y - cl.Y)^2
+                    if d < bd then best, bd = a, d end
+                end
+            end
+            if not best then alog("CB: no live zombie loaded"); z.ph, z.tp = "end", z.t; return end
+            z.zb = best
+            -- bring it in front of the joiner and hold it there
+            local f = cp:GetActorForwardVector()
+            z.spot = { X = cl.X + f.X * 150, Y = cl.Y + f.Y * 150, Z = cl.Z }
+            pcall(function() best:K2_TeleportTo(z.spot, best:K2_GetActorRotation()) end)
+            pcall(function() best.CustomTimeDilation = 0.001 end)
+            z.h0 = A.zHealth(best)
+            z.hx0, z.cx0 = A.xpOf(hp), A.xpOf(cp)
+            alog(("CB: zombie %s (%.0f away) held in front of the joiner, health %.1f; XP host %.0f joiner %.0f")
+                :format(className(best), math.sqrt(bd), z.h0, z.hx0, z.cx0))
+            local l = best:K2_GetActorLocation()
+            fwrite("sdmp_phase.txt", ("combat:%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z))
+            z.ph, z.tp = "fighting", z.t
+        elseif z.ph == "fighting" then
+            if dnValid(z.zb) and z.spot then pcall(function() z.zb:K2_TeleportTo(z.spot, z.zb:K2_GetActorRotation()) end) end
+            if (z.t - z.tp) % 4 == 0 then
+                local h, dead = A.zHealth(z.zb)
+                alog(("CB: zombie health %.1f dead=%s"):format(h, tostring(dead)))
+            end
+            if z.t == z.tp + 75 then
+                local h, dead = A.zHealth(z.zb)
+                local hx, cx = A.xpOf(hp), A.xpOf(cp)
+                alog(("CB RESULT joiner hurts a zombie: health %.1f -> %.1f dead=%s -> %s"):format(z.h0, h, tostring(dead),
+                    (h < z.h0 or dead == true or not dnValid(z.zb)) and "PASS" or "FAIL"))
+                alog(("CB RESULT xp: host %.0f -> %.0f, joiner %.0f -> %.0f"):format(z.hx0, hx, z.cx0, cx))
+                local c = {}
+                for k, v in pairs(A.cbCount) do c[#c + 1] = k .. "=" .. v end
+                table.sort(c)
+                alog("CB host rpc counts: " .. table.concat(c, " "))
+                z.ph, z.tp = "end", z.t
+            end
+        elseif z.ph == "end" and z.t == z.tp + 4 then
+            alog("CB done")
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    -- vehicle test: the host parks the nearest vehicle beside the joiner, the
+    -- joiner gets in, "holds" W for 5 s (D for the last 2), lets go, gets out.
+    -- PASS = the host's copy of the car moved while the joiner drove it and
+    -- the joiner ended up back on foot next to it.
+    A.vhTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local cp = z.p
+        z.ph = z.ph or "wait"
+        if z.t == 2 then pcall(function() cp.bCanBeDamaged = false end) end
+        local pid = PJ.idOf(cp)
+        local loaded = not PJ.enabled or not pid or (PJ.st[pid] and PJ.st[pid].ready)
+        if z.ph == "wait" and z.t >= 12 and (loaded or z.t >= 60) then
+            local cl = cp:K2_GetActorLocation()
+            local best, bd = nil, 1e18
+            for _, v in ipairs(safe(function() return FindAllOf("BP_VehicleMaster_C") end, nil) or {}) do
+                local l = dnValid(v) and safe(function() return v:K2_GetActorLocation() end, nil)
+                if l then
+                    local d = (l.X - cl.X)^2 + (l.Y - cl.Y)^2
+                    if d < bd then best, bd = v, d end
+                end
+            end
+            if not best then alog("VT: no vehicle loaded"); z.ph, z.tp = "end", z.t; return end
+            local r = cp:GetActorRightVector()
+            local spot = { X = cl.X + r.X * 400, Y = cl.Y + r.Y * 400, Z = cl.Z + 60 }
+            pcall(function() best:K2_TeleportTo(spot, cp:K2_GetActorRotation()) end)
+            z.v = best
+            alog(("VT: parked %s (was %.0f away) beside the joiner"):format(className(best), math.sqrt(bd)))
+            z.ph, z.tp = "parked", z.t
+        elseif z.ph == "parked" and z.t == z.tp + 4 then
+            local l = z.v:K2_GetActorLocation()
+            z.l0 = l
+            fwrite("sdmp_phase.txt", ("veh:%.0f,%.0f,%.0f"):format(l.X, l.Y, l.Z))
+            z.ph, z.tp = "driving", z.t
+        elseif z.ph == "driving" then
+            local seat = BD.vh.seat[cp:GetAddress()]
+            if seat and not z.seated then z.seated, z.ls = true, z.v:K2_GetActorLocation() end
+            if seat == nil and z.seated and not z.out then z.out = true end
+            if (z.t - z.tp) % 4 == 0 then
+                local l = z.v:K2_GetActorLocation()
+                local pl = cp:K2_GetActorLocation()
+                local par = safe(function() return cp:GetAttachParentActor() end, nil)
+                alog(("VT: car at %.0f,%.0f speed %.0f | joiner seated=%s attached=%s %.0f from car | inputs %d")
+                    :format(l.X, l.Y, safe(function() return z.v:GetVelocity():Size() end, -1) or -1, tostring(seat ~= nil),
+                        tostring(dnValid(par)), math.sqrt((pl.X - l.X)^2 + (pl.Y - l.Y)^2), BD.vh.inputs or 0))
+            end
+            if z.t == z.tp + 60 then
+                local l = z.v:K2_GetActorLocation()
+                local l0 = z.ls or z.l0
+                local moved = math.sqrt((l.X - l0.X)^2 + (l.Y - l0.Y)^2)
+                local pl = cp:K2_GetActorLocation()
+                local near = math.sqrt((pl.X - l.X)^2 + (pl.Y - l.Y)^2)
+                alog(("VT RESULT joiner drives: seated=%s, car moved %.0f, %d inputs -> %s"):format(tostring(z.seated == true), moved,
+                    BD.vh.inputs or 0, (z.seated and moved > 500) and "PASS" or "FAIL"))
+                alog(("VT RESULT joiner gets out: out=%s, %.0f from the car -> %s"):format(tostring(z.out == true), near,
+                    (z.out and near < 800) and "PASS" or "FAIL"))
+                z.ph, z.tp = "end", z.t
+            end
+        elseif z.ph == "end" and z.t == z.tp + 4 then
+            alog("VT done")
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    -- skills test: does a joiner take damage through its OWN Toughness, does
+    -- the XP for it reach the joiner (not the host), does the tree sync
+    A.skTick = function()
+        local z = A.ztest
+        z.t = z.t + 1
+        local cp, hp = z.p, myPawn()
+        z.ph = z.ph or "wait"
+        if z.t == 2 then pcall(function() cp.bCanBeDamaged = false end) end
+        local pid = PJ.idOf(cp)
+        local loaded = not PJ.enabled or not pid or (PJ.st[pid] and PJ.st[pid].ready)
+        local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+        local hpc = safe(function() return hp.Controller end, nil)
+        local jpc = safe(function() return cp.Controller end, nil)
+        local hs, js = PK.compOf(hpc, "PassiveSkillsComponent_C"), PK.compOf(jpc, "PassiveSkillsComponent_C")
+        local function hit(n)
+            pcall(function() cp.bCanBeDamaged = true end)
+            local h0 = cp.MedicalComponent.Health
+            pcall(function() gs:ApplyDamage(cp, n, nil, nil, nil) end)
+            local h1 = cp.MedicalComponent.Health
+            pcall(function() cp.MedicalComponent.Health = h0 end)
+            pcall(function() cp.bCanBeDamaged = false end)
+            return h0 - h1
+        end
+        if z.ph == "wait" and z.t >= 12 and ((loaded and PK.applied > 0) or z.t >= 60) then
+            if not (hs and js) then alog("SK: can't find the passive skills components"); z.ph, z.tp = "end", z.t; return end
+            z.jt = js.ToughnessMultiplier
+            z.ht = hs.ToughnessMultiplier
+            alog(("SK: %d joiner skill fields applied, redirects so far %d; toughness host %.2f joiner %.2f"):format(PK.applied, PK.redir, z.ht, z.jt))
+            hs.ToughnessMultiplier = 0.25
+            local took = hit(10.0)
+            hs.ToughnessMultiplier = z.ht
+            local want = 10.0 / (z.jt ~= 0 and z.jt or 1)
+            alog(("SK RESULT joiner's own toughness: 10 dmg took %.2f (own %.2f, host's would be %.2f) -> %s"):format(took, want, 10.0 / 0.25,
+                math.abs(took - want) < 0.6 and "PASS" or "FAIL"))
+            z.hx0 = hs.CurrentToughessXP
+            z.sent0 = PK.xpSent
+            for _ = 1, 3 do hit(10.0) end
+            z.ph, z.tp = "xp", z.t
+        elseif z.ph == "xp" and z.t == z.tp + 2 then
+            z.jx0 = js.CurrentToughessXP   -- after the host-side add, before the joiner's numbers come back
+        elseif z.ph == "xp" and z.t == z.tp + 16 then
+            alog(("SK RESULT toughness XP: host's own %.2f -> %.2f, %d XP message(s) sent down, joiner now %.2f -> %s"):format(z.hx0,
+                hs.CurrentToughessXP, PK.xpSent - z.sent0, js.CurrentToughessXP,
+                (math.abs(hs.CurrentToughessXP - z.hx0) < 0.01 and PK.xpSent > z.sent0) and "PASS" or "FAIL"))
+            local tt = PK.compOf(jpc, "TechTreeComponent_C")
+            alog("SK: joiner's tree on the host usable=" .. tostring(PK.treeOk(tt)) .. ", redirects " .. PK.redir)
+            z.ph, z.tp = "end", z.t
+        elseif z.ph == "end" and z.t == z.tp + 4 then
+            alog("SK done")
+            fwrite("sdmp_done.txt", "1")
+        end
+    end
+    A.vhClient = function()
+        if A.vc1 then return end
+        local ph = fread("sdmp_phase.txt") or ""
+        if not ph:find("^veh:") then return end
+        A.vc1 = true
+        local x, y, zz = ph:match("veh:(%-?%d+),(%-?%d+),(%-?%d+)")
+        local at = { X = tonumber(x), Y = tonumber(y), Z = tonumber(zz) }
+        local v = nearestActor(safe(function() return FindAllOf("BP_VehicleMaster_C") end, nil), at)
+        local me = myPawn()
+        if not dnValid(v) then alog("VT(client): can't see the car"); return end
+        A.aimAt = v
+        -- the way F does it first; straight to the get-in function if that didn't
+        local ok = pcall(function() v:OnExecuteInteract(me, { TagName = FName("Jig.InteractOptions.Option1") }) end)
+        alog("VT(client): interact with " .. className(v) .. " -> " .. tostring(ok))
+        gameDelay(1500, function()
+            A.aimAt = nil
+            if not BD.vh.mine then
+                local ok2, e2 = pcall(function() v:Interact_GetInVehicle() end)
+                alog("VT(client): interact didn't seat me - Interact_GetInVehicle -> " .. tostring(ok2) .. " " .. tostring(e2 or ""):sub(1, 100))
+            end
+            local t0 = os.clock()
+            gameLoop(50, function()
+                local s = os.clock() - t0
+                if s < 5 then
+                    BD.vh.keys.MoveForward = os.clock()
+                    if s > 3 then BD.vh.keys.MoveRight = os.clock() end
+                    return false
+                end
+                return true
+            end)
+            gameDelay(8000, function()
+                local l = safe(function() return v:K2_GetActorLocation() end, at)
+                alog(("VT(client): car moved %.0f on my screen - getting out"):format(math.sqrt((l.X - at.X)^2 + (l.Y - at.Y)^2)))
+                local ok3, e3 = pcall(function() v:ExitVehicle({}) end)
+                alog("VT(client): ExitVehicle -> " .. tostring(ok3) .. " " .. tostring(e3 or ""):sub(1, 100))
+            end)
+        end)
+    end
+    -- joiner: try every way the game might start an attack, 4 s apart
+    A.cbClient = function()
+        local ph = fread("sdmp_phase.txt") or ""
+        if A.cc1 then return end
+        if not A.cbHooked then pcall(A.cbHooks, "client"); pcall(A.cmdEquipProbe) end
+        if ph == "arm" and not A.ccArm then
+            A.ccArm = true
+            local me = myPawn()
+            local list = A.pkNear(me:K2_GetActorLocation(), 500)
+            alog(("CB(client): %d items on the ground by me - picking them up"):format(#list))
+            local tag = { TagName = FName("Jig.InteractOptions.Option1") }
+            for i, a in ipairs(list) do
+                gameDelay(i * 800, function()
+                    local ok = pcall(function() a:OnExecuteInteract(me, tag) end)
+                    alog(("CB(client): pick up %s -> %s"):format(className(a), tostring(ok)))
+                end)
+            end
+            gameDelay(#list * 800 + 1500, function()
+                local w = safe(function() return me:GetCurrentActiveWeapon() end, nil)
+                alog("CB(client): armed, weapon in hand: " .. (type(w) == "userdata" and className(w) or tostring(w)))
+            end)
+            return
+        end
+        if not ph:find("^combat:") then return end
+        A.cc1 = true
+        local me = myPawn()
+        local x, y, zz = ph:match("combat:(%-?%d+),(%-?%d+),(%-?%d+)")
+        local zl = { X = tonumber(x), Y = tonumber(y), Z = tonumber(zz) + 60 }
+        local P = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C:"
+        for _, f in ipairs({ "Event_Fire", "Local_StartShooting", "Local_StopShooting", "EquipMelee", "ServerFuncChangeActiveSlot",
+                             "GetCurrentActiveWeapon", "Svr_WeaponShove", "Svr_Montage", "Svr_UpdateCombatState", "Event_MeleeAim" }) do
+            alog("CB(client) sig " .. f .. ": " .. PR.sig(P .. f))
+        end
+        local w = safe(function() return me:GetCurrentActiveWeapon() end, nil)
+        alog("CB(client) active weapon: " .. tostring(type(w) == "userdata" and className(w) or w))
+        local function face()
+            local pc = UEHelpers.GetPlayerController()
+            local cam = safe(function() return pc.PlayerCameraManager:GetCameraLocation() end, nil) or me:K2_GetActorLocation()
+            local yaw = math.deg(math.atan(zl.Y - cam.Y, zl.X - cam.X))
+            local pitch = math.deg(math.atan(zl.Z - cam.Z, math.sqrt((zl.X - cam.X)^2 + (zl.Y - cam.Y)^2)))
+            pcall(function() pc:SetControlRotation({ Pitch = pitch, Yaw = yaw, Roll = 0.0 }) end)
+        end
+        -- keep the camera on the zombie, so clicks made by hand land too
+        A.aimAt = nearestActor(safe(function() return FindAllOf("BP_MasterZombie_C") end, nil), zl)
+        alog("CB(client) aiming at " .. className(A.aimAt))
+        local function weapon()
+            local w = safe(function() return me:GetCurrentActiveWeapon() end, nil)
+            return type(w) == "userdata" and className(w) or tostring(w)
+        end
+        local tries = {
+            { "EquipMelee", function() me:EquipMelee() end },
+            { "Event_Fire (melee in hand?)", function() me:Event_Fire() end },
+            { "Event_Fire again", function() me:Event_Fire() end },
+            { "Event_MeleeAim + Event_Fire", function() me:Event_MeleeAim(); me:Event_Fire() end },
+        }
+        for i, tr in ipairs(tries) do
+            gameDelay(1000 + (i - 1) * 4500, function()
+                face()
+                local ok, err = pcall(tr[2])
+                alog(("CB(client) try %s -> %s %s (weapon in hand: %s)"):format(tr[1], tostring(ok), tostring(err or ""):sub(1, 120), weapon()))
+                if tr[3] then gameDelay(1200, function() pcall(tr[3]) end) end
+            end)
+        end
+        for _, ms in ipairs({ 20000, 70000 }) do
+            gameDelay(ms, function()
+                local c = {}
+                for k, v in pairs(A.cbCount) do c[#c + 1] = k .. "=" .. v end
+                table.sort(c)
+                alog("CB(client) rpc counts: " .. table.concat(c, " ") .. " | weapon in hand: " .. weapon())
+            end)
+        end
     end
     -- newest pickup near l that wasn't in the before-list
     A.pkNew = function(l, before)
@@ -6732,7 +7791,7 @@ do
                     else
                         alog("no safe spot by the host yet - joiner stays where it spawned")
                     end
-                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" or A.test == "pick") and not A.ztest then
+                    if (A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" or A.test == "pick" or A.test == "combat" or A.test == "vehicle" or A.test == "skills") and not A.ztest then
                         A.ztest = { p = p, t = 0 }
                     elseif not A.play then
                         pcall(function() p.bCanBeDamaged = false end)
@@ -6816,7 +7875,7 @@ do
                 fwrite("sdmp_phase.txt", "ok:" .. r .. ":" .. t .. ":" .. ak .. ":" .. hn)
                 alog(("phase: replicate movement %s, server corrections %s"):format(r, t == "on" and "off" or "on"))
             end
-            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or (A.test == "build" and A.buildTick) or (A.test == "pick" and A.pkTick) or A.zTick)() end
+            if A.ztest then (A.test == "downed" and A.dTick or (A.test == "door" and A.doorTick) or (A.test == "persist" and A.persistTick) or (A.test == "well" and A.wellTick) or (A.test == "loot" and A.lootTick) or (A.test == "build" and A.buildTick) or (A.test == "pick" and A.pkTick) or (A.test == "combat" and A.cbTick) or (A.test == "vehicle" and A.vhTick) or (A.test == "skills" and A.skTick) or A.zTick)() end
             A.serveT = (A.serveT or 0) + 1
             if A.test == "steam" then
                 if A.serveT == 5 then pcall(A.steamProbe3) end
@@ -6933,7 +7992,7 @@ do
                 A.step, A.t = "playing", 0
                 return
             end
-            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" or A.test == "pick" then
+            if A.test == "zombie" or A.test == "downed" or A.test == "door" or A.test == "persist" or A.test == "well" or A.test == "loot" or A.test == "build" or A.test == "pick" or A.test == "combat" or A.test == "vehicle" or A.test == "skills" then
                 -- no client-side god: we want the damage to land
                 alog("zombie test: standing still, host drives it")
                 A.step, A.t = "zwait", 0
@@ -7098,6 +8157,8 @@ do
             if A.test == "loot" then pcall(A.lootClient) end
             if A.test == "build" then pcall(A.buildClient) end
             if A.test == "pick" then pcall(A.pkClient) end
+            if A.test == "combat" then pcall(A.cbClient) end
+            if A.test == "vehicle" then pcall(A.vhClient) end
             if (fread("sdmp_done.txt") or ""):find("1") or A.t > (A.test == "downed" and 260 or 120) then
                 if A.test == "downed" then DN.census("client final") end
                 A.step, A.t = "finished", 0

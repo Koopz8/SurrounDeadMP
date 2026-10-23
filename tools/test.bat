@@ -33,6 +33,12 @@ if /I "%1"=="build" set TEST=-sdmptest=build
 if /I "%2"=="build" set TEST=-sdmptest=build
 if /I "%1"=="pick" set TEST=-sdmptest=pick
 if /I "%2"=="pick" set TEST=-sdmptest=pick
+if /I "%1"=="combat" set TEST=-sdmptest=combat
+if /I "%2"=="combat" set TEST=-sdmptest=combat
+if /I "%1"=="vehicle" set TEST=-sdmptest=vehicle
+if /I "%2"=="vehicle" set TEST=-sdmptest=vehicle
+if /I "%1"=="skills" set TEST=-sdmptest=skills
+if /I "%2"=="skills" set TEST=-sdmptest=skills
 
 REM steam: host only, started THROUGH Steam so the Steam API is up (checks
 REM Steam ids, rich presence and listening on Steam's own network driver)
@@ -42,7 +48,7 @@ if /I "%2"=="steam" goto steam
 REM no test named: the old scripted-movement run is retired (it crashed the
 REM client), so just say what to run
 if "%TEST%"=="" (
-  echo Usage: test.bat zombie^|downed^|door^|persist^|well^|loot^|build^|pick^|steam [stay]
+  echo Usage: test.bat zombie^|downed^|door^|persist^|well^|loot^|build^|pick^|combat^|vehicle^|skills^|steam [stay]
   echo Or double-click zombietest / downedtest / doortest / persisttest / playtest.
   pause
   exit /b 1
